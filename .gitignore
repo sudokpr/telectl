@@ -1,0 +1,14 @@
+.env
+.env.local
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+logs/
+run/
+data/
+*.log
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
