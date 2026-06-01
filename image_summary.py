@@ -9,12 +9,19 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+VISION_PROMPT = """
+Read the uploaded image carefully and summarize only what is visibly present.
+
+Focus on useful content: visible text, document purpose, numbers, dates, names, tasks, and decisions.
+Do not invent people, places, events, or facts that are not visible in the image.
+If the image is too blurry or unreadable, say that briefly instead of guessing.
+""".strip()
 
 
 @dataclass(frozen=True)
@@ -31,8 +38,11 @@ class ImageSummaryConfig:
     ocr_psm: str
     ocr_llm_model: str
     vision_llm_model: str
+    vision_llm_models: tuple[str, ...]
     ollama_url: str
     ollama_timeout_seconds: int
+    memory_dir: Path
+    memory_llm_model: str
 
 
 def env_bool(value: str | None, default: bool = False) -> bool:
@@ -47,6 +57,12 @@ def env_int(value: str | None, default: int) -> int:
     return int(value)
 
 
+def env_list(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return default
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
 def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConfig:
     mode = env.get("IMAGE_SUMMARY_MODE", "compare").strip().lower()
     if mode not in {"compare", "ocr", "vision"}:
@@ -59,6 +75,7 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         )
     ).expanduser()
 
+    vision_model = env.get("IMAGE_SUMMARY_VISION_LLM_MODEL", "gemma4:e2b")
     return ImageSummaryConfig(
         chat_id=env_int(env.get("IMAGE_SUMMARY_CHAT_ID"), fallback_chat_id),
         topic_id=env_int(env.get("IMAGE_SUMMARY_TOPIC_ID"), 145),
@@ -71,9 +88,12 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         ocr_lang=env.get("IMAGE_SUMMARY_OCR_LANG", "eng"),
         ocr_psm=env.get("IMAGE_SUMMARY_OCR_PSM", "6"),
         ocr_llm_model=env.get("IMAGE_SUMMARY_OCR_LLM_MODEL", "llama3.1:8b"),
-        vision_llm_model=env.get("IMAGE_SUMMARY_VISION_LLM_MODEL", "gemma4:e2b"),
+        vision_llm_model=vision_model,
+        vision_llm_models=env_list(env.get("IMAGE_SUMMARY_VISION_MODELS"), (vision_model,)),
         ollama_url=env.get("IMAGE_SUMMARY_OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         ollama_timeout_seconds=env_int(env.get("IMAGE_SUMMARY_OLLAMA_TIMEOUT_SECONDS"), 600),
+        memory_dir=Path(env.get("MEMORY_WORK_DIR", "./data/memories")).expanduser(),
+        memory_llm_model=env.get("MEMORY_LLM_MODEL", env.get("IMAGE_SUMMARY_OCR_LLM_MODEL", "llama3.1:8b")),
     )
 
 
@@ -157,13 +177,7 @@ OCR TEXT:
 
 
 def summarize_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
-    prompt = """
-Summarize this image for a private Telegram topic.
-
-Focus on the useful content: visible text, document purpose, numbers, dates, names, tasks, and decisions.
-Keep it concise. If text is unreadable or uncertain, say so briefly.
-""".strip()
-    return ollama_chat(cfg, cfg.vision_llm_model, prompt, images=[image_path])
+    return ollama_chat(cfg, cfg.vision_llm_model, VISION_PROMPT, images=[image_path])
 
 
 def timed_call(label: str, fn: Any) -> dict[str, Any]:
@@ -198,17 +212,30 @@ def build_reply(results: list[dict[str, Any]], mode: str) -> str:
     return "\n".join(lines).strip()
 
 
-def process_image(image_path: Path, cfg: ImageSummaryConfig) -> str:
-    results: list[dict[str, Any]] = []
+def build_result_reply(result: dict[str, Any], mode: str) -> str:
+    return build_reply([result], mode)
+
+
+def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[str, Callable[[], dict[str, Any]]]]:
+    jobs: list[tuple[str, Callable[[], dict[str, Any]]]] = []
     if cfg.summary_mode in {"compare", "ocr"}:
-        results.append(
-            timed_call(f"OCR + LLM ({cfg.ocr_llm_model})", lambda: summarize_ocr(image_path, cfg))
-        )
+        label = f"OCR + LLM ({cfg.ocr_llm_model})"
+        jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_ocr(image_path, cfg))))
     if cfg.summary_mode in {"compare", "vision"}:
-        results.append(
-            timed_call(
-                f"Direct vision LLM ({cfg.vision_llm_model})",
-                lambda: summarize_vision(image_path, cfg),
+        for model in cfg.vision_llm_models:
+            label = f"Direct vision LLM ({model})"
+            jobs.append(
+                (
+                    label,
+                    lambda label=label, model=model: timed_call(
+                        label,
+                        lambda: ollama_chat(cfg, model, VISION_PROMPT, images=[image_path]),
+                    ),
+                )
             )
-        )
+    return jobs
+
+
+def process_image(image_path: Path, cfg: ImageSummaryConfig) -> str:
+    results = [job() for _, job in image_result_jobs(image_path, cfg)]
     return build_reply(results, cfg.summary_mode)

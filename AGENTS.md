@@ -6,6 +6,10 @@ This project runs one Telegram bot process for:
 
 - Codex remote-control commands in a configured Telegram topic.
 - Image OCR and Ollama summaries in a separate configured Telegram topic.
+- Plain text memory extraction from the same image-summary topic.
+- Optional local HTTP intake for iOS Shortcuts and other automation.
+- Env-controlled image comparison across Tesseract OCR plus one or more Ollama vision models.
+- Fuel receipt + odometer extraction with approval before CSV append.
 
 Only one process should poll a given Telegram bot token at a time.
 
@@ -26,6 +30,13 @@ uv --cache-dir .uv-cache run python -m py_compile bot.py image_summary.py
 ```
 
 For image-summary changes, also verify `tesseract` is installed and that the configured Ollama endpoint is reachable from the runtime environment.
+Preserve `IMAGE_SUMMARY_VISION_MODELS` configurability when changing vision comparison behavior.
+
+For memory extraction changes, verify a sample text message can produce a markdown file under `MEMORY_WORK_DIR`.
+
+For HTTP intake changes, verify `GET /health` and `POST /memory` locally. Do not expose the endpoint publicly without `HTTP_INTAKE_TOKEN`.
+
+For fuel changes, preserve the approval-before-append flow. Do not append to the fuel CSV without explicit approval. Preserve Fuelio CSV section structure by inserting approved rows into the `## Log` section, not at end of file. Approval must let the user choose full tank, partial fill, correction, or reject. Correction mode must expire after `FUEL_CORRECTION_WINDOW_SECONDS`.
 
 ## Operational Notes
 
