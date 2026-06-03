@@ -23,7 +23,7 @@ from image_summary import build_config as build_image_summary_config
 from image_summary import log as image_summary_log
 from image_summary import split_message
 from http_intake import HttpIntakeConfig, build_http_config, start_http_intake
-from memory_processor import save_memory
+from memory_processor import answer_memory_question, save_memory
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -701,6 +701,63 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await reply_chunked(update, reply, summary_config.max_reply_chars)
 
 
+async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> None:
+    config: Config = context.application.bot_data["config"]
+    summary_config = config.image_summary
+    message = update.effective_message
+    if not message:
+        return
+
+    question = question.strip()
+    if not question:
+        await message.reply_text("Ask with `/memory_query your question` or `? your question`.")
+        return
+
+    image_summary_log(summary_config, f"memory_query question={question!r}")
+    await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
+
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(
+        typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
+    )
+    try:
+        result = await asyncio.to_thread(answer_memory_question, question, summary_config)
+    finally:
+        stop_event.set()
+        await typing_task
+
+    sources = "\n".join(f"- {path.name}" for path in result.context_paths)
+    reply = result.answer
+    if sources:
+        reply += f"\n\nSources:\n{sources}"
+    await reply_chunked(update, reply, summary_config.max_reply_chars)
+
+
+async def memory_query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    await answer_memory_query(update, context, " ".join(context.args or []))
+
+
+async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+
+    raw_text = (message.text or message.caption or "").strip()
+    match = re.match(r"^(?:\?|q:|query:)\s*(.+)$", raw_text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return
+    await answer_memory_query(update, context, match.group(1))
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config | None = context.application.bot_data.get("config")
     if config:
@@ -789,6 +846,7 @@ async def post_init(application: Application) -> None:
         BotCommand("codex_start", "restart Codex remote control"),
         BotCommand("codex_status", "show Codex remote-control status"),
         BotCommand("codex_stop", "stop Codex remote control"),
+        BotCommand("memory_query", "ask saved memories"),
     ]
     await application.bot.set_my_commands(
         commands,
@@ -828,11 +886,18 @@ def main() -> None:
     application.add_handler(CommandHandler("codex_start", codex_start))
     application.add_handler(CommandHandler("codex_status", codex_status))
     application.add_handler(CommandHandler("codex_stop", codex_stop))
+    application.add_handler(CommandHandler("memory_query", memory_query_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, fuel_image_handler), group=0)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_summary_handler), group=1)
     application.add_handler(
         MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, fuel_correction_handler),
         group=1,
+    )
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & filters.Regex(r"^\s*(?:\?|q:|query:)"),
+            memory_query_text_handler,
+        )
     )
     application.add_handler(
         MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, text_memory_handler)
