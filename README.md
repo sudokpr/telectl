@@ -107,9 +107,10 @@ Set `IMAGE_SUMMARY_OCR_ENABLED=true` to add the old `OCR + LLM` result back
 into compare mode. `IMAGE_SUMMARY_MODE=ocr` also requires OCR to be enabled.
 
 When compare mode has both a Codex benchmark and one or more Ollama vision
-responses, the bot sends a follow-up Codex evaluation that ranks the Ollama
-responses on factual overlap, omissions, hallucination risk, text/number
-fidelity, and overall usefulness.
+responses, the bot sends a follow-up Codex evaluation comparing the local
+response against Codex-extracted image text. The report uses Telegram-friendly
+bullets instead of tables and scores factual coverage, omissions, unsupported
+claims, text/number fidelity, and practical usefulness.
 
 The bot keeps refreshing Telegram `typing` while processing runs. Debug
 logging for all received updates is enabled by default and written to

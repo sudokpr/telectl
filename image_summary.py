@@ -24,25 +24,48 @@ Focus on useful content: visible text, document purpose, numbers, dates, names, 
 Do not invent people, places, events, or facts that are not visible in the image.
 If the image is too blurry or unreadable, say that briefly instead of guessing.
 """.strip()
+CODEX_BENCHMARK_PROMPT = """
+Read the uploaded image carefully and extract the visible text plus key facts.
+
+Return a concise benchmark record that includes:
+- visible text, numbers, dates, names, labels, and totals when readable
+- the likely document or image purpose
+- important tasks, decisions, or claims visible in the image
+
+Do not invent people, places, events, or facts that are not visible in the image.
+If a field is blurry or unreadable, say so briefly instead of guessing.
+""".strip()
 COMPARISON_PROMPT_TEMPLATE = """
 You are evaluating image-summary quality for a private Telegram workflow.
 
-Treat the Codex response as the benchmark. Compare each Ollama vision response
-against it using only the text below. Do not add facts that are not present in
-the benchmark or candidate response.
+Treat the Codex benchmark as the reference text extracted from the image.
+Compare each local Ollama vision response against it using only the text below.
+Do not add facts that are not present in the benchmark or candidate response.
 
-Return a concise Markdown report with:
-- a ranked table of Ollama responses
-- scores from 1-5 for factual overlap, missing-detail penalty, hallucination risk,
-  text/number fidelity, and overall usefulness
-- one short note per response explaining the main gap or strength
+Return a concise Telegram-friendly Markdown report. Do not use a Markdown table.
+Use this shape for each local model:
+
+Benchmark evaluation: <model label>
+Verdict: Use local / Borderline / Use Codex
+Overall: <score>/5
+Scores:
+- Factual coverage: <score>/5
+- Missing important details: <score>/5
+- Unsupported claims risk: <score>/5
+- Text and number fidelity: <score>/5
+- Practical usefulness: <score>/5
+What MiniCPM got right:
+- <short bullets>
+What MiniCPM missed or distorted:
+- <short bullets>
+Decision note: <one sentence about whether the local model is good enough>
 
 Scoring guidance:
-- factual overlap: higher means more benchmark facts preserved
-- missing-detail penalty: higher means fewer important omissions
-- hallucination risk: higher means fewer unsupported claims
-- text/number fidelity: higher means visible text, numbers, dates, and names match better
-- overall usefulness: higher means better practical summary
+- factual coverage: higher means more Codex benchmark facts are preserved
+- missing important details: higher means fewer important omissions
+- unsupported claims risk: higher means fewer claims unsupported by the Codex benchmark
+- text and number fidelity: higher means visible text, numbers, dates, and names match better
+- practical usefulness: higher means better for deciding whether local Ollama is sufficient
 
 CODEX BENCHMARK:
 {benchmark}
@@ -243,7 +266,7 @@ def summarize_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
 
 
 def summarize_codex_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
-    return codex_image_chat(cfg, VISION_PROMPT, image_path)
+    return codex_image_chat(cfg, CODEX_BENCHMARK_PROMPT, image_path)
 
 
 def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConfig) -> dict[str, Any] | None:
@@ -251,7 +274,7 @@ def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConf
         (
             result
             for result in results
-            if result.get("ok") and str(result.get("label", "")).startswith("Direct Codex vision")
+            if result.get("ok") and str(result.get("label", "")).startswith("Codex benchmark text")
         ),
         None,
     )
@@ -271,7 +294,7 @@ def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConf
         benchmark=str(benchmark["value"]).strip(),
         candidates=candidate_text,
     )
-    label = f"Ollama-vs-Codex evaluation ({cfg.codex_llm_model or 'default'})"
+    label = f"MiniCPM-vs-Codex benchmark ({cfg.codex_llm_model or 'default'})"
     return timed_call(label, lambda: codex_text_chat(cfg, prompt))
 
 
@@ -330,7 +353,7 @@ def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[s
         jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_ocr(image_path, cfg))))
     if cfg.summary_mode in {"compare", "vision"}:
         if cfg.codex_llm_enabled:
-            label = f"Direct Codex vision ({cfg.codex_llm_model or 'default'})"
+            label = f"Codex benchmark text ({cfg.codex_llm_model or 'default'})"
             jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_codex_vision(image_path, cfg))))
         for model in cfg.vision_llm_models:
             label = f"Direct vision LLM ({model})"
