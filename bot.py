@@ -710,7 +710,7 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     question = question.strip()
     if not question:
-        await message.reply_text("Ask with `/memory_query your question` or `? your question`.")
+        await message.reply_text("Ask with `/memq your question` or `? your question`.")
         return
 
     image_summary_log(summary_config, f"memory_query question={question!r}")
@@ -846,7 +846,7 @@ async def post_init(application: Application) -> None:
         BotCommand("codex_start", "restart Codex remote control"),
         BotCommand("codex_status", "show Codex remote-control status"),
         BotCommand("codex_stop", "stop Codex remote control"),
-        BotCommand("memory_query", "ask saved memories"),
+        BotCommand("memq", "ask saved memories"),
     ]
     await application.bot.set_my_commands(
         commands,
@@ -886,7 +886,7 @@ def main() -> None:
     application.add_handler(CommandHandler("codex_start", codex_start))
     application.add_handler(CommandHandler("codex_status", codex_status))
     application.add_handler(CommandHandler("codex_stop", codex_stop))
-    application.add_handler(CommandHandler("memory_query", memory_query_command))
+    application.add_handler(CommandHandler(["memq", "memory_query"], memory_query_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, fuel_image_handler), group=0)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_summary_handler), group=1)
     application.add_handler(

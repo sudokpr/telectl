@@ -113,7 +113,7 @@ field extraction.
 Ask saved memories from the same topic with:
 
 ```text
-/memory_query how much was the service labour for polo in 2026
+/memq how much was the service labour for polo in 2026
 ```
 
 or:
