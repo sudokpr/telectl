@@ -88,16 +88,29 @@ Output is written to `logs/codex-remote-control.log`.
 Images posted in `IMAGE_SUMMARY_TOPIC_ID` are acknowledged immediately,
 downloaded to `data/image-summary/images`, and summarized with:
 
-- OCR through `tesseract`
-- OCR text summary through Ollama `llama3.1:8b`
+- direct Codex vision when `CODEX_LLM_ENABLED=true`
 - direct vision summaries through `IMAGE_SUMMARY_VISION_MODELS`
+- optional OCR through `tesseract` when `IMAGE_SUMMARY_OCR_ENABLED=true`
+- optional OCR text summary through Codex when `CODEX_LLM_ENABLED=true`,
+  falling back to Ollama `IMAGE_SUMMARY_OCR_LLM_MODEL`
 
-In `IMAGE_SUMMARY_MODE=compare`, the bot compares Tesseract OCR + text LLM
-against each configured vision model, for example:
+In `IMAGE_SUMMARY_MODE=compare`, the bot compares direct Codex vision, when
+enabled, against each configured Ollama vision model. For example:
 
 ```env
-IMAGE_SUMMARY_VISION_MODELS=gemma4:e2b,minicpm-v:latest
+CODEX_LLM_ENABLED=true
+IMAGE_SUMMARY_OCR_ENABLED=false
+IMAGE_SUMMARY_VISION_MODELS=minicpm-v:latest
 ```
+
+Set `IMAGE_SUMMARY_OCR_ENABLED=true` to add the old `OCR + LLM` result back
+into compare mode. `IMAGE_SUMMARY_MODE=ocr` also requires OCR to be enabled.
+
+When compare mode has both a Codex benchmark and one or more Ollama vision
+responses, the bot sends a follow-up Codex evaluation comparing the local
+response against Codex-extracted image text. The report uses Telegram-friendly
+bullets instead of tables and scores factual coverage, omissions, unsupported
+claims, text/number fidelity, and practical usefulness.
 
 The bot keeps refreshing Telegram `typing` while processing runs. Debug
 logging for all received updates is enabled by default and written to
@@ -123,11 +136,49 @@ or:
 ```
 
 The query path retrieves relevant markdown files from `MEMORY_WORK_DIR`, asks
-`MEMORY_QUERY_MODEL`, and replies with the answer plus source file names. Use a
-fast model such as `gemma4:31b-cloud` for interactive Q&A, while keeping
-`MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
+Codex when `CODEX_LLM_ENABLED=true`, falls back to `MEMORY_QUERY_MODEL` through
+Ollama on Codex errors, and replies with the answer plus source file names. Use
+a fast fallback model such as `gemma4:31b-cloud` for interactive Q&A, while
+keeping `MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
 `MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
 for aggregate questions that need multiple memories.
+
+## Codex SDK LLM POC
+
+This repo includes a small proof of concept for using the local Codex app
+server through the official Python SDK instead of waiting on local Ollama
+models. It reuses your existing Codex authentication.
+
+This uses `openai-codex>=0.1.0b3`, which includes a runtime package with a
+compatible `manylinux aarch64` wheel for Raspberry Pi / Debian ARM64. Install
+the normal project dependencies:
+
+```bash
+uv --cache-dir .uv-cache sync
+```
+
+```bash
+uv --cache-dir .uv-cache run python codex_poc.py "Say hello in one sentence"
+```
+
+Ask about a local image by passing one or more `--image` paths:
+
+```bash
+uv --cache-dir .uv-cache run python codex_poc.py \
+  --image ./data/image-summary/images/example.jpg \
+  "What text and important numbers are visible in this image?"
+```
+
+Optional settings:
+
+```env
+CODEX_LLM_CWD=.
+CODEX_LLM_ENABLED=true
+CODEX_LLM_MODEL=gpt-5.4-mini
+CODEX_LLM_SANDBOX=read_only
+CODEX_LLM_EPHEMERAL=true
+CODEX_LLM_BASE_INSTRUCTIONS=
+```
 
 ## HTTP Intake
 

@@ -20,7 +20,9 @@ from fuel_tracker import extract_fuel_fields, format_approval, make_approval, pa
 from image_summary import ImageSummaryConfig
 from image_summary import build_result_reply, image_result_jobs
 from image_summary import build_config as build_image_summary_config
+from image_summary import compare_ollama_to_codex
 from image_summary import log as image_summary_log
+from image_summary import processing_description
 from image_summary import split_message
 from http_intake import HttpIntakeConfig, build_http_config, start_http_intake
 from memory_processor import answer_memory_question, save_memory
@@ -366,7 +368,7 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
     image_summary_log(summary_config, f"processing {message_debug_line(update)} target={target}")
 
     await message.reply_text(
-        "Received the image. Processing OCR + direct vision summary now; this can take 1-2 minutes."
+        f"Received the image. Processing {processing_description(summary_config)} summary now; this can take 1-2 minutes."
     )
 
     try:
@@ -385,15 +387,29 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
         typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
     )
     try:
+        results: list[dict[str, Any]] = []
         for label, job in image_result_jobs(target, summary_config):
             image_summary_log(summary_config, f"image_result_started message_id={message.message_id} label={label!r}")
             result = await asyncio.to_thread(job)
+            results.append(result)
             image_summary_log(
                 summary_config,
                 f"image_result_finished message_id={message.message_id} "
                 f"label={label!r} ok={result['ok']} seconds={result['seconds']:.1f}",
             )
             await reply_chunked(update, build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars)
+
+        image_summary_log(summary_config, f"image_comparison_started message_id={message.message_id}")
+        comparison = await asyncio.to_thread(compare_ollama_to_codex, results, summary_config)
+        if comparison:
+            image_summary_log(
+                summary_config,
+                f"image_comparison_finished message_id={message.message_id} "
+                f"ok={comparison['ok']} seconds={comparison['seconds']:.1f}",
+            )
+            await reply_chunked(update, build_result_reply(comparison, "comparison"), summary_config.max_reply_chars)
+        else:
+            image_summary_log(summary_config, f"image_comparison_skipped message_id={message.message_id}")
     finally:
         stop_event.set()
         await typing_task

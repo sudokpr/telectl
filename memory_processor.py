@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from image_summary import IST, ImageSummaryConfig, log, ollama_chat
+from image_summary import IST, ImageSummaryConfig, log, ollama_chat, text_llm_chat
 
 
 @dataclass(frozen=True)
@@ -263,7 +263,7 @@ QUESTION:
 MEMORY CONTEXT:
 {context}
 """.strip()
-    answer = ollama_chat(cfg, cfg.memory_query_model, prompt)
+    answer = text_llm_chat(cfg, cfg.memory_query_model, prompt, "memory_query")
     return MemoryAnswer(
         answer=answer,
         context_paths=tuple(path for path, _content, _score in memories),
