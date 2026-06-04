@@ -89,7 +89,8 @@ Images posted in `IMAGE_SUMMARY_TOPIC_ID` are acknowledged immediately,
 downloaded to `data/image-summary/images`, and summarized with:
 
 - OCR through `tesseract`
-- OCR text summary through Ollama `llama3.1:8b`
+- OCR text summary through Codex when `CODEX_LLM_ENABLED=true`, falling back to
+  Ollama `IMAGE_SUMMARY_OCR_LLM_MODEL`
 - direct vision summaries through `IMAGE_SUMMARY_VISION_MODELS`
 
 In `IMAGE_SUMMARY_MODE=compare`, the bot compares Tesseract OCR + text LLM
@@ -123,11 +124,49 @@ or:
 ```
 
 The query path retrieves relevant markdown files from `MEMORY_WORK_DIR`, asks
-`MEMORY_QUERY_MODEL`, and replies with the answer plus source file names. Use a
-fast model such as `gemma4:31b-cloud` for interactive Q&A, while keeping
-`MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
+Codex when `CODEX_LLM_ENABLED=true`, falls back to `MEMORY_QUERY_MODEL` through
+Ollama on Codex errors, and replies with the answer plus source file names. Use
+a fast fallback model such as `gemma4:31b-cloud` for interactive Q&A, while
+keeping `MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
 `MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
 for aggregate questions that need multiple memories.
+
+## Codex SDK LLM POC
+
+This repo includes a small proof of concept for using the local Codex app
+server through the official Python SDK instead of waiting on local Ollama
+models. It reuses your existing Codex authentication.
+
+This uses `openai-codex>=0.1.0b3`, which includes a runtime package with a
+compatible `manylinux aarch64` wheel for Raspberry Pi / Debian ARM64. Install
+the normal project dependencies:
+
+```bash
+uv --cache-dir .uv-cache sync
+```
+
+```bash
+uv --cache-dir .uv-cache run python codex_poc.py "Say hello in one sentence"
+```
+
+Ask about a local image by passing one or more `--image` paths:
+
+```bash
+uv --cache-dir .uv-cache run python codex_poc.py \
+  --image ./data/image-summary/images/example.jpg \
+  "What text and important numbers are visible in this image?"
+```
+
+Optional settings:
+
+```env
+CODEX_LLM_CWD=.
+CODEX_LLM_ENABLED=true
+CODEX_LLM_MODEL=gpt-5.4-mini
+CODEX_LLM_SANDBOX=read_only
+CODEX_LLM_EPHEMERAL=true
+CODEX_LLM_BASE_INSTRUCTIONS=
+```
 
 ## HTTP Intake
 

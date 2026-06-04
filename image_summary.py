@@ -13,6 +13,8 @@ from typing import Any, Callable
 
 import requests
 
+from codex_llm import ask_codex_text, build_codex_llm_config
+
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 VISION_PROMPT = """
@@ -41,6 +43,8 @@ class ImageSummaryConfig:
     vision_llm_models: tuple[str, ...]
     ollama_url: str
     ollama_timeout_seconds: int
+    codex_llm_enabled: bool
+    codex_llm_model: str
     memory_dir: Path
     memory_llm_model: str
     memory_query_model: str
@@ -95,6 +99,8 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         vision_llm_models=env_list(env.get("IMAGE_SUMMARY_VISION_MODELS"), (vision_model,)),
         ollama_url=env.get("IMAGE_SUMMARY_OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         ollama_timeout_seconds=env_int(env.get("IMAGE_SUMMARY_OLLAMA_TIMEOUT_SECONDS"), 600),
+        codex_llm_enabled=env_bool(env.get("CODEX_LLM_ENABLED"), bool(env.get("CODEX_LLM_MODEL"))),
+        codex_llm_model=env.get("CODEX_LLM_MODEL", "").strip(),
         memory_dir=Path(env.get("MEMORY_WORK_DIR", "./data/memories")).expanduser(),
         memory_llm_model=env.get("MEMORY_LLM_MODEL", env.get("IMAGE_SUMMARY_OCR_LLM_MODEL", "llama3.1:8b")),
         memory_query_model=env.get("MEMORY_QUERY_MODEL", "gemma4:31b-cloud"),
@@ -165,6 +171,19 @@ def ollama_chat(
     return resp.json().get("message", {}).get("content", "").strip()
 
 
+def codex_text_chat(cfg: ImageSummaryConfig, prompt: str) -> str:
+    return ask_codex_text(prompt, build_codex_llm_config())
+
+
+def text_llm_chat(cfg: ImageSummaryConfig, ollama_model: str, prompt: str, purpose: str) -> str:
+    if cfg.codex_llm_enabled:
+        try:
+            return codex_text_chat(cfg, prompt)
+        except Exception as exc:
+            log(cfg, f"codex_llm_failed purpose={purpose} model={cfg.codex_llm_model or 'default'} error={exc}")
+    return ollama_chat(cfg, ollama_model, prompt)
+
+
 def summarize_ocr(image_path: Path, cfg: ImageSummaryConfig) -> tuple[str, str]:
     text = run_ocr(image_path, cfg)
     if not text:
@@ -178,7 +197,7 @@ If the OCR text is noisy, infer cautiously and mention uncertainty only when it 
 OCR TEXT:
 {text}
 """.strip()
-    summary = ollama_chat(cfg, cfg.ocr_llm_model, prompt)
+    summary = text_llm_chat(cfg, cfg.ocr_llm_model, prompt, "ocr_summary")
     return text, summary
 
 
@@ -225,7 +244,8 @@ def build_result_reply(result: dict[str, Any], mode: str) -> str:
 def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[str, Callable[[], dict[str, Any]]]]:
     jobs: list[tuple[str, Callable[[], dict[str, Any]]]] = []
     if cfg.summary_mode in {"compare", "ocr"}:
-        label = f"OCR + LLM ({cfg.ocr_llm_model})"
+        model = f"Codex {cfg.codex_llm_model or 'default'} -> Ollama {cfg.ocr_llm_model}" if cfg.codex_llm_enabled else cfg.ocr_llm_model
+        label = f"OCR + LLM ({model})"
         jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_ocr(image_path, cfg))))
     if cfg.summary_mode in {"compare", "vision"}:
         for model in cfg.vision_llm_models:
