@@ -88,17 +88,28 @@ Output is written to `logs/codex-remote-control.log`.
 Images posted in `IMAGE_SUMMARY_TOPIC_ID` are acknowledged immediately,
 downloaded to `data/image-summary/images`, and summarized with:
 
-- OCR through `tesseract`
-- OCR text summary through Codex when `CODEX_LLM_ENABLED=true`, falling back to
-  Ollama `IMAGE_SUMMARY_OCR_LLM_MODEL`
+- direct Codex vision when `CODEX_LLM_ENABLED=true`
 - direct vision summaries through `IMAGE_SUMMARY_VISION_MODELS`
+- optional OCR through `tesseract` when `IMAGE_SUMMARY_OCR_ENABLED=true`
+- optional OCR text summary through Codex when `CODEX_LLM_ENABLED=true`,
+  falling back to Ollama `IMAGE_SUMMARY_OCR_LLM_MODEL`
 
-In `IMAGE_SUMMARY_MODE=compare`, the bot compares Tesseract OCR + text LLM
-against each configured vision model, for example:
+In `IMAGE_SUMMARY_MODE=compare`, the bot compares direct Codex vision, when
+enabled, against each configured Ollama vision model. For example:
 
 ```env
-IMAGE_SUMMARY_VISION_MODELS=gemma4:e2b,minicpm-v:latest
+CODEX_LLM_ENABLED=true
+IMAGE_SUMMARY_OCR_ENABLED=false
+IMAGE_SUMMARY_VISION_MODELS=minicpm-v:latest
 ```
+
+Set `IMAGE_SUMMARY_OCR_ENABLED=true` to add the old `OCR + LLM` result back
+into compare mode. `IMAGE_SUMMARY_MODE=ocr` also requires OCR to be enabled.
+
+When compare mode has both a Codex benchmark and one or more Ollama vision
+responses, the bot sends a follow-up Codex evaluation that ranks the Ollama
+responses on factual overlap, omissions, hallucination risk, text/number
+fidelity, and overall usefulness.
 
 The bot keeps refreshing Telegram `typing` while processing runs. Debug
 logging for all received updates is enabled by default and written to

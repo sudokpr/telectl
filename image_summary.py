@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 import requests
 
-from codex_llm import ask_codex_text, build_codex_llm_config
+from codex_llm import CodexLlmConfig, ask_codex_image, ask_codex_text, build_codex_llm_config
 
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -23,6 +23,32 @@ Read the uploaded image carefully and summarize only what is visibly present.
 Focus on useful content: visible text, document purpose, numbers, dates, names, tasks, and decisions.
 Do not invent people, places, events, or facts that are not visible in the image.
 If the image is too blurry or unreadable, say that briefly instead of guessing.
+""".strip()
+COMPARISON_PROMPT_TEMPLATE = """
+You are evaluating image-summary quality for a private Telegram workflow.
+
+Treat the Codex response as the benchmark. Compare each Ollama vision response
+against it using only the text below. Do not add facts that are not present in
+the benchmark or candidate response.
+
+Return a concise Markdown report with:
+- a ranked table of Ollama responses
+- scores from 1-5 for factual overlap, missing-detail penalty, hallucination risk,
+  text/number fidelity, and overall usefulness
+- one short note per response explaining the main gap or strength
+
+Scoring guidance:
+- factual overlap: higher means more benchmark facts preserved
+- missing-detail penalty: higher means fewer important omissions
+- hallucination risk: higher means fewer unsupported claims
+- text/number fidelity: higher means visible text, numbers, dates, and names match better
+- overall usefulness: higher means better practical summary
+
+CODEX BENCHMARK:
+{benchmark}
+
+OLLAMA RESPONSES:
+{candidates}
 """.strip()
 
 
@@ -35,6 +61,7 @@ class ImageSummaryConfig:
     work_dir: Path
     log_file: Path
     debug_updates: bool
+    ocr_enabled: bool
     ocr_command: str
     ocr_lang: str
     ocr_psm: str
@@ -45,6 +72,7 @@ class ImageSummaryConfig:
     ollama_timeout_seconds: int
     codex_llm_enabled: bool
     codex_llm_model: str
+    codex_llm_config: CodexLlmConfig
     memory_dir: Path
     memory_llm_model: str
     memory_query_model: str
@@ -74,6 +102,9 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
     mode = env.get("IMAGE_SUMMARY_MODE", "compare").strip().lower()
     if mode not in {"compare", "ocr", "vision"}:
         raise ValueError("IMAGE_SUMMARY_MODE must be one of: compare, ocr, vision")
+    ocr_enabled = env_bool(env.get("IMAGE_SUMMARY_OCR_ENABLED"), False)
+    if mode == "ocr" and not ocr_enabled:
+        raise ValueError("IMAGE_SUMMARY_MODE=ocr requires IMAGE_SUMMARY_OCR_ENABLED=true")
 
     work_dir = Path(
         env.get(
@@ -91,6 +122,7 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         work_dir=work_dir,
         log_file=Path(env.get("IMAGE_SUMMARY_LOG_FILE", str(work_dir / "worker.log"))).expanduser(),
         debug_updates=env_bool(env.get("IMAGE_SUMMARY_DEBUG_UPDATES"), True),
+        ocr_enabled=ocr_enabled,
         ocr_command=env.get("IMAGE_SUMMARY_OCR_COMMAND", "tesseract"),
         ocr_lang=env.get("IMAGE_SUMMARY_OCR_LANG", "eng"),
         ocr_psm=env.get("IMAGE_SUMMARY_OCR_PSM", "6"),
@@ -99,8 +131,9 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         vision_llm_models=env_list(env.get("IMAGE_SUMMARY_VISION_MODELS"), (vision_model,)),
         ollama_url=env.get("IMAGE_SUMMARY_OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         ollama_timeout_seconds=env_int(env.get("IMAGE_SUMMARY_OLLAMA_TIMEOUT_SECONDS"), 600),
-        codex_llm_enabled=env_bool(env.get("CODEX_LLM_ENABLED"), bool(env.get("CODEX_LLM_MODEL"))),
+        codex_llm_enabled=env_bool(env.get("CODEX_LLM_ENABLED"), False),
         codex_llm_model=env.get("CODEX_LLM_MODEL", "").strip(),
+        codex_llm_config=build_codex_llm_config(env),
         memory_dir=Path(env.get("MEMORY_WORK_DIR", "./data/memories")).expanduser(),
         memory_llm_model=env.get("MEMORY_LLM_MODEL", env.get("IMAGE_SUMMARY_OCR_LLM_MODEL", "llama3.1:8b")),
         memory_query_model=env.get("MEMORY_QUERY_MODEL", "gemma4:31b-cloud"),
@@ -172,7 +205,11 @@ def ollama_chat(
 
 
 def codex_text_chat(cfg: ImageSummaryConfig, prompt: str) -> str:
-    return ask_codex_text(prompt, build_codex_llm_config())
+    return ask_codex_text(prompt, cfg.codex_llm_config)
+
+
+def codex_image_chat(cfg: ImageSummaryConfig, prompt: str, image_path: Path) -> str:
+    return ask_codex_image(prompt, [image_path], cfg.codex_llm_config)
 
 
 def text_llm_chat(cfg: ImageSummaryConfig, ollama_model: str, prompt: str, purpose: str) -> str:
@@ -203,6 +240,39 @@ OCR TEXT:
 
 def summarize_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
     return ollama_chat(cfg, cfg.vision_llm_model, VISION_PROMPT, images=[image_path])
+
+
+def summarize_codex_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
+    return codex_image_chat(cfg, VISION_PROMPT, image_path)
+
+
+def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConfig) -> dict[str, Any] | None:
+    benchmark = next(
+        (
+            result
+            for result in results
+            if result.get("ok") and str(result.get("label", "")).startswith("Direct Codex vision")
+        ),
+        None,
+    )
+    candidates = [
+        result
+        for result in results
+        if result.get("ok") and str(result.get("label", "")).startswith("Direct vision LLM")
+    ]
+    if not benchmark or not candidates:
+        return None
+
+    candidate_text = "\n\n".join(
+        f"{index}. {result['label']}\n{str(result['value']).strip()}"
+        for index, result in enumerate(candidates, start=1)
+    )
+    prompt = COMPARISON_PROMPT_TEMPLATE.format(
+        benchmark=str(benchmark["value"]).strip(),
+        candidates=candidate_text,
+    )
+    label = f"Ollama-vs-Codex evaluation ({cfg.codex_llm_model or 'default'})"
+    return timed_call(label, lambda: codex_text_chat(cfg, prompt))
 
 
 def timed_call(label: str, fn: Any) -> dict[str, Any]:
@@ -241,13 +311,27 @@ def build_result_reply(result: dict[str, Any], mode: str) -> str:
     return build_reply([result], mode)
 
 
+def processing_description(cfg: ImageSummaryConfig) -> str:
+    parts: list[str] = []
+    if cfg.summary_mode in {"compare", "vision"}:
+        if cfg.codex_llm_enabled:
+            parts.append("Codex vision")
+        parts.append("direct vision")
+    if cfg.summary_mode in {"compare", "ocr"} and cfg.ocr_enabled:
+        parts.append("OCR")
+    return " + ".join(parts) or cfg.summary_mode
+
+
 def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[str, Callable[[], dict[str, Any]]]]:
     jobs: list[tuple[str, Callable[[], dict[str, Any]]]] = []
-    if cfg.summary_mode in {"compare", "ocr"}:
+    if cfg.summary_mode in {"compare", "ocr"} and cfg.ocr_enabled:
         model = f"Codex {cfg.codex_llm_model or 'default'} -> Ollama {cfg.ocr_llm_model}" if cfg.codex_llm_enabled else cfg.ocr_llm_model
         label = f"OCR + LLM ({model})"
         jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_ocr(image_path, cfg))))
     if cfg.summary_mode in {"compare", "vision"}:
+        if cfg.codex_llm_enabled:
+            label = f"Direct Codex vision ({cfg.codex_llm_model or 'default'})"
+            jobs.append((label, lambda label=label: timed_call(label, lambda: summarize_codex_vision(image_path, cfg))))
         for model in cfg.vision_llm_models:
             label = f"Direct vision LLM ({model})"
             jobs.append(
@@ -264,4 +348,8 @@ def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[s
 
 def process_image(image_path: Path, cfg: ImageSummaryConfig) -> str:
     results = [job() for _, job in image_result_jobs(image_path, cfg)]
-    return build_reply(results, cfg.summary_mode)
+    comparison = compare_ollama_to_codex(results, cfg)
+    replies = [build_reply(results, cfg.summary_mode)]
+    if comparison:
+        replies.append(build_result_reply(comparison, "comparison"))
+    return "\n\n".join(replies)
