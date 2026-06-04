@@ -224,6 +224,19 @@ async def guarded(update: Update, config: Config) -> bool:
     return True
 
 
+def is_allowed_user(update: Update, config: Config) -> bool:
+    user = update.effective_user
+    return not config.allowed_user_ids or bool(user and user.id in config.allowed_user_ids)
+
+
+async def allowed_user_guard(update: Update, config: Config) -> bool:
+    if is_allowed_user(update, config):
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("You are not allowed to run this command.")
+    return False
+
+
 def is_image_summary_target(update: Update, config: Config) -> bool:
     message = update.effective_message
     chat = update.effective_chat
@@ -740,6 +753,8 @@ async def memory_query_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if update.effective_user and update.effective_user.id == context.bot.id:
         return
+    if not await allowed_user_guard(update, config):
+        return
     await answer_memory_query(update, context, " ".join(context.args or []))
 
 
@@ -749,6 +764,8 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
     if not message or not is_image_summary_target(update, config):
         return
     if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    if not await allowed_user_guard(update, config):
         return
 
     raw_text = (message.text or message.caption or "").strip()
