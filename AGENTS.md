@@ -7,6 +7,7 @@ This project runs one Telegram bot process for:
 - Codex remote-control commands in a configured Telegram topic.
 - Image OCR and Ollama summaries in a separate configured Telegram topic.
 - Plain text memory extraction from the same image-summary topic.
+- Memory question answering over saved markdown memories.
 - Optional local HTTP intake for iOS Shortcuts and other automation.
 - Env-controlled image comparison across Tesseract OCR plus one or more Ollama vision models.
 - Fuel receipt + odometer extraction with approval before CSV append.
@@ -33,6 +34,7 @@ For image-summary changes, also verify `tesseract` is installed and that the con
 Preserve `IMAGE_SUMMARY_VISION_MODELS` configurability when changing vision comparison behavior.
 
 For memory extraction changes, verify a sample text message can produce a markdown file under `MEMORY_WORK_DIR`.
+For memory query changes, verify `/memory_query ...` or `? ...` retrieves relevant markdown memory files and answers using `MEMORY_QUERY_MODEL`. Interactive query defaults may use a cloud model for speed; keep recurring extraction/summarization defaults local unless the user asks otherwise.
 
 For HTTP intake changes, verify `GET /health` and `POST /memory` locally. Do not expose the endpoint publicly without `HTTP_INTAKE_TOKEN`.
 

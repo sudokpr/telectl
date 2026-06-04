@@ -16,6 +16,47 @@ class SavedMemory:
     content: str
 
 
+@dataclass(frozen=True)
+class MemoryAnswer:
+    answer: str
+    context_paths: tuple[Path, ...]
+
+
+QUERY_STOP_WORDS = {
+    "about",
+    "after",
+    "all",
+    "and",
+    "any",
+    "are",
+    "ask",
+    "but",
+    "can",
+    "did",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "into",
+    "more",
+    "much",
+    "not",
+    "our",
+    "the",
+    "this",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+}
+
+
 def slugify(value: str, default: str = "memory") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug[:60] or default
@@ -132,3 +173,98 @@ def save_memory(raw_text: str, cfg: ImageSummaryConfig, source: dict[str, Any]) 
     path.write_text(content, encoding="utf-8")
     log(cfg, f"memory_saved path={path} title={title!r} category={data.get('category')!r}")
     return SavedMemory(path=path, content=content)
+
+
+def query_terms(question: str) -> set[str]:
+    terms = {
+        term
+        for term in re.findall(r"[a-z0-9]+", question.lower())
+        if len(term) > 2 and term not in QUERY_STOP_WORDS
+    }
+    if "labour" in terms:
+        terms.add("labor")
+    if "labor" in terms:
+        terms.add("labour")
+    for term in list(terms):
+        if len(term) == 4 and term.startswith("20") and term[2:].isdigit():
+            terms.add(term[2:])
+    return terms
+
+
+def memory_score(path: Path, content: str, terms: set[str]) -> int:
+    haystack = f"{path.name}\n{content}".lower()
+    tokens = re.findall(r"[a-z0-9]+", haystack)
+    score = 0
+    for term in terms:
+        occurrences = tokens.count(term)
+        if occurrences:
+            score += occurrences
+            if term in path.name.lower():
+                score += 5
+    return score
+
+
+def relevant_memories(question: str, cfg: ImageSummaryConfig) -> list[tuple[Path, str, int]]:
+    terms = query_terms(question)
+    memories: list[tuple[Path, str, int]] = []
+    if not cfg.memory_dir.exists():
+        return memories
+    for path in sorted(cfg.memory_dir.glob("*.md"), reverse=True):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        score = memory_score(path, content, terms)
+        if score > 0:
+            memories.append((path, content, score))
+    memories.sort(key=lambda item: (item[2], item[0].stat().st_mtime), reverse=True)
+    return memories[: cfg.memory_query_top_k]
+
+
+def build_memory_context(memories: list[tuple[Path, str, int]], max_chars: int) -> str:
+    chunks: list[str] = []
+    used = 0
+    for path, content, _score in memories:
+        header = f"\n\n--- MEMORY FILE: {path.name} ---\n"
+        remaining = max_chars - used - len(header)
+        if remaining <= 0:
+            break
+        body = content[:remaining]
+        chunks.append(header + body)
+        used += len(header) + len(body)
+    return "".join(chunks).strip()
+
+
+def answer_memory_question(question: str, cfg: ImageSummaryConfig) -> MemoryAnswer:
+    memories = relevant_memories(question, cfg)
+    if not memories:
+        return MemoryAnswer(
+            answer="I could not find a relevant memory for that question.",
+            context_paths=(),
+        )
+
+    context = build_memory_context(memories, cfg.memory_query_max_context_chars)
+    prompt = f"""
+You answer questions using only the provided local memory files.
+
+Rules:
+- Answer the user's question directly.
+- Use only facts present in the memory context.
+- If a value is unclear, say what is unclear.
+- Include the memory file name you used.
+- Do not invent missing totals or dates.
+- Do not summarize the memory files generally.
+- Prefer a short answer with the exact amount, date, vehicle, and any useful subtotal/tax detail.
+- For receipt tables, distinguish subtotal, tax, and tax-inclusive amounts when those labels are visible.
+
+QUESTION:
+{question}
+
+MEMORY CONTEXT:
+{context}
+""".strip()
+    answer = ollama_chat(cfg, cfg.memory_query_model, prompt)
+    return MemoryAnswer(
+        answer=answer,
+        context_paths=tuple(path for path, _content, _score in memories),
+    )

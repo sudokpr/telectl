@@ -110,6 +110,25 @@ Markdown under `MEMORY_WORK_DIR`, and replies with what was saved. This is the
 first step toward later command/keyword-specific handling, such as fuel receipt
 field extraction.
 
+Ask saved memories from the same topic with:
+
+```text
+/memq how much was the service labour for polo in 2026
+```
+
+or:
+
+```text
+? how much was the service labour for polo in 2026
+```
+
+The query path retrieves relevant markdown files from `MEMORY_WORK_DIR`, asks
+`MEMORY_QUERY_MODEL`, and replies with the answer plus source file names. Use a
+fast model such as `gemma4:31b-cloud` for interactive Q&A, while keeping
+`MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
+`MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
+for aggregate questions that need multiple memories.
+
 ## HTTP Intake
 
 Set `HTTP_INTAKE_ENABLED=true` to accept memory text from iOS Shortcuts or other

@@ -43,6 +43,9 @@ class ImageSummaryConfig:
     ollama_timeout_seconds: int
     memory_dir: Path
     memory_llm_model: str
+    memory_query_model: str
+    memory_query_top_k: int
+    memory_query_max_context_chars: int
 
 
 def env_bool(value: str | None, default: bool = False) -> bool:
@@ -94,6 +97,9 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         ollama_timeout_seconds=env_int(env.get("IMAGE_SUMMARY_OLLAMA_TIMEOUT_SECONDS"), 600),
         memory_dir=Path(env.get("MEMORY_WORK_DIR", "./data/memories")).expanduser(),
         memory_llm_model=env.get("MEMORY_LLM_MODEL", env.get("IMAGE_SUMMARY_OCR_LLM_MODEL", "llama3.1:8b")),
+        memory_query_model=env.get("MEMORY_QUERY_MODEL", "gemma4:31b-cloud"),
+        memory_query_top_k=env_int(env.get("MEMORY_QUERY_TOP_K"), 1),
+        memory_query_max_context_chars=env_int(env.get("MEMORY_QUERY_MAX_CONTEXT_CHARS"), 14000),
     )
 
 
