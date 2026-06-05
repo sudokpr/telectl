@@ -250,12 +250,41 @@ def is_image_summary_target(update: Update, config: Config) -> bool:
     )
 
 
+def fuel_unauthorized_reason(update: Update, config: Config) -> str | None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not config.fuel.enabled:
+        return "Fuel tracking is disabled."
+    if not message or not chat:
+        return "Unsupported update."
+    if chat.id != config.fuel.chat_id:
+        return "Fuel tracking is only enabled in the configured supergroup."
+    if message.message_thread_id != config.fuel.topic_id:
+        return "Fuel tracking is only enabled in the configured topic."
+    if config.allowed_user_ids and (not user or user.id not in config.allowed_user_ids):
+        return "You are not allowed to update fuel entries."
+    return None
+
+
 def is_fuel_target(update: Update, config: Config) -> bool:
     message = update.effective_message
     chat = update.effective_chat
     if not config.fuel.enabled or not message or not chat:
         return False
     return chat.id == config.fuel.chat_id and message.message_thread_id == config.fuel.topic_id
+
+
+async def fuel_guarded(update: Update, config: Config) -> bool:
+    reason = fuel_unauthorized_reason(update, config)
+    if not reason:
+        return True
+    if update.callback_query:
+        await update.callback_query.answer(reason, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(reason)
+    return False
 
 
 def message_debug_line(update: Update) -> str:
@@ -523,7 +552,9 @@ async def process_fuel_pending(
 async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
-    if not message or not is_fuel_target(update, config):
+    if not message:
+        return
+    if not await fuel_guarded(update, config):
         return
 
     key = fuel_group_key(message)
@@ -561,6 +592,8 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     parts = query.data.split(":")
     if len(parts) != 3 or parts[0] != "fuel":
+        return
+    if not await fuel_guarded(update, config):
         return
     action, approval_id = parts[1], parts[2]
     approvals: dict[str, FuelApproval] = context.application.bot_data.setdefault("fuel_approvals", {})
@@ -651,6 +684,8 @@ async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_
     )
     approval_id = approval_id_for_correction(message, pending_corrections)
     if not approval_id:
+        return
+    if not await fuel_guarded(update, config):
         return
 
     approval = approvals.get(approval_id)
