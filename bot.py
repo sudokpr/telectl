@@ -552,7 +552,7 @@ async def process_fuel_pending(
 async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
-    if not message:
+    if not message or not is_fuel_target(update, config):
         return
     if not await fuel_guarded(update, config):
         return
