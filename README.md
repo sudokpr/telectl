@@ -79,9 +79,45 @@ The bot registers these Telegram menu commands:
 - `/codex_start` - stop any running `codex remote-control` process and start it again
 - `/codex_status` - show whether the tracked process is running
 - `/codex_stop` - stop the tracked process
+- `/ot` - show an OwnTracks daily activity digest
+- `/tag` - tag a stop from the latest OwnTracks digest
+- `/name` - name a stop from the latest OwnTracks digest
+- `/note` - add a note to a stop from the latest OwnTracks digest
 
 Commands are only honored in `TELEGRAM_CHAT_ID` and `TELEGRAM_TOPIC_ID`.
 Output is written to `logs/codex-remote-control.log`.
+
+## OwnTracks Activity Review
+
+OwnTracks MQTT events are logged to `data/owntracks/mqtt.log`. The daily
+digest runs at 21:00 IST and posts to `OWNTRACKS_TOPIC_ID`. It is generic:
+use it for cycle rides, errands, saloon visits, government office visits,
+tax payments, work visits, or any other activity inferred from location
+stops.
+
+The digest lists named geofence events and candidate stops with Google Maps
+links, motion, duration, and point count. Each stop gets a short alias such
+as `s1`, `s2`, etc.
+
+Short commands in the OwnTracks topic:
+
+```text
+/ot [today|yesterday|YYYY-MM-DD]
+/tag s1 haircut saloon
+/name s1 Local saloon
+/note s1 haircut, paid by UPI
+```
+
+Run `/ot` first. The bot remembers the last reviewed date for you in that
+topic, so `/tag s1 ...` does not need the date. You can still include the
+date explicitly:
+
+```text
+/tag 2026-06-06 s1 property-tax govt-office
+```
+
+Saved review data is stored in `data/owntracks/user_tags.json`; the raw MQTT
+log is not modified.
 
 ## Image Summaries
 
