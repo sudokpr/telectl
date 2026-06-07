@@ -82,7 +82,9 @@ OWNTRACKS_MAP_BASE_URL=http://192.168.1.50:8787
 ```
 
 In hosted mode, `/otm` replies with a link like
-`/owntracks/map/YYYY-MM-DD?token=...` instead of attaching the HTML file.
+`/owntracks/map/YYYY-MM-DD?token=...` instead of attaching the HTML file. The
+hosted route renders the map dynamically from the OwnTracks log on each
+request, so there is no per-day HTML file to regenerate for map UI changes.
 
 The bot starts `codex remote-control` by default. If the bot runs under a
 service manager with a minimal `PATH`, set `CODEX_REMOTE_COMMAND` to an
@@ -107,7 +109,7 @@ The bot registers these Telegram menu commands:
 - `/memq` - ask saved memories
 - `/otd` - show an OwnTracks daily activity digest
 - `/otm` - send an interactive labeled OwnTracks stop map
-- `/otb` - bulk-save stop names exported by the map
+- `/otb` - bulk-save stop names, tags, and notes exported by the map
 - `/ott` - tag a stop from the latest OwnTracks digest
 - `/otn` - name a stop from the latest OwnTracks digest
 - `/oto` - add a note to a stop from the latest OwnTracks digest
@@ -128,16 +130,14 @@ tax payments, work visits, or any other activity inferred from location
 stops.
 
 The digest lists named geofence events and candidate stops with Google Maps
-links, motion, duration, and point count. It also writes a self-contained HTML
-map with all stops annotated by alias and name. The map works without external
-JavaScript, so it can open in Telegram's iOS browser. Background map tiles are
-loaded from OpenStreetMap when the file is opened. For Telegram iOS, set
-`OWNTRACKS_MAP_DELIVERY=hosted` to open the map as a normal browser URL, or
-set `OWNTRACKS_EMBED_MAP_TILES=true` to download and embed the first-view
-tiles at map-generation time; embedding sends location-derived tile coordinates
-to OpenStreetMap. In the map, you can select stops, group nearby stops, rename
-them locally, and copy a generated `/otb` command back into Telegram to save
-those names. Each stop gets a short alias such as `s1`, `s2`, etc.
+links, motion, duration, and point count. File delivery writes a self-contained
+HTML map attachment. Hosted delivery serves a dynamic Leaflet map from
+`/owntracks/map/YYYY-MM-DD`, which gives normal browser tile loading and zoom.
+Background map tiles are loaded from OpenStreetMap when the hosted map is
+opened. For Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map,
+you can select stops, rename them locally, and copy a generated `/otb` command
+back into Telegram to save those names. Each stop gets a short alias such as
+`s1`, `s2`, etc.
 
 Short commands in the OwnTracks topic:
 
@@ -145,7 +145,7 @@ Short commands in the OwnTracks topic:
 /otd [today|yesterday|DD|MM-DD|YYYY-MM-DD]
 /otm [today|yesterday|DD|MM-DD|YYYY-MM-DD]
 /otb 2026-06-06
-s1 Local saloon
+s1 Local saloon | tags: haircut saloon | note: paid by UPI
 s2 Local saloon
 /ott s1 haircut saloon
 /otn s1 Local saloon

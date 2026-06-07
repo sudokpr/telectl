@@ -31,12 +31,20 @@ def split_message(text: str, limit: int = 3900) -> list[str]:
     current: list[str] = []
     current_len = 0
     for line in text.splitlines():
-        line_len = len(line) + 1
+        remaining = line
+        while len(remaining) + 1 > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            chunks.append(remaining[:limit])
+            remaining = remaining[limit:]
+        line_len = len(remaining) + 1
         if current and current_len + line_len > limit:
             chunks.append("\n".join(current))
             current = []
             current_len = 0
-        current.append(line)
+        current.append(remaining)
         current_len += line_len
     if current:
         chunks.append("\n".join(current))

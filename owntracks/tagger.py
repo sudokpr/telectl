@@ -267,7 +267,7 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         motions = Counter(motion for item in cluster for motion in item.motion)
         regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
         name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
-        stop_id = f"{slug(name)}-{cluster[0].line_no}-{cluster[-1].line_no}"
+        stop_id = f"{slug(name)}-{cluster[0].line_no}"
         stops.append(
             {
                 "id": stop_id,
@@ -307,10 +307,7 @@ def apply_user_tags(plan: dict, user_tags: dict) -> dict:
     plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + global_tags))
     stop_overrides = day_tags.get("stops", {})
     for stop in plan["candidate_stops"]:
-        override = stop_overrides.get(stop["id"], {})
-        if not override:
-            legacy_id = legacy_stop_id(stop["id"])
-            override = stop_overrides.get(legacy_id, {}) if legacy_id else {}
+        override = stop_override_for(stop, stop_overrides)
         if override.get("name"):
             stop["reviewed_name"] = override["name"]
         if override.get("tags"):
@@ -321,8 +318,33 @@ def apply_user_tags(plan: dict, user_tags: dict) -> dict:
     return plan
 
 
+def stop_override_for(stop: dict, stop_overrides: dict) -> dict:
+    stop_id = stop["id"]
+    if stop_id in stop_overrides:
+        return stop_overrides[stop_id]
+    old_range_re = re.compile(rf"^{re.escape(stop_id)}-\d+$")
+    for saved_id, override in stop_overrides.items():
+        if old_range_re.fullmatch(saved_id):
+            return override
+    for fallback_id in fallback_stop_ids(stop_id):
+        if fallback_id in stop_overrides:
+            return stop_overrides[fallback_id]
+    return {}
+
+
+def fallback_stop_ids(stop_id: str) -> list[str]:
+    values = []
+    legacy_id = legacy_stop_id(stop_id)
+    if legacy_id:
+        values.append(legacy_id)
+    stable_match = re.fullmatch(r"(.+-\d+)-\d+", stop_id)
+    if stable_match:
+        values.append(stable_match.group(1))
+    return values
+
+
 def legacy_stop_id(stop_id: str) -> str | None:
-    match = re.fullmatch(r"(unnamed-stop-\d+)-\d+-\d+", stop_id)
+    match = re.fullmatch(r"(unnamed-stop-\d+)(?:-\d+){1,2}", stop_id)
     return match.group(1) if match else None
 
 
@@ -416,6 +438,8 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             "duration": stop.get("duration", ""),
             "points": stop.get("points", ""),
             "maps": stop.get("maps", ""),
+            "tags": stop.get("user_tags", []),
+            "note": stop.get("user_note", ""),
         }
         for stop in plan.get("candidate_stops", [])
         if stop.get("lat") is not None and stop.get("lon") is not None
@@ -519,6 +543,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
                     f'<image class="tile" href="{href}" x="{min(xy1[0], xy2[0]):.1f}" y="{min(xy1[1], xy2[1]):.1f}" '
                     f'width="{abs(xy2[0] - xy1[0]):.1f}" height="{abs(xy2[1] - xy1[1]):.1f}" preserveAspectRatio="none"></image>'
                 )
+    embedded_tile_images = bool(tile_images) and all("data:image/png;base64," in image for image in tile_images)
     fallback_places = []
     for place in named_places:
         xy = project_point(place["lat"], place["lon"])
@@ -736,6 +761,21 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       min-width: 36px;
       padding: 6px 8px;
     }}
+    .map-status {{
+      background: rgb(255 255 255 / 0.92);
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      bottom: 10px;
+      box-shadow: 0 2px 10px rgb(15 23 42 / 0.14);
+      color: #111827;
+      font-size: 12px;
+      font-weight: 700;
+      left: 10px;
+      line-height: 1.35;
+      padding: 6px 8px;
+      position: absolute;
+      z-index: 2;
+    }}
     .route {{
       fill: none;
       stroke: #2563eb;
@@ -823,6 +863,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         <button id="zoomOut" type="button">-</button>
         <button id="resetView" class="secondary" type="button">Reset</button>
       </div>
+      <div id="mapStatus" class="map-status">tiles: loading</div>
       <svg id="map" aria-label="{escaped_title}" viewBox="0 0 1000 700" role="img">
         <defs>
           <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
@@ -894,17 +935,22 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     const stopsLayer = document.getElementById("stops");
     const stopList = document.getElementById("stopList");
     const commands = document.getElementById("commands");
+    const mapStatus = document.getElementById("mapStatus");
     const width = 1000;
     const height = 700;
     const padding = 70;
     const selected = new Set();
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
-    const embeddedTiles = {str(bool(tile_images)).lower()};
+    const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
+    const originalNotes = new Map(data.stops.map((stop) => [stop.alias, stop.note || ""]));
+    const embeddedTiles = {str(embedded_tile_images).lower()};
     let viewBox = [0, 0, width, height];
     let dragStart = null;
     let stopTapStart = null;
     const activePointers = new Map();
     let pinchStart = null;
+    let currentTileZoom = null;
+    let currentTileCount = 0;
 
     const allPoints = [
       ...data.track,
@@ -963,24 +1009,41 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       }};
     }};
     const drawTiles = () => {{
-      if (embeddedTiles) return;
+      if (!allPoints.length) {{
+        currentTileZoom = null;
+        currentTileCount = 0;
+        mapStatus.textContent = "no location data";
+        return;
+      }}
+      if (embeddedTiles) {{
+        currentTileZoom = "embedded";
+        currentTileCount = tilesLayer.querySelectorAll("image").length;
+        mapStatus.textContent = `tiles: embedded · count ${{currentTileCount}}`;
+        return;
+      }}
       const bounds = currentGeoBounds();
       const lonSpan = Math.max(0.00001, Math.abs(bounds.maxLon - bounds.minLon));
-      const zoomLevel = clamp(Math.round(Math.log2(5 * 360 / lonSpan)), 1, 19);
+      const deviceBoost = Math.ceil(Math.log2(window.devicePixelRatio || 1));
+      const zoomLevel = clamp(Math.round(Math.log2(5 * 360 / lonSpan)) + deviceBoost + 2, 1, 19);
       const maxTile = (2 ** zoomLevel) - 1;
       const minTileX = clamp(lonToTileX(bounds.minLon, zoomLevel) - 1, 0, maxTile);
       const maxTileX = clamp(lonToTileX(bounds.maxLon, zoomLevel) + 1, 0, maxTile);
       const minTileY = clamp(latToTileY(bounds.maxLat, zoomLevel) - 1, 0, maxTile);
       const maxTileY = clamp(latToTileY(bounds.minLat, zoomLevel) + 1, 0, maxTile);
       const pieces = [];
+      let sampleTile = "";
       for (let x = minTileX; x <= maxTileX; x += 1) {{
         for (let y = minTileY; y <= maxTileY; y += 1) {{
+          if (!sampleTile) sampleTile = `${{zoomLevel}}/${{x}}/${{y}}`;
           const [x1, y1] = project(tileLat(y, zoomLevel), tileLon(x, zoomLevel));
           const [x2, y2] = project(tileLat(y + 1, zoomLevel), tileLon(x + 1, zoomLevel));
           pieces.push(`<image class="tile" href="https://tile.openstreetmap.org/${{zoomLevel}}/${{x}}/${{y}}.png" x="${{Math.min(x1, x2)}}" y="${{Math.min(y1, y2)}}" width="${{Math.abs(x2 - x1)}}" height="${{Math.abs(y2 - y1)}}" preserveAspectRatio="none"></image>`);
         }}
       }}
       tilesLayer.innerHTML = pieces.join("");
+      currentTileZoom = zoomLevel;
+      currentTileCount = pieces.length;
+      mapStatus.textContent = `tile z${{zoomLevel}} · count ${{pieces.length}} · dpr ${{(window.devicePixelRatio || 1).toFixed(1)}} · ${{sampleTile}}`;
     }};
     const distanceMeters = (a, b) => {{
       const radius = 6371008.8;
@@ -1232,6 +1295,452 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}, {{ passive: false }});
     setViewBox();
     refresh();
+  </script>
+</body>
+</html>"""
+
+
+def render_leaflet_map_html(plan: dict) -> str:
+    title = f"OwnTracks map - {plan['date']}"
+    track = [
+        [point["lat"], point["lon"]]
+        for point in plan.get("sampled_track", [])
+        if point.get("lat") is not None and point.get("lon") is not None
+    ]
+    stops = [
+        {
+            "alias": stop.get("alias", ""),
+            "name": stop.get("reviewed_name") or stop.get("name") or "unnamed stop",
+            "id": stop.get("id", ""),
+            "lat": stop.get("lat"),
+            "lon": stop.get("lon"),
+            "start": stop.get("start", ""),
+            "end": stop.get("end", ""),
+            "duration": stop.get("duration", ""),
+            "points": stop.get("points", ""),
+            "maps": stop.get("maps", ""),
+            "tags": stop.get("user_tags", []),
+            "note": stop.get("user_note", ""),
+        }
+        for stop in plan.get("candidate_stops", [])
+        if stop.get("lat") is not None and stop.get("lon") is not None
+    ]
+    named_places = [
+        {
+            "name": place.get("name", ""),
+            "action": place.get("action", ""),
+            "lat": place.get("lat"),
+            "lon": place.get("lon"),
+            "time": place.get("time", ""),
+        }
+        for place in plan.get("named_places", [])
+        if place.get("lat") is not None and place.get("lon") is not None
+    ]
+    payload = json.dumps(
+        {"date": plan["date"], "track": track, "stops": stops, "namedPlaces": named_places},
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
+    escaped_title = escape(title)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escaped_title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{
+      height: 100%;
+      margin: 0;
+    }}
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    #map {{
+      background: #dbeafe;
+    }}
+    .tools {{
+      background: rgb(255 255 255 / 0.94);
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgb(15 23 42 / 0.18);
+      left: 10px;
+      max-height: calc(100vh - 20px);
+      max-width: min(420px, calc(100vw - 20px));
+      overflow: auto;
+      padding: 10px;
+      position: absolute;
+      top: 10px;
+      z-index: 1000;
+    }}
+    .tools h1 {{
+      font-size: 15px;
+      margin: 0 0 8px;
+    }}
+    .tools textarea, .tools input {{
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font: inherit;
+      padding: 7px;
+      width: 100%;
+    }}
+    .tools textarea {{
+      height: 72px;
+      margin-top: 8px;
+    }}
+    .tools label {{
+      color: #374151;
+      display: block;
+      font-size: 12px;
+      font-weight: 750;
+      margin: 8px 0 4px;
+    }}
+    .row {{
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .row > * {{
+      flex: 1;
+    }}
+    button {{
+      background: #111827;
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 7px 9px;
+    }}
+    button.secondary {{
+      background: #e5e7eb;
+      color: #111827;
+    }}
+    .status {{
+      color: #374151;
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 7px;
+    }}
+    .stop-list {{
+      margin-top: 8px;
+      max-height: 34vh;
+      overflow: auto;
+    }}
+    .stop-row {{
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      margin-bottom: 6px;
+      padding: 7px;
+    }}
+    .stop-row.selected {{
+      border-color: #dc2626;
+      box-shadow: 0 0 0 1px #dc2626 inset;
+    }}
+    .stop-head {{
+      align-items: center;
+      display: flex;
+      gap: 7px;
+      margin-bottom: 6px;
+    }}
+    .stop-head input {{
+      width: auto;
+    }}
+    .alias {{
+      background: #111827;
+      border-radius: 4px;
+      color: white;
+      font-size: 12px;
+      font-weight: 800;
+      min-width: 34px;
+      padding: 3px 5px;
+      text-align: center;
+    }}
+    .meta {{
+      color: #6b7280;
+      font-size: 11px;
+      line-height: 1.35;
+      margin-top: 5px;
+    }}
+    .stop-label {{
+      background: #111827;
+      border: 0;
+      border-radius: 4px;
+      box-shadow: 0 2px 8px rgb(0 0 0 / 0.22);
+      color: white;
+      font-size: 13px;
+      font-weight: 800;
+      padding: 4px 6px;
+    }}
+    .place-label {{
+      background: white;
+      border: 1px solid #2563eb;
+      border-radius: 4px;
+      color: #1e3a8a;
+      font-size: 12px;
+      font-weight: 750;
+      padding: 3px 5px;
+    }}
+    .empty {{
+      background: white;
+      border-radius: 8px;
+      left: 50%;
+      padding: 16px 18px;
+      position: absolute;
+      text-align: center;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 999;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="tools">
+    <h1>{escaped_title}</h1>
+    <div class="row">
+      <button id="selectAll" type="button" class="secondary">Select all</button>
+      <button id="clearSelection" type="button" class="secondary">Clear</button>
+      <button id="fitAll" type="button" class="secondary">Fit</button>
+    </div>
+    <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
+    <label for="groupDistance">Nearby grouping distance, meters</label>
+    <input id="groupDistance" type="number" min="20" step="10" value="150">
+    <div class="row">
+      <button id="selectNearby" type="button">Select nearby</button>
+      <button id="groupSelected" type="button">Group selected</button>
+    </div>
+    <label for="bulkName">Name for selected stops</label>
+    <input id="bulkName" placeholder="Name selected stops">
+    <div class="row">
+      <button id="applyName" type="button">Apply</button>
+      <button id="copyCommands" type="button" class="secondary">Copy</button>
+    </div>
+    <div id="stopList" class="stop-list"></div>
+    <label for="commands">Paste this in Telegram</label>
+    <textarea id="commands" readonly></textarea>
+    <div id="status" class="status">loading</div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const data = {payload};
+    const selected = new Set();
+    const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
+    const commands = document.getElementById("commands");
+    const status = document.getElementById("status");
+    const map = L.map("map", {{ preferCanvas: true }});
+    const tiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }}).addTo(map);
+    const bounds = [];
+    const markers = new Map();
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }}[char]));
+    const updateStatus = () => {{
+      status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · stops ${{data.stops.length}}`;
+    }};
+    const distanceMeters = (a, b) => {{
+      const radius = 6371008.8;
+      const toRad = (value) => value * Math.PI / 180;
+      const dLat = toRad(b.lat - a.lat);
+      const dLon = toRad(b.lon - a.lon);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      return 2 * radius * Math.asin(Math.sqrt(h));
+    }};
+    const updateCommands = () => {{
+      const changed = data.stops.filter((stop) =>
+        stop.name !== originalNames.get(stop.alias)
+        || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
+        || (stop.note || "") !== originalNotes.get(stop.alias)
+      );
+      commands.value = changed.length
+        ? [
+            "/otb " + data.date,
+            ...changed.map((stop) => {{
+              const parts = [`${{stop.alias}} ${{stop.name}}`];
+              if ((stop.tags || []).length) parts.push(`tags: ${{stop.tags.join(" ")}}`);
+              if (stop.note) parts.push(`note: ${{stop.note}}`);
+              return parts.join(" | ");
+            }})
+          ].join("\\n")
+        : "";
+      updateStatus();
+    }};
+    const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
+    const iconFor = (stop) => L.divIcon({{
+      className: "",
+      html: `<div style="background:${{selected.has(stop.alias) ? "#f59e0b" : "#dc2626"}};border:3px solid white;border-radius:999px;box-shadow:0 1px 7px rgb(0 0 0 / .35);height:18px;width:18px"></div>`,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    }});
+    const labelFor = (stop) => `${{stop.alias}}: ${{stop.name}}`;
+    const refreshStop = (stop) => {{
+      const marker = markers.get(stop.alias);
+      if (!marker) return;
+      marker.setIcon(iconFor(stop));
+      marker.setTooltipContent(escapeHtml(labelFor(stop)));
+      marker.setPopupContent(`
+        <strong>${{escapeHtml(labelFor(stop))}}</strong><br>
+        ${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}}<br>
+        ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points<br>
+        <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
+      `);
+    }};
+    const renderList = () => {{
+      const stopList = document.getElementById("stopList");
+      stopList.innerHTML = data.stops.map((stop) => `
+        <div class="stop-row ${{selected.has(stop.alias) ? "selected" : ""}}">
+          <div class="stop-head">
+            <input type="checkbox" data-check="${{escapeHtml(stop.alias)}}" ${{selected.has(stop.alias) ? "checked" : ""}}>
+            <span class="alias">${{escapeHtml(stop.alias)}}</span>
+            <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
+          </div>
+          <input data-name="${{escapeHtml(stop.alias)}}" value="${{escapeHtml(stop.name)}}">
+          <input data-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
+          <textarea data-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
+          <div class="meta">${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}} · ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points</div>
+        </div>
+      `).join("");
+      stopList.querySelectorAll("[data-check]").forEach((input) => {{
+        input.addEventListener("change", () => setSelected(input.dataset.check, input.checked, true));
+      }});
+      stopList.querySelectorAll("[data-name]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.name);
+          if (!stop) return;
+          stop.name = input.value.trim() || originalNames.get(stop.alias);
+          refreshStop(stop);
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-tags]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.tags);
+          if (!stop) return;
+          stop.tags = input.value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-note]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.note);
+          if (!stop) return;
+          stop.note = input.value.trim();
+          updateCommands();
+        }});
+      }});
+    }};
+    const refreshSelectedStops = () => {{
+      for (const stop of data.stops) refreshStop(stop);
+      renderList();
+      updateCommands();
+    }};
+    const centerStop = (stop) => {{
+      map.panTo([stop.lat, stop.lon]);
+    }};
+    const setSelected = (alias, isSelected, center = false) => {{
+      const stop = data.stops.find((item) => item.alias === alias);
+      if (!stop) return;
+      if (isSelected) selected.add(alias);
+      else selected.delete(alias);
+      refreshStop(stop);
+      renderList();
+      updateCommands();
+      if (isSelected && center) centerStop(stop);
+    }};
+    const toggleStop = (stop) => {{
+      setSelected(stop.alias, !selected.has(stop.alias), true);
+    }};
+    if (data.track.length) {{
+      const route = L.polyline(data.track, {{ color: "#2563eb", weight: 4, opacity: 0.8 }}).addTo(map);
+      bounds.push(route.getBounds());
+    }}
+    for (const place of data.namedPlaces) {{
+      const label = `${{place.action || ""}} ${{place.name}}`.trim();
+      const marker = L.circleMarker([place.lat, place.lon], {{ radius: 6, color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(map);
+      marker.bindTooltip(escapeHtml(label), {{ permanent: true, direction: "right", className: "place-label" }});
+      marker.bindPopup(`<strong>${{escapeHtml(label)}}</strong><br>${{escapeHtml(place.time)}}`);
+      bounds.push(marker.getLatLng());
+    }}
+    for (const stop of data.stops) {{
+      const marker = L.marker([stop.lat, stop.lon], {{ icon: iconFor(stop) }}).addTo(map);
+      markers.set(stop.alias, marker);
+      marker.bindTooltip(escapeHtml(labelFor(stop)), {{ permanent: true, direction: "top", offset: [0, -12], className: "stop-label" }});
+      marker.on("click", () => toggleStop(stop));
+      bounds.push(marker.getLatLng());
+      refreshStop(stop);
+    }}
+    if (bounds.length) {{
+      const group = L.featureGroup(bounds.map((item) => item instanceof L.LatLngBounds ? L.rectangle(item, {{ opacity: 0, fillOpacity: 0 }}) : L.marker(item, {{ opacity: 0 }})));
+      map.fitBounds(group.getBounds().pad(0.18));
+    }} else {{
+      map.setView([0, 0], 2);
+      document.body.insertAdjacentHTML("beforeend", `<div class="empty"><strong>No OwnTracks points for ${{escapeHtml(data.date)}}</strong><br>Try another date.</div>`);
+    }}
+    document.getElementById("applyName").addEventListener("click", () => {{
+      const value = document.getElementById("bulkName").value.trim();
+      if (!value) return;
+      selectedStops().forEach((stop) => stop.name = value);
+      refreshSelectedStops();
+    }});
+    document.getElementById("selectAll").addEventListener("click", () => {{
+      data.stops.forEach((stop) => selected.add(stop.alias));
+      refreshSelectedStops();
+    }});
+    document.getElementById("clearSelection").addEventListener("click", () => {{
+      selected.clear();
+      refreshSelectedStops();
+    }});
+    document.getElementById("centerSelected").addEventListener("click", () => {{
+      const stop = selectedStops()[0];
+      if (stop) centerStop(stop);
+    }});
+    document.getElementById("selectNearby").addEventListener("click", () => {{
+      const picked = selectedStops()[0] || data.stops[0];
+      const threshold = Number(document.getElementById("groupDistance").value) || 150;
+      if (!picked) return;
+      selected.clear();
+      data.stops.filter((stop) => distanceMeters(picked, stop) <= threshold).forEach((stop) => selected.add(stop.alias));
+      refreshSelectedStops();
+      centerStop(picked);
+    }});
+    document.getElementById("groupSelected").addEventListener("click", () => {{
+      const stops = selectedStops();
+      if (!stops.length) return;
+      const existing = stops.find((stop) => !/^unnamed-stop-\\d+$/.test(stop.name));
+      const name = document.getElementById("bulkName").value.trim() || (existing ? existing.name : stops[0].name);
+      stops.forEach((stop) => stop.name = name);
+      document.getElementById("bulkName").value = name;
+      refreshSelectedStops();
+    }});
+    document.getElementById("copyCommands").addEventListener("click", async () => {{
+      updateCommands();
+      commands.select();
+      try {{
+        await navigator.clipboard.writeText(commands.value);
+      }} catch (error) {{
+        document.execCommand("copy");
+      }}
+    }});
+    document.getElementById("fitAll").addEventListener("click", () => {{
+      if (bounds.length) {{
+        const group = L.featureGroup(bounds.map((item) => item instanceof L.LatLngBounds ? L.rectangle(item, {{ opacity: 0, fillOpacity: 0 }}) : L.marker(item, {{ opacity: 0 }})));
+        map.fitBounds(group.getBounds().pad(0.18));
+      }}
+    }});
+    map.on("zoomend moveend", updateStatus);
+    tiles.on("tileloadstart tileload tileerror", updateStatus);
+    renderList();
+    updateCommands();
   </script>
 </body>
 </html>"""

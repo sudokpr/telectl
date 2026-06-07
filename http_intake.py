@@ -15,6 +15,7 @@ from telegram.ext import Application
 
 from image_summary import ImageSummaryConfig, log, split_message
 from memory_processor import save_memory
+from owntracks.digest import generate_hosted_map
 
 
 @dataclass(frozen=True)
@@ -127,11 +128,12 @@ def make_handler(
                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", match):
                     write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid date"})
                     return
-                path = project_relative_path(http_cfg.owntracks_derived_dir) / f"activity-map-{match}.html"
-                if not path.exists():
-                    write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "map not found"})
+                try:
+                    _plan, html = generate_hosted_map(match)
+                except Exception as exc:
+                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                     return
-                body = path.read_bytes()
+                body = html.encode("utf-8")
                 self.send_response(HTTPStatus.OK.value)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
