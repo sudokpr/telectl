@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -41,6 +42,24 @@ LOG_DIR = BASE_DIR / "logs"
 PID_FILE = RUN_DIR / "codex-remote-control.pid"
 LOG_FILE = LOG_DIR / "codex-remote-control.log"
 
+COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
+    ("cmd", "list bot command shortcuts"),
+    ("cxr", "restart Codex remote control"),
+    ("cxs", "show Codex remote-control status"),
+    ("cxq", "stop Codex remote control"),
+    ("memq", "ask saved memories"),
+    ("otd", "show OwnTracks activity digest"),
+    ("otm", "send interactive OwnTracks map"),
+    ("otb", "bulk-save OwnTracks stop names"),
+    ("ott", "tag an OwnTracks stop"),
+    ("otn", "name an OwnTracks stop"),
+    ("oto", "add an OwnTracks stop note"),
+    ("oth", "show OwnTracks help"),
+)
+
+OWNTRACKS_DATE_RE = re.compile(r"(?:today|yesterday|\d{1,2}|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})")
+OWNTRACKS_DATE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD"
+
 
 @dataclass(frozen=True)
 class Config:
@@ -49,12 +68,15 @@ class Config:
     topic_id: int
     allowed_user_ids: frozenset[int]
     command: str
+    codex_remote_detached: bool
     workdir: Path
     image_summary: ImageSummaryConfig
     http_intake: HttpIntakeConfig
     fuel: FuelConfig
     owntracks_topic_id: int
     owntracks_user_tags_path: Path
+    owntracks_map_delivery: str
+    owntracks_map_base_url: str
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -124,6 +146,8 @@ def load_config() -> Config:
         topic_id=int(topic_id or "0"),
         allowed_user_ids=parse_user_ids(first_value(["ALLOWED_USER_IDS"], local_env)),
         command=command,
+        codex_remote_detached=(first_value(["CODEX_REMOTE_DETACHED"], local_env) or "true").strip().lower()
+        in {"1", "true", "yes", "on"},
         workdir=workdir,
         image_summary=build_image_summary_config(image_summary_env, int(chat_id or "0")),
         http_intake=build_http_config(image_summary_env),
@@ -133,6 +157,8 @@ def load_config() -> Config:
             first_value(["OWNTRACKS_USER_TAGS_PATH"], local_env),
             "./data/owntracks/user_tags.json",
         ),
+        owntracks_map_delivery=(first_value(["OWNTRACKS_MAP_DELIVERY"], local_env) or "file").strip().lower(),
+        owntracks_map_base_url=(first_value(["OWNTRACKS_MAP_BASE_URL", "HTTP_PUBLIC_BASE_URL"], local_env) or "").strip(),
     )
 
 
@@ -184,6 +210,23 @@ def remote_command(config: Config, subcommand: str) -> str:
     return f"{config.command} {subcommand}"
 
 
+def detached_remote_start_command(config: Config) -> str:
+    return " ".join(
+        [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            "--unit=codex-remote-control",
+            f"--working-directory={shlex.quote(str(config.workdir))}",
+            "/bin/bash",
+            "-lc",
+            shlex.quote(remote_command(config, "start")),
+        ]
+    )
+
+
 def daemon_version_command(config: Config) -> str:
     parts = shlex.split(config.command)
     if not parts:
@@ -194,6 +237,8 @@ def daemon_version_command(config: Config) -> str:
 def start_process(config: Config) -> subprocess.CompletedProcess[str]:
     RUN_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
+    if config.codex_remote_detached:
+        return run_shell_command(detached_remote_start_command(config), config.workdir)
     return run_shell_command(remote_command(config, "start"), config.workdir)
 
 
@@ -805,6 +850,14 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
     await answer_memory_query(update, context, match.group(1))
 
 
+async def command_shortcuts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["Bot command shortcuts:"]
+    lines.extend(f"/{name} - {description}" for name, description in COMMAND_SHORTCUTS)
+    lines.append("")
+    lines.append("Long underscore commands may still work as hidden compatibility aliases.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config | None = context.application.bot_data.get("config")
     if config:
@@ -831,8 +884,10 @@ async def codex_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if start_result.returncode == 0 and status_result.returncode == 0:
+        start_mode = "detached systemd user scope" if config.codex_remote_detached else "bot service process"
         await update.effective_message.reply_text(
             "Restarted codex remote-control daemon.\n"
+            f"Mode: {start_mode}\n"
             f"Command: {remote_command(config, 'start')}\n"
             f"Status: {command_summary(status_result)}\n"
             f"Log: {LOG_FILE}"
@@ -929,6 +984,62 @@ async def owntracks_digest_command(update: Update, context: ContextTypes.DEFAULT
         await update.effective_message.reply_text(chunk, disable_web_page_preview=False)
 
 
+def owntracks_map_url(config: Config, date_text: str) -> str:
+    base_url = config.owntracks_map_base_url
+    if not base_url:
+        host = config.http_intake.host
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        base_url = f"http://{host}:{config.http_intake.port}"
+    url = f"{base_url.rstrip('/')}/owntracks/map/{quote(date_text)}"
+    if config.http_intake.token:
+        url += "?" + urlencode({"token": config.http_intake.token})
+    return url
+
+
+async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not await owntracks_guarded(update, config):
+        return
+    if context.args:
+        date_text = context.args[0]
+        if not OWNTRACKS_DATE_RE.fullmatch(date_text):
+            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_DATE_USAGE}]")
+            return
+    else:
+        date_text = remembered_owntracks_date(update, context) or "today"
+    try:
+        plan, _digest, digest_path = generate_owntracks_digest(date_text)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not generate OwnTracks map: {exc}")
+        return
+    remember_owntracks_date(update, context, plan["date"])
+    map_path = digest_path.with_name(f"activity-map-{plan['date']}.html")
+    if not map_path.exists():
+        await update.effective_message.reply_text(f"OwnTracks map was not written: {map_path}")
+        return
+    if config.owntracks_map_delivery == "hosted":
+        if not config.http_intake.enabled:
+            await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY=hosted requires HTTP_INTAKE_ENABLED=true.")
+            return
+        url = owntracks_map_url(config, plan["date"])
+        await update.effective_message.reply_text(
+            f"OwnTracks map for {plan['date']}:\n{url}",
+            disable_web_page_preview=True,
+        )
+        return
+    if config.owntracks_map_delivery not in {"file", "html", "attachment"}:
+        await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY must be 'file' or 'hosted'.")
+        return
+    caption = f"OwnTracks map for {plan['date']} with labeled stops."
+    with map_path.open("rb") as handle:
+        await update.effective_message.reply_document(
+            document=handle,
+            filename=map_path.name,
+            caption=caption,
+        )
+
+
 def owntracks_session_key(update: Update) -> str:
     message = update.effective_message
     user = update.effective_user
@@ -948,14 +1059,14 @@ def remembered_owntracks_date(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def owntracks_date_and_args(update: Update, context: ContextTypes.DEFAULT_TYPE, min_tail: int) -> tuple[str | None, list[str], str | None]:
     args = list(context.args)
-    if args and re.fullmatch(r"\d{4}-\d{2}-\d{2}|today|yesterday", args[0]):
+    if args and OWNTRACKS_DATE_RE.fullmatch(args[0]):
         return args[0], args[1:], None
     remembered = remembered_owntracks_date(update, context)
     if remembered:
         return remembered, args, None
     if len(args) >= min_tail + 1:
         return args[0], args[1:], None
-    return None, args, "Run /ot YYYY-MM-DD first, or include a date."
+    return None, args, f"Run /otd {OWNTRACKS_DATE_USAGE} first, or include a date."
 
 
 def resolve_owntracks_stop_id(date_text: str, stop_ref: str) -> tuple[str, str]:
@@ -967,6 +1078,70 @@ def resolve_owntracks_stop_id(date_text: str, stop_ref: str) -> tuple[str, str]:
     raise ValueError(f"Unknown stop '{stop_ref}'. Valid stops: {valid or 'none'}")
 
 
+async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not await owntracks_guarded(update, config):
+        return
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+    if not lines:
+        return
+    first_parts = lines[0].split(maxsplit=1)
+    date_text = remembered_owntracks_date(update, context) or "today"
+    inline_pairs: list[str] = []
+    if len(first_parts) > 1:
+        tail = first_parts[1].strip()
+        if OWNTRACKS_DATE_RE.fullmatch(tail):
+            date_text = tail
+        else:
+            inline_pairs.append(tail)
+    pair_lines = inline_pairs + lines[1:]
+    if not pair_lines:
+        await message.reply_text(f"Usage:\n/otb {OWNTRACKS_DATE_USAGE}\ns1 Place name\ns2 Place name")
+        return
+    try:
+        plan, _digest, _path = generate_owntracks_digest(date_text)
+    except Exception as exc:
+        await message.reply_text(f"Could not load OwnTracks stops: {exc}")
+        return
+    stop_ids_by_ref = {
+        ref: stop["id"]
+        for stop in plan["candidate_stops"]
+        for ref in (stop["id"], stop.get("alias"))
+        if ref
+    }
+    updates: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for line in pair_lines:
+        parts = line.split(maxsplit=1)
+        if len(parts) < 2:
+            errors.append(f"Missing name: {line}")
+            continue
+        stop_ref, name = parts[0], parts[1].strip()
+        stop_id = stop_ids_by_ref.get(stop_ref)
+        if not stop_id:
+            errors.append(f"Unknown stop: {stop_ref}")
+            continue
+        if not name:
+            errors.append(f"Missing name: {stop_ref}")
+            continue
+        updates.append((stop_id, name))
+    if not updates:
+        await message.reply_text("No names saved. " + "; ".join(errors[:5]))
+        return
+    tags_path = config.owntracks_user_tags_path
+    data = load_owntracks_user_tags(tags_path)
+    stops = data.setdefault(plan["date"], {}).setdefault("stops", {})
+    for stop_id, name in updates:
+        stops.setdefault(stop_id, {})["name"] = name
+    save_owntracks_user_tags(tags_path, data)
+    remember_owntracks_date(update, context, plan["date"])
+    suffix = f"\nSkipped: {'; '.join(errors[:5])}" if errors else ""
+    await message.reply_text(f"Saved {len(updates)} OwnTracks stop names for {plan['date']}.{suffix}")
+
+
 async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
@@ -976,7 +1151,7 @@ async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text(error)
         return
     if len(args) < 2 or not date_text:
-        await update.effective_message.reply_text("Usage: /tag s1 tag1 tag2 or /tag YYYY-MM-DD s1 tag1 tag2")
+        await update.effective_message.reply_text(f"Usage: /ott s1 tag1 tag2 or /ott {OWNTRACKS_DATE_USAGE} s1 tag1 tag2")
         return
     stop_ref = args[0]
     tags = args[1:]
@@ -1006,7 +1181,7 @@ async def owntracks_name_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.effective_message.reply_text(error)
         return
     if len(args) < 2 or not date_text:
-        await update.effective_message.reply_text("Usage: /name s1 place name or /name YYYY-MM-DD s1 place name")
+        await update.effective_message.reply_text(f"Usage: /otn s1 place name or /otn {OWNTRACKS_DATE_USAGE} s1 place name")
         return
     stop_ref = args[0]
     name = " ".join(args[1:])
@@ -1033,7 +1208,7 @@ async def owntracks_note_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.effective_message.reply_text(error)
         return
     if len(args) < 2 or not date_text:
-        await update.effective_message.reply_text("Usage: /note s1 what happened or /note YYYY-MM-DD s1 what happened")
+        await update.effective_message.reply_text(f"Usage: /oto s1 what happened or /oto {OWNTRACKS_DATE_USAGE} s1 what happened")
         return
     stop_ref = args[0]
     note = " ".join(args[1:])
@@ -1057,26 +1232,19 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     await update.effective_message.reply_text(
         "OwnTracks commands:\n"
-        "/ot [today|yesterday|YYYY-MM-DD]\n"
-        "/tag s1 tag1 tag2\n"
-        "/name s1 place name\n"
-        "/note s1 what happened\n"
-        "Run /ot first; s1/s2 aliases come from the latest digest."
+        f"/otd [{OWNTRACKS_DATE_USAGE}]\n"
+        f"/otm [{OWNTRACKS_DATE_USAGE}]\n"
+        f"/otb {OWNTRACKS_DATE_USAGE} then lines like: s1 Place name\n"
+        "/ott s1 tag1 tag2\n"
+        "/otn s1 place name\n"
+        "/oto s1 what happened\n"
+        "Run /otd first; s1/s2 aliases come from the latest digest."
     )
 
 
 async def post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
-    commands = [
-        BotCommand("codex_start", "restart Codex remote control"),
-        BotCommand("codex_status", "show Codex remote-control status"),
-        BotCommand("codex_stop", "stop Codex remote control"),
-        BotCommand("memq", "ask saved memories"),
-        BotCommand("ot", "show OwnTracks activity digest"),
-        BotCommand("tag", "tag an OwnTracks stop"),
-        BotCommand("name", "name an OwnTracks stop"),
-        BotCommand("note", "add an OwnTracks stop note"),
-    ]
+    commands = [BotCommand(name, description) for name, description in COMMAND_SHORTCUTS]
     await application.bot.set_my_commands(
         commands,
         scope=BotCommandScopeChat(chat_id=config.chat_id),
@@ -1112,15 +1280,18 @@ def main() -> None:
     application.bot_data["fuel_approvals"] = {}
     application.add_handler(MessageHandler(filters.ALL, debug_update), group=-1)
     application.add_handler(CallbackQueryHandler(fuel_callback_handler, pattern=r"^fuel:"))
-    application.add_handler(CommandHandler("codex_start", codex_start))
-    application.add_handler(CommandHandler("codex_status", codex_status))
-    application.add_handler(CommandHandler("codex_stop", codex_stop))
+    application.add_handler(CommandHandler(["cmd", "commands", "help"], command_shortcuts_command))
+    application.add_handler(CommandHandler(["cxr", "codex_start"], codex_start))
+    application.add_handler(CommandHandler(["cxs", "codex_status"], codex_status))
+    application.add_handler(CommandHandler(["cxq", "codex_stop"], codex_stop))
     application.add_handler(CommandHandler(["memq", "memory_query"], memory_query_command))
-    application.add_handler(CommandHandler(["owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
-    application.add_handler(CommandHandler(["ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
-    application.add_handler(CommandHandler(["tag", "owntracks_tag", "ot_tag"], owntracks_tag_command))
-    application.add_handler(CommandHandler(["name", "owntracks_name", "ot_name"], owntracks_name_command))
-    application.add_handler(CommandHandler(["note", "owntracks_note", "ot_note"], owntracks_note_command))
+    application.add_handler(CommandHandler(["oth", "owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
+    application.add_handler(CommandHandler(["otd", "ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
+    application.add_handler(CommandHandler(["otm", "ot_map", "owntracks_map"], owntracks_map_command))
+    application.add_handler(CommandHandler(["otb", "ot_names", "owntracks_names"], owntracks_names_command))
+    application.add_handler(CommandHandler(["ott", "tag", "owntracks_tag", "ot_tag"], owntracks_tag_command))
+    application.add_handler(CommandHandler(["otn", "name", "owntracks_name", "ot_name"], owntracks_name_command))
+    application.add_handler(CommandHandler(["oto", "note", "owntracks_note", "ot_note"], owntracks_note_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, fuel_image_handler), group=0)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_summary_handler), group=1)
     application.add_handler(

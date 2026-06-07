@@ -7,7 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .env import env_int, load_env, project_path
-from .tagger import build_geojson, build_plan, load_user_tags, parse_log, render_digest, target_date_from_text
+from .tagger import build_geojson, build_plan, load_user_tags, parse_log, render_digest, render_map_html, target_date_from_text
 from .telegram_send import send_telegram_message
 
 
@@ -27,11 +27,15 @@ def generate_digest(date_text: str | None = None) -> tuple[dict, str, Path]:
     plan_path = derived_dir / f"activity-tag-plan-{target_date.isoformat()}.json"
     digest_path = derived_dir / f"activity-summary-{target_date.isoformat()}.txt"
     geojson_path = derived_dir / f"activity-track-{target_date.isoformat()}.geojson"
+    map_path = derived_dir / f"activity-map-{target_date.isoformat()}.html"
+    embed_map_tiles = env.get("OWNTRACKS_EMBED_MAP_TILES", "false").strip().lower() in {"1", "true", "yes", "on"}
     digest = render_digest(plan)
 
     plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     digest_path.write_text(digest + "\n", encoding="utf-8")
     geojson_path.write_text(json.dumps(build_geojson(track_points, plan["named_places"], plan["candidate_stops"]), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tile_cache_dir = derived_dir / "tile-cache" if embed_map_tiles else None
+    map_path.write_text(render_map_html(plan, tile_cache_dir), encoding="utf-8")
     return plan, digest, digest_path
 
 
