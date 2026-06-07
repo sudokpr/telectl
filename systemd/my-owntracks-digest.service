@@ -3,6 +3,6 @@ Description=Telegram Control OwnTracks daily digest
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/workspace/projects/telegram_control
+WorkingDirectory=/path/to/telectl
 Environment=TZ=Asia/Kolkata
 ExecStart=%h/.local/bin/uv --cache-dir .uv-cache run python -m owntracks.digest --date today --send

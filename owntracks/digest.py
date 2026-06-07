@@ -43,6 +43,8 @@ def send_daily(date_text: str | None = None) -> None:
     topic_id = env_int(env.get("OWNTRACKS_TOPIC_ID"))
     if not token or not chat_id:
         raise RuntimeError("BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+    if not topic_id:
+        raise RuntimeError("OWNTRACKS_TOPIC_ID must be set in .env before sending the OwnTracks digest")
     send_telegram_message(token, chat_id, digest, topic_id)
 
 

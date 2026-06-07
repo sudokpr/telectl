@@ -54,6 +54,7 @@ class Config:
     http_intake: HttpIntakeConfig
     fuel: FuelConfig
     owntracks_topic_id: int
+    owntracks_user_tags_path: Path
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -128,6 +129,10 @@ def load_config() -> Config:
         http_intake=build_http_config(image_summary_env),
         fuel=build_fuel_config(image_summary_env, int(chat_id or "0")),
         owntracks_topic_id=int(first_value(["OWNTRACKS_TOPIC_ID"], local_env) or "0"),
+        owntracks_user_tags_path=owntracks_project_path(
+            first_value(["OWNTRACKS_USER_TAGS_PATH"], local_env),
+            "./data/owntracks/user_tags.json",
+        ),
     )
 
 
@@ -891,7 +896,9 @@ def owntracks_unauthorized_reason(update: Update, config: Config) -> str | None:
         return "Unsupported update."
     if chat.id != config.chat_id:
         return "OwnTracks commands are only enabled in the configured supergroup."
-    if config.owntracks_topic_id and message.message_thread_id != config.owntracks_topic_id:
+    if not config.owntracks_topic_id:
+        return "OWNTRACKS_TOPIC_ID must be configured before OwnTracks commands are enabled."
+    if message.message_thread_id != config.owntracks_topic_id:
         return "OwnTracks commands are only enabled in the OwnTracks topic."
     if config.allowed_user_ids and (not user or user.id not in config.allowed_user_ids):
         return "You are not allowed to run this command."
@@ -978,7 +985,7 @@ async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
-    tags_path = owntracks_project_path(None, "./data/owntracks/user_tags.json")
+    tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
     existing = stop_data.setdefault("tags", [])
@@ -1008,7 +1015,7 @@ async def owntracks_name_command(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
-    tags_path = owntracks_project_path(None, "./data/owntracks/user_tags.json")
+    tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
     stop_data["name"] = name
@@ -1035,7 +1042,7 @@ async def owntracks_note_command(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
-    tags_path = owntracks_project_path(None, "./data/owntracks/user_tags.json")
+    tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
     stop_data["note"] = note

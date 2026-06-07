@@ -116,8 +116,12 @@ date explicitly:
 /tag 2026-06-06 s1 property-tax govt-office
 ```
 
-Saved review data is stored in `data/owntracks/user_tags.json`; the raw MQTT
-log is not modified.
+Saved review data is stored in `OWNTRACKS_USER_TAGS_PATH`, defaulting to
+`data/owntracks/user_tags.json`; the raw MQTT log is not modified.
+
+The sample OwnTracks systemd units in `systemd/` use `/path/to/telectl` as
+an install-time placeholder. Replace it with this checkout path before
+installing the units.
 
 ## Image Summaries
 

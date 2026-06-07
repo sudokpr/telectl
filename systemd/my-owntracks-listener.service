@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=%h/workspace/projects/telegram_control
+WorkingDirectory=/path/to/telectl
 ExecStart=%h/.local/bin/uv --cache-dir .uv-cache run python -m owntracks.listener
 Restart=always
 RestartSec=5

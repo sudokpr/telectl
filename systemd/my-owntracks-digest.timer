@@ -2,7 +2,7 @@
 Description=Run Telegram Control OwnTracks daily digest at 21:00 IST
 
 [Timer]
-OnCalendar=*-*-* 21:00:00
+OnCalendar=*-*-* 21:00:00 Asia/Kolkata
 Persistent=true
 Unit=my-owntracks-digest.service
 

@@ -263,7 +263,7 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         motions = Counter(motion for item in cluster for motion in item.motion)
         regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
         name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
-        stop_id = slug(name)
+        stop_id = f"{slug(name)}-{cluster[0].line_no}-{cluster[-1].line_no}"
         stops.append(
             {
                 "id": stop_id,
