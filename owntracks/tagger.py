@@ -1571,7 +1571,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     .leaflet-control-scale {{
       margin-bottom: 14px !important;
-      margin-right: 14px !important;
+      margin-left: 14px !important;
     }}
     .leaflet-control-scale-line {{
       background: rgb(255 255 255 / 0.92);
@@ -1676,12 +1676,13 @@ def render_leaflet_map_html(plan: dict) -> str:
     const commands = document.getElementById("commands");
     const status = document.getElementById("status");
     let clipboardStatus = "";
-    const map = L.map("map", {{ preferCanvas: true }});
+    const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     const tiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
     }}).addTo(map);
-    L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
+    L.control.zoom({{ position: "bottomleft" }}).addTo(map);
+    L.control.scale({{ position: "bottomleft", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const bounds = [];
     const markers = new Map();
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
@@ -1753,7 +1754,12 @@ def render_leaflet_map_html(plan: dict) -> str:
       iconSize: [24, 24],
       iconAnchor: [12, 12]
     }});
+    const shorten = (value, maxLength = 18) => {{
+      const text = String(value ?? "");
+      return text.length > maxLength ? text.slice(0, maxLength - 3) + "..." : text;
+    }};
     const labelFor = (stop) => `${{stop.alias}}: ${{stop.name}}`;
+    const shortLabelFor = (stop) => `${{stop.alias}}: ${{shorten(stop.name)}}`;
     const popupFor = (stop) => `
       <div class="stop-popup">
         <strong>${{escapeHtml(labelFor(stop))}}</strong>
@@ -1780,7 +1786,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       const marker = markers.get(stop.alias);
       if (!marker) return;
       marker.setIcon(iconFor(stop));
-      marker.setTooltipContent(escapeHtml(labelFor(stop)));
+      marker.setTooltipContent(escapeHtml(shortLabelFor(stop)));
+      marker.getElement()?.setAttribute("title", labelFor(stop));
       if (refreshPopup) marker.setPopupContent(popupFor(stop));
     }};
     const applyPopupEdit = (target) => {{
@@ -1885,12 +1892,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     for (const stop of data.stops) {{
       const marker = L.marker([stop.lat, stop.lon], {{ icon: iconFor(stop) }}).addTo(map);
       markers.set(stop.alias, marker);
-      marker.bindTooltip(escapeHtml(labelFor(stop)), {{ permanent: true, direction: "top", offset: [0, -12], className: "stop-label" }});
+      marker.bindTooltip(escapeHtml(shortLabelFor(stop)), {{ permanent: true, direction: "top", offset: [0, -12], className: "stop-label" }});
       marker.bindPopup(popupFor(stop), {{ className: "stop-popup-shell", maxWidth: 320 }});
       marker.on("click", () => {{
         toggleStop(stop);
         marker.openPopup();
       }});
+      marker.on("mouseover", () => marker.setTooltipContent(escapeHtml(labelFor(stop))));
+      marker.on("mouseout", () => marker.setTooltipContent(escapeHtml(shortLabelFor(stop))));
       marker.on("popupopen", () => attachPopupHandlers(stop));
       bounds.push(marker.getLatLng());
       refreshStop(stop);
