@@ -320,16 +320,38 @@ def apply_user_tags(plan: dict, user_tags: dict) -> dict:
 
 def stop_override_for(stop: dict, stop_overrides: dict) -> dict:
     stop_id = stop["id"]
-    if stop_id in stop_overrides:
-        return stop_overrides[stop_id]
+    matches = []
+    for fallback_id in fallback_stop_ids(stop_id):
+        if fallback_id in stop_overrides:
+            matches.append(stop_overrides[fallback_id])
     old_range_re = re.compile(rf"^{re.escape(stop_id)}-\d+$")
     for saved_id, override in stop_overrides.items():
         if old_range_re.fullmatch(saved_id):
-            return override
-    for fallback_id in fallback_stop_ids(stop_id):
-        if fallback_id in stop_overrides:
-            return stop_overrides[fallback_id]
-    return {}
+            matches.append(override)
+    if stop_id in stop_overrides:
+        matches.append(stop_overrides[stop_id])
+    return merge_stop_overrides(matches)
+
+
+def merge_stop_overrides(overrides: list[dict]) -> dict:
+    merged: dict = {}
+    merged_tags: list[str] = []
+    for override in overrides:
+        if not isinstance(override, dict):
+            continue
+        if override.get("name"):
+            merged["name"] = override["name"]
+        if override.get("note"):
+            merged["note"] = override["note"]
+        raw_tags = override.get("tags") or []
+        tags = raw_tags if isinstance(raw_tags, list) else [raw_tags]
+        for tag in tags:
+            tag_text = str(tag).strip()
+            if tag_text and tag_text not in merged_tags:
+                merged_tags.append(tag_text)
+    if merged_tags:
+        merged["tags"] = merged_tags
+    return merged
 
 
 def fallback_stop_ids(stop_id: str) -> list[str]:
@@ -338,7 +360,7 @@ def fallback_stop_ids(stop_id: str) -> list[str]:
     if legacy_id:
         values.append(legacy_id)
     stable_match = re.fullmatch(r"(.+-\d+)-\d+", stop_id)
-    if stable_match:
+    if stable_match and stable_match.group(1) not in values:
         values.append(stable_match.group(1))
     return values
 
@@ -1493,6 +1515,19 @@ def render_leaflet_map_html(plan: dict) -> str:
       transform: translate(-50%, -50%);
       z-index: 999;
     }}
+    .leaflet-control-scale {{
+      margin-bottom: 14px !important;
+      margin-right: 14px !important;
+    }}
+    .leaflet-control-scale-line {{
+      background: rgb(255 255 255 / 0.92);
+      border-color: #111827;
+      border-width: 0 2px 2px;
+      box-shadow: 0 1px 5px rgb(15 23 42 / 0.22);
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+    }}
   </style>
 </head>
 <body>
@@ -1534,6 +1569,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
     }}).addTo(map);
+    L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const bounds = [];
     const markers = new Map();
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
@@ -1813,6 +1849,21 @@ def target_date_from_text(value: str | None, local_tz: ZoneInfo) -> date:
 
 def render_digest(plan: dict) -> str:
     window = plan.get("activity_window") or plan["ride_window"]
+
+    def is_reviewed_stop(stop: dict) -> bool:
+        return bool(stop.get("reviewed_name") or stop.get("user_tags") or stop.get("user_note"))
+
+    def append_stop_lines(stop: dict) -> None:
+        display_name = stop.get("reviewed_name") or stop["name"]
+        lines.append(f"- {stop['alias']} ({stop['id']}): {display_name}")
+        lines.append(f"  Time: {stop['start']} to {stop['end']} ({stop['duration']})")
+        lines.append(f"  Motion: {stop['motion']} | Points: {stop['points']}")
+        lines.append(f"  Map: {stop['maps']}")
+        if stop.get("user_tags"):
+            lines.append(f"  Saved tags: {', '.join(stop['user_tags'])}")
+        if stop.get("user_note"):
+            lines.append(f"  Note: {stop['user_note']}")
+
     lines = [
         f"OwnTracks activity digest - {plan['date']}",
         "",
@@ -1832,19 +1883,19 @@ def render_digest(plan: dict) -> str:
         if place.get("maps"):
             lines.append(f"  {place['maps']}")
 
-    lines.extend(["", "Stops to review"])
-    if not plan["candidate_stops"]:
+    reviewed_stops = [stop for stop in plan["candidate_stops"] if is_reviewed_stop(stop)]
+    pending_stops = [stop for stop in plan["candidate_stops"] if not is_reviewed_stop(stop)]
+    lines.extend(["", "Reviewed stops"])
+    if not reviewed_stops:
         lines.append("- None")
-    for stop in plan["candidate_stops"]:
-        display_name = stop.get("reviewed_name") or stop["name"]
-        lines.append(f"- {stop['alias']} ({stop['id']}): {display_name}")
-        lines.append(f"  Time: {stop['start']} to {stop['end']} ({stop['duration']})")
-        lines.append(f"  Motion: {stop['motion']} | Points: {stop['points']}")
-        lines.append(f"  Map: {stop['maps']}")
-        if stop.get("user_tags"):
-            lines.append(f"  Saved tags: {', '.join(stop['user_tags'])}")
-        if stop.get("user_note"):
-            lines.append(f"  Note: {stop['user_note']}")
+    for stop in reviewed_stops:
+        append_stop_lines(stop)
+
+    lines.extend(["", "Stops to review"])
+    if not pending_stops:
+        lines.append("- None")
+    for stop in pending_stops:
+        append_stop_lines(stop)
 
     lines.extend(["", "Tags"])
     lines.append(", ".join(plan["recommended_tags"]))
