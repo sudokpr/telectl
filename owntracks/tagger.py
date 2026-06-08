@@ -1707,11 +1707,13 @@ def render_leaflet_map_html(plan: dict) -> str:
     const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
     const copyCommandsToClipboard = async (automatic = false) => {{
       if (!commands.value) return false;
-      commands.select();
       try {{
         if (navigator.clipboard?.writeText) {{
           await navigator.clipboard.writeText(commands.value);
+        }} else if (automatic) {{
+          throw new Error("automatic clipboard unavailable");
         }} else {{
+          commands.select();
           document.execCommand("copy");
         }}
         clipboardStatus = automatic ? " · copied" : " · copied manually";
@@ -1773,22 +1775,6 @@ def render_leaflet_map_html(plan: dict) -> str:
       const element = marker?.getPopup()?.getElement();
       if (!element) return;
       L.DomEvent.disableClickPropagation(element);
-      const nameInput = element.querySelector("[data-popup-name]");
-      const tagsInput = element.querySelector("[data-popup-tags]");
-      const noteInput = element.querySelector("[data-popup-note]");
-      nameInput?.addEventListener("input", () => {{
-        stop.name = nameInput.value.trim() || originalNames.get(stop.alias);
-        refreshStop(stop, false);
-        updateCommands();
-      }});
-      tagsInput?.addEventListener("input", () => {{
-        stop.tags = parseTags(tagsInput.value);
-        updateCommands();
-      }});
-      noteInput?.addEventListener("input", () => {{
-        stop.note = noteInput.value.trim();
-        updateCommands();
-      }});
     }};
     const refreshStop = (stop, refreshPopup = true) => {{
       const marker = markers.get(stop.alias);
@@ -1797,6 +1783,29 @@ def render_leaflet_map_html(plan: dict) -> str:
       marker.setTooltipContent(escapeHtml(labelFor(stop)));
       if (refreshPopup) marker.setPopupContent(popupFor(stop));
     }};
+    const applyPopupEdit = (target) => {{
+      const alias = target.dataset.popupName || target.dataset.popupTags || target.dataset.popupNote;
+      if (!alias) return;
+      const stop = data.stops.find((item) => item.alias === alias);
+      if (!stop) return;
+      if (target.dataset.popupName) {{
+        stop.name = target.value.trim() || originalNames.get(stop.alias);
+        refreshStop(stop, false);
+      }} else if (target.dataset.popupTags) {{
+        stop.tags = parseTags(target.value);
+      }} else if (target.dataset.popupNote) {{
+        stop.note = target.value.trim();
+      }}
+      updateCommands();
+    }};
+    const handlePopupEditEvent = (event) => {{
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+      if (!target.matches("[data-popup-name], [data-popup-tags], [data-popup-note]")) return;
+      applyPopupEdit(target);
+    }};
+    document.addEventListener("input", handlePopupEditEvent);
+    document.addEventListener("change", handlePopupEditEvent);
     const renderList = () => {{
       const stopList = document.getElementById("stopList");
       stopList.innerHTML = data.stops.map((stop) => `
