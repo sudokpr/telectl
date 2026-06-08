@@ -301,13 +301,47 @@ def save_user_tags(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def location_override_for(stop: dict, user_tags: dict, current_date: str, radius_m: int = 150) -> dict:
+    stop_lat = as_float(stop.get("lat"))
+    stop_lon = as_float(stop.get("lon"))
+    if stop_lat is None or stop_lon is None:
+        return {}
+    best: tuple[float, dict] | None = None
+    for date_key, day_tags in user_tags.items():
+        if not isinstance(day_tags, dict):
+            continue
+        for saved_stop in day_tags.get("stops", {}).values():
+            if not isinstance(saved_stop, dict) or not saved_stop.get("name"):
+                continue
+            saved_lat = as_float(saved_stop.get("lat"))
+            saved_lon = as_float(saved_stop.get("lon"))
+            if saved_lat is None or saved_lon is None:
+                continue
+            distance_m = haversine_km(stop_lat, stop_lon, saved_lat, saved_lon) * 1000
+            if distance_m > radius_m:
+                continue
+            if best is None or (date_key == current_date, -distance_m) > (best[1].get("_date") == current_date, -best[0]):
+                best = (distance_m, {**saved_stop, "_date": date_key, "_distance_m": round(distance_m)})
+    if best is None:
+        return {}
+    override = best[1].copy()
+    override.pop("note", None)
+    override.pop("_date", None)
+    return override
+
+
 def apply_user_tags(plan: dict, user_tags: dict) -> dict:
     day_tags = user_tags.get(plan["date"], {})
     global_tags = day_tags.get("activity", day_tags.get("ride", {})).get("tags", [])
     plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + global_tags))
     stop_overrides = day_tags.get("stops", {})
     for stop in plan["candidate_stops"]:
-        override = stop_override_for(stop, stop_overrides)
+        override = merge_stop_overrides(
+            [
+                location_override_for(stop, user_tags, plan["date"]),
+                stop_override_for(stop, stop_overrides),
+            ]
+        )
         if override.get("name"):
             stop["reviewed_name"] = override["name"]
         if override.get("tags"):
@@ -1528,6 +1562,39 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-size: 12px;
       font-weight: 800;
     }}
+    .stop-popup {{
+      min-width: 240px;
+    }}
+    .stop-popup strong {{
+      display: block;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }}
+    .stop-popup label {{
+      color: #374151;
+      display: block;
+      font-size: 11px;
+      font-weight: 800;
+      margin: 8px 0 3px;
+    }}
+    .stop-popup input,
+    .stop-popup textarea {{
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      box-sizing: border-box;
+      font: inherit;
+      padding: 6px;
+      width: 100%;
+    }}
+    .stop-popup textarea {{
+      min-height: 62px;
+      resize: vertical;
+    }}
+    .popup-meta {{
+      color: #4b5563;
+      font-size: 12px;
+      line-height: 1.4;
+    }}
   </style>
 </head>
 <body>
@@ -1562,6 +1629,8 @@ def render_leaflet_map_html(plan: dict) -> str:
     const data = {payload};
     const selected = new Set();
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
+    const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
+    const originalNotes = new Map(data.stops.map((stop) => [stop.alias, stop.note || ""]));
     const commands = document.getElementById("commands");
     const status = document.getElementById("status");
     const map = L.map("map", {{ preferCanvas: true }});
@@ -1592,6 +1661,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
       return 2 * radius * Math.asin(Math.sqrt(h));
     }};
+    const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
     const updateCommands = () => {{
       const changed = data.stops.filter((stop) =>
         stop.name !== originalNames.get(stop.alias)
@@ -1619,17 +1689,50 @@ def render_leaflet_map_html(plan: dict) -> str:
       iconAnchor: [12, 12]
     }});
     const labelFor = (stop) => `${{stop.alias}}: ${{stop.name}}`;
-    const refreshStop = (stop) => {{
+    const popupFor = (stop) => `
+      <div class="stop-popup">
+        <strong>${{escapeHtml(labelFor(stop))}}</strong>
+        <div class="popup-meta">
+          ${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}}<br>
+          ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points<br>
+          <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
+        </div>
+        <label for="popup-name-${{escapeHtml(stop.alias)}}">Name</label>
+        <input id="popup-name-${{escapeHtml(stop.alias)}}" data-popup-name="${{escapeHtml(stop.alias)}}" value="${{escapeHtml(stop.name)}}">
+        <label for="popup-tags-${{escapeHtml(stop.alias)}}">Tags</label>
+        <input id="popup-tags-${{escapeHtml(stop.alias)}}" data-popup-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
+        <label for="popup-note-${{escapeHtml(stop.alias)}}">Note</label>
+        <textarea id="popup-note-${{escapeHtml(stop.alias)}}" data-popup-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
+      </div>
+    `;
+    const attachPopupHandlers = (stop) => {{
+      const marker = markers.get(stop.alias);
+      const element = marker?.getPopup()?.getElement();
+      if (!element) return;
+      L.DomEvent.disableClickPropagation(element);
+      const nameInput = element.querySelector("[data-popup-name]");
+      const tagsInput = element.querySelector("[data-popup-tags]");
+      const noteInput = element.querySelector("[data-popup-note]");
+      nameInput?.addEventListener("input", () => {{
+        stop.name = nameInput.value.trim() || originalNames.get(stop.alias);
+        refreshStop(stop, false);
+        updateCommands();
+      }});
+      tagsInput?.addEventListener("input", () => {{
+        stop.tags = parseTags(tagsInput.value);
+        updateCommands();
+      }});
+      noteInput?.addEventListener("input", () => {{
+        stop.note = noteInput.value.trim();
+        updateCommands();
+      }});
+    }};
+    const refreshStop = (stop, refreshPopup = true) => {{
       const marker = markers.get(stop.alias);
       if (!marker) return;
       marker.setIcon(iconFor(stop));
       marker.setTooltipContent(escapeHtml(labelFor(stop)));
-      marker.setPopupContent(`
-        <strong>${{escapeHtml(labelFor(stop))}}</strong><br>
-        ${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}}<br>
-        ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points<br>
-        <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
-      `);
+      if (refreshPopup) marker.setPopupContent(popupFor(stop));
     }};
     const renderList = () => {{
       const stopList = document.getElementById("stopList");
@@ -1662,7 +1765,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         input.addEventListener("input", () => {{
           const stop = data.stops.find((item) => item.alias === input.dataset.tags);
           if (!stop) return;
-          stop.tags = input.value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
+          stop.tags = parseTags(input.value);
           updateCommands();
         }});
       }});
@@ -1712,6 +1815,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       markers.set(stop.alias, marker);
       marker.bindTooltip(escapeHtml(labelFor(stop)), {{ permanent: true, direction: "top", offset: [0, -12], className: "stop-label" }});
       marker.on("click", () => toggleStop(stop));
+      marker.on("popupopen", () => attachPopupHandlers(stop));
       bounds.push(marker.getLatLng());
       refreshStop(stop);
     }}

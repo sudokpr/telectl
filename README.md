@@ -135,9 +135,9 @@ HTML map attachment. Hosted delivery serves a dynamic Leaflet map from
 `/owntracks/map/YYYY-MM-DD`, which gives normal browser tile loading and zoom.
 Background map tiles are loaded from OpenStreetMap when the hosted map is
 opened. For Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map,
-you can select stops, rename them locally, and copy a generated `/otb` command
-back into Telegram to save those names. Each stop gets a short alias such as
-`s1`, `s2`, etc.
+you can select stops, click a stop for a popup editor, rename stops locally,
+add tags/notes, and copy a generated `/otb` command back into Telegram to save
+those reviews. Each stop gets a short alias such as `s1`, `s2`, etc.
 
 Short commands in the OwnTracks topic:
 
@@ -164,7 +164,9 @@ means June 16 of the current year:
 ```
 
 Saved review data is stored in `OWNTRACKS_USER_TAGS_PATH`, defaulting to
-`data/owntracks/user_tags.json`; the raw MQTT log is not modified.
+`data/owntracks/user_tags.json`; the raw MQTT log is not modified. Saved stop
+coordinates let future visits within about 150 meters reuse names and tags
+automatically. Notes stay tied to the specific visit/date.
 
 The sample OwnTracks systemd units in `systemd/` use `/path/to/telectl` as
 an install-time placeholder. Replace it with this checkout path before

@@ -1078,13 +1078,24 @@ def owntracks_date_and_args(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     return None, args, f"Run /otd {OWNTRACKS_DATE_USAGE} first, or include a date."
 
 
-def resolve_owntracks_stop_id(date_text: str, stop_ref: str) -> tuple[str, str]:
+def resolve_owntracks_stop(date_text: str, stop_ref: str) -> tuple[dict, str]:
     plan, _digest, _path = generate_owntracks_digest(date_text)
     for stop in plan["candidate_stops"]:
         if stop_ref in {stop["id"], stop.get("alias")}:
-            return stop["id"], plan["date"]
+            return stop, plan["date"]
     valid = ", ".join(f"{stop.get('alias')}={stop['id']}" for stop in plan["candidate_stops"])
     raise ValueError(f"Unknown stop '{stop_ref}'. Valid stops: {valid or 'none'}")
+
+
+def resolve_owntracks_stop_id(date_text: str, stop_ref: str) -> tuple[str, str]:
+    stop, target_date = resolve_owntracks_stop(date_text, stop_ref)
+    return stop["id"], target_date
+
+
+def annotate_saved_stop(stop_data: dict, stop: dict) -> None:
+    for key in ("lat", "lon"):
+        if stop.get(key) is not None:
+            stop_data[key] = stop[key]
 
 
 def parse_owntracks_review_line(line: str) -> tuple[str, dict]:
@@ -1138,13 +1149,13 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
     except Exception as exc:
         await message.reply_text(f"Could not load OwnTracks stops: {exc}")
         return
-    stop_ids_by_ref = {
-        ref: stop["id"]
+    stops_by_ref = {
+        ref: stop
         for stop in plan["candidate_stops"]
         for ref in (stop["id"], stop.get("alias"))
         if ref
     }
-    updates: list[tuple[str, dict]] = []
+    updates: list[tuple[dict, dict]] = []
     errors: list[str] = []
     for line in pair_lines:
         try:
@@ -1152,22 +1163,24 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
         except ValueError as exc:
             errors.append(str(exc))
             continue
-        stop_id = stop_ids_by_ref.get(stop_ref)
-        if not stop_id:
+        stop = stops_by_ref.get(stop_ref)
+        if not stop:
             errors.append(f"Unknown stop: {stop_ref}")
             continue
         if not update.get("name"):
             errors.append(f"Missing name: {stop_ref}")
             continue
-        updates.append((stop_id, update))
+        updates.append((stop, update))
     if not updates:
         await message.reply_text("No reviews saved. " + "; ".join(errors[:5]))
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
     stops = data.setdefault(plan["date"], {}).setdefault("stops", {})
-    for stop_id, update in updates:
+    for stop, update in updates:
+        stop_id = stop["id"]
         stop_data = stops.setdefault(stop_id, {})
+        annotate_saved_stop(stop_data, stop)
         if update.get("name"):
             stop_data["name"] = update["name"]
         if "tags" in update:
@@ -1194,13 +1207,15 @@ async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TY
     stop_ref = args[0]
     tags = args[1:]
     try:
-        stop_id, target_date = await asyncio.to_thread(resolve_owntracks_stop_id, date_text, stop_ref)
+        stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
+    stop_id = stop["id"]
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
+    annotate_saved_stop(stop_data, stop)
     existing = stop_data.setdefault("tags", [])
     for tag in tags:
         if tag not in existing:
@@ -1224,13 +1239,15 @@ async def owntracks_name_command(update: Update, context: ContextTypes.DEFAULT_T
     stop_ref = args[0]
     name = " ".join(args[1:])
     try:
-        stop_id, target_date = await asyncio.to_thread(resolve_owntracks_stop_id, date_text, stop_ref)
+        stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
+    stop_id = stop["id"]
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
+    annotate_saved_stop(stop_data, stop)
     stop_data["name"] = name
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, target_date)
@@ -1251,13 +1268,15 @@ async def owntracks_note_command(update: Update, context: ContextTypes.DEFAULT_T
     stop_ref = args[0]
     note = " ".join(args[1:])
     try:
-        stop_id, target_date = await asyncio.to_thread(resolve_owntracks_stop_id, date_text, stop_ref)
+        stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
         await update.effective_message.reply_text(str(exc))
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
+    stop_id = stop["id"]
     stop_data = data.setdefault(target_date, {}).setdefault("stops", {}).setdefault(stop_id, {})
+    annotate_saved_stop(stop_data, stop)
     stop_data["note"] = note
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, target_date)
