@@ -1429,9 +1429,29 @@ def render_leaflet_map_html(plan: dict) -> str:
       top: 10px;
       z-index: 1000;
     }}
+    .tools.collapsed {{
+      overflow: hidden;
+      padding: 7px;
+      width: auto;
+    }}
+    .tools.collapsed .tools-body {{
+      display: none;
+    }}
+    .tools.collapsed h1 {{
+      display: none;
+    }}
+    .tools-title {{
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+    }}
     .tools h1 {{
       font-size: 15px;
-      margin: 0 0 8px;
+      margin: 0;
+    }}
+    .tools-body {{
+      margin-top: 8px;
     }}
     .tools textarea, .tools input {{
       border: 1px solid #cbd5e1;
@@ -1595,34 +1615,54 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-size: 12px;
       line-height: 1.4;
     }}
+    @media (max-width: 700px) {{
+      .tools {{
+        max-height: calc(100vh - 20px);
+        max-width: min(360px, calc(100vw - 20px));
+      }}
+      .tools:not(.collapsed) {{
+        bottom: 10px;
+      }}
+      .stop-list {{
+        display: none;
+      }}
+      .tools textarea {{
+        height: 54px;
+      }}
+    }}
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <div class="tools">
-    <h1>{escaped_title}</h1>
-    <div class="row">
-      <button id="selectAll" type="button" class="secondary">Select all</button>
-      <button id="clearSelection" type="button" class="secondary">Clear</button>
-      <button id="fitAll" type="button" class="secondary">Fit</button>
+  <div id="tools" class="tools">
+    <div class="tools-title">
+      <h1>{escaped_title}</h1>
+      <button id="toggleTools" type="button" class="secondary">Hide</button>
     </div>
-    <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
-    <label for="groupDistance">Nearby grouping distance, meters</label>
-    <input id="groupDistance" type="number" min="20" step="10" value="150">
-    <div class="row">
-      <button id="selectNearby" type="button">Select nearby</button>
-      <button id="groupSelected" type="button">Group selected</button>
+    <div id="toolsBody" class="tools-body">
+      <div class="row">
+        <button id="selectAll" type="button" class="secondary">Select all</button>
+        <button id="clearSelection" type="button" class="secondary">Clear</button>
+        <button id="fitAll" type="button" class="secondary">Fit</button>
+      </div>
+      <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
+      <label for="groupDistance">Nearby grouping distance, meters</label>
+      <input id="groupDistance" type="number" min="20" step="10" value="150">
+      <div class="row">
+        <button id="selectNearby" type="button">Select nearby</button>
+        <button id="groupSelected" type="button">Group selected</button>
+      </div>
+      <label for="bulkName">Name for selected stops</label>
+      <input id="bulkName" placeholder="Name selected stops">
+      <div class="row">
+        <button id="applyName" type="button">Apply</button>
+        <button id="copyCommands" type="button" class="secondary">Copy</button>
+      </div>
+      <div id="stopList" class="stop-list"></div>
+      <label for="commands">Paste this in Telegram</label>
+      <textarea id="commands" readonly></textarea>
+      <div id="status" class="status">loading</div>
     </div>
-    <label for="bulkName">Name for selected stops</label>
-    <input id="bulkName" placeholder="Name selected stops">
-    <div class="row">
-      <button id="applyName" type="button">Apply</button>
-      <button id="copyCommands" type="button" class="secondary">Copy</button>
-    </div>
-    <div id="stopList" class="stop-list"></div>
-    <label for="commands">Paste this in Telegram</label>
-    <textarea id="commands" readonly></textarea>
-    <div id="status" class="status">loading</div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
@@ -1631,8 +1671,11 @@ def render_leaflet_map_html(plan: dict) -> str:
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
     const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
     const originalNotes = new Map(data.stops.map((stop) => [stop.alias, stop.note || ""]));
+    const tools = document.getElementById("tools");
+    const toggleToolsButton = document.getElementById("toggleTools");
     const commands = document.getElementById("commands");
     const status = document.getElementById("status");
+    let clipboardStatus = "";
     const map = L.map("map", {{ preferCanvas: true }});
     const tiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
       maxZoom: 19,
@@ -1649,7 +1692,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       "'": "&#39;"
     }}[char]));
     const updateStatus = () => {{
-      status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · stops ${{data.stops.length}}`;
+      status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · stops ${{data.stops.length}}${{clipboardStatus}}`;
     }};
     const distanceMeters = (a, b) => {{
       const radius = 6371008.8;
@@ -1662,7 +1705,25 @@ def render_leaflet_map_html(plan: dict) -> str:
       return 2 * radius * Math.asin(Math.sqrt(h));
     }};
     const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
-    const updateCommands = () => {{
+    const copyCommandsToClipboard = async (automatic = false) => {{
+      if (!commands.value) return false;
+      commands.select();
+      try {{
+        if (navigator.clipboard?.writeText) {{
+          await navigator.clipboard.writeText(commands.value);
+        }} else {{
+          document.execCommand("copy");
+        }}
+        clipboardStatus = automatic ? " · copied" : " · copied manually";
+        updateStatus();
+        return true;
+      }} catch (error) {{
+        clipboardStatus = " · copy blocked";
+        updateStatus();
+        return false;
+      }}
+    }};
+    const updateCommands = (autoCopy = true) => {{
       const changed = data.stops.filter((stop) =>
         stop.name !== originalNames.get(stop.alias)
         || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
@@ -1679,7 +1740,9 @@ def render_leaflet_map_html(plan: dict) -> str:
             }})
           ].join("\\n")
         : "";
+      clipboardStatus = commands.value ? clipboardStatus : "";
       updateStatus();
+      if (autoCopy && commands.value) copyCommandsToClipboard(true);
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
     const iconFor = (stop) => L.divIcon({{
@@ -1868,12 +1931,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     document.getElementById("copyCommands").addEventListener("click", async () => {{
       updateCommands();
-      commands.select();
-      try {{
-        await navigator.clipboard.writeText(commands.value);
-      }} catch (error) {{
-        document.execCommand("copy");
-      }}
+      await copyCommandsToClipboard(false);
     }});
     document.getElementById("fitAll").addEventListener("click", () => {{
       if (bounds.length) {{
@@ -1883,8 +1941,17 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     map.on("zoomend moveend", updateStatus);
     tiles.on("tileloadstart tileload tileerror", updateStatus);
+    toggleToolsButton.addEventListener("click", () => {{
+      tools.classList.toggle("collapsed");
+      toggleToolsButton.textContent = tools.classList.contains("collapsed") ? "Tools" : "Hide";
+      setTimeout(() => map.invalidateSize(), 0);
+    }});
+    if (window.innerWidth <= 700) {{
+      tools.classList.add("collapsed");
+      toggleToolsButton.textContent = "Tools";
+    }}
     renderList();
-    updateCommands();
+    updateCommands(false);
   </script>
 </body>
 </html>"""
