@@ -1814,7 +1814,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       const marker = L.marker([stop.lat, stop.lon], {{ icon: iconFor(stop) }}).addTo(map);
       markers.set(stop.alias, marker);
       marker.bindTooltip(escapeHtml(labelFor(stop)), {{ permanent: true, direction: "top", offset: [0, -12], className: "stop-label" }});
-      marker.on("click", () => toggleStop(stop));
+      marker.bindPopup(popupFor(stop), {{ className: "stop-popup-shell", maxWidth: 320 }});
+      marker.on("click", () => {{
+        toggleStop(stop);
+        marker.openPopup();
+      }});
       marker.on("popupopen", () => attachPopupHandlers(stop));
       bounds.push(marker.getLatLng());
       refreshStop(stop);
