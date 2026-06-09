@@ -136,9 +136,7 @@ HTML map attachment. Hosted delivery serves a dynamic Leaflet map from
 Month and year scopes such as `/owntracks/map/YYYY-MM` and
 `/owntracks/map/YYYY` render heatmaps instead of the daily stop map. Background
 map tiles are loaded from OpenStreetMap when the hosted map is opened. The
-heatmap panel can filter locations by saved tags or label keywords; URL query
-parameters such as `?filter=cycling`, `?tag=work`, `?q=airport`, or
-`?keyword=saloon` prefill the same filter. `/owntracks/sample` serves a
+heatmap panel can filter locations by motion mode. `/owntracks/sample` serves a
 synthetic heatmap with points across countries, cities, and city areas for
 visual testing without OwnTracks logs. For
 Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
@@ -150,7 +148,7 @@ Short commands in the OwnTracks topic:
 
 ```text
 /otd [today|yesterday|DD|MM-DD|YYYY-MM-DD]
-/otm [today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY] [filter words]
+/otm [today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY]
 /otb 2026-06-06
 s1 Local saloon | tags: haircut saloon | note: paid by UPI
 s2 Local saloon

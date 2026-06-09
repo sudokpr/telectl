@@ -62,6 +62,17 @@ class Event:
         return self.kind == "location" and self.lat is not None and self.lon is not None
 
 
+MOTION_MODES = ("all", "stationary", "walking", "cycling", "automotive", "moving")
+MOTION_COLORS = {
+    "stationary": "#6b7280",
+    "walking": "#16a34a",
+    "cycling": "#2563eb",
+    "automotive": "#f97316",
+    "moving": "#7c3aed",
+    "unknown": "#64748b",
+}
+
+
 @dataclass(frozen=True)
 class OwnTracksScope:
     kind: str
@@ -145,6 +156,49 @@ def maps_url(lat: float, lon: float) -> str:
     return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
 
 
+def normalized_motion_modes(event: Event) -> set[str]:
+    return {str(item).strip().lower() for item in event.motion if str(item).strip()}
+
+
+def motion_mode(event: Event) -> str:
+    if not event.is_location:
+        return "unknown"
+    modes = normalized_motion_modes(event)
+    speed = event.speed_kmh or 0
+    if "automotive" in modes or "driving" in modes:
+        return "automotive"
+    if "cycling" in modes:
+        return "cycling"
+    if "walking" in modes:
+        return "walking"
+    if "stationary" in modes:
+        return "stationary"
+    if speed >= 8:
+        return "moving"
+    if speed <= 1:
+        return "stationary"
+    return "moving"
+
+
+def motion_summary(points: list[Event]) -> dict:
+    counts: Counter[str] = Counter()
+    distances: Counter[str] = Counter()
+    previous: Event | None = None
+    for event in points:
+        mode = motion_mode(event)
+        counts[mode] += 1
+        if previous and previous.lat is not None and previous.lon is not None and event.lat is not None and event.lon is not None:
+            segment = haversine_km(previous.lat, previous.lon, event.lat, event.lon)
+            if segment <= 5:
+                distances[mode] += segment
+        previous = event
+    return {
+        "counts": dict(counts),
+        "distance_km": {mode: round(distance, 2) for mode, distance in distances.items()},
+        "dominant": counts.most_common(1)[0][0] if counts else "unknown",
+    }
+
+
 def point_dict(event: Event) -> dict:
     return {
         "line": event.line_no,
@@ -152,6 +206,7 @@ def point_dict(event: Event) -> dict:
         "lat": event.lat,
         "lon": event.lon,
         "motion": event.motion,
+        "motion_mode": motion_mode(event),
         "speed_kmh": event.speed_kmh,
         "accuracy_m": event.payload.get("acc"),
         "battery": event.payload.get("batt"),
@@ -163,8 +218,10 @@ def point_dict(event: Event) -> dict:
 def is_moving_ride_point(event: Event) -> bool:
     if not event.is_location:
         return False
-    motion = set(event.motion)
+    motion = normalized_motion_modes(event)
     speed = event.speed_kmh or 0
+    if "automotive" in motion or "driving" in motion:
+        return False
     if "cycling" in motion:
         return True
     if "walking" in motion or "stationary" in motion:
@@ -244,6 +301,7 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         for event in events
         if event.is_location
         and "Home" not in (event.payload.get("inregions") or [])
+        and motion_mode(event) != "automotive"
         and (event.speed_kmh is None or event.speed_kmh <= 3)
     ]
     clusters: list[list[Event]] = []
@@ -275,6 +333,8 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         lon = sum(item.lon or 0 for item in cluster) / len(cluster)
         motions = Counter(motion for item in cluster for motion in item.motion)
         regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
+        motion_modes = Counter(motion_mode(item) for item in cluster)
+        dominant_motion = motion_modes.most_common(1)[0][0] if motion_modes else "unknown"
         name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
         stop_id = f"{slug(name)}-{cluster[0].line_no}"
         stops.append(
@@ -289,6 +349,8 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
                 "lon": round(lon, 6),
                 "points": len(cluster),
                 "motion": ", ".join(f"{name}:{count}" for name, count in motions.most_common()) or "unknown",
+                "motion_mode": dominant_motion,
+                "motion_modes": ", ".join(f"{name}:{count}" for name, count in motion_modes.most_common()) or "unknown",
                 "tags": [f"stop:{stop_id}", "candidate:stop"],
                 "maps": maps_url(lat, lon),
             }
@@ -491,10 +553,18 @@ def fetch_tile_data_uri(zoom: int, x: int, y: int, cache_dir: Path | None) -> st
 
 def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     title = f"OwnTracks map - {plan['date']}"
-    track = [
-        [point["lat"], point["lon"]]
+    track_points = [
+        {
+            "lat": point["lat"],
+            "lon": point["lon"],
+            "motion_mode": point.get("motion_mode") or "moving",
+        }
         for point in plan.get("sampled_track", [])
         if point.get("lat") is not None and point.get("lon") is not None
+    ]
+    track = [
+        [point["lat"], point["lon"]]
+        for point in track_points
     ]
     stops = [
         {
@@ -525,6 +595,18 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         for place in plan.get("named_places", [])
         if place.get("lat") is not None and place.get("lon") is not None
     ]
+    motion_summary = plan.get("motion_summary") or {}
+    motion_counts = motion_summary.get("counts") or {}
+    motion_dom = motion_summary.get("dominant") or "unknown"
+    motion_chips = []
+    for mode in ("stationary", "walking", "cycling", "automotive", "moving"):
+        count = motion_counts.get(mode)
+        if count:
+            motion_chips.append(
+                f'<span class="motion-chip {escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</span>'
+            )
+    if motion_chips:
+        motion_chips.insert(0, f'<span class="motion-chip {escape(motion_dom)}"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
     all_points = [
         *track,
         *[[stop["lat"], stop["lon"]] for stop in stops],
@@ -575,11 +657,22 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         return x, y
 
     route_parts = []
-    for index, point in enumerate(track):
-        xy = project_point(point[0], point[1])
+    fallback_segments = []
+    previous_track_point: dict | None = None
+    for index, point in enumerate(track_points):
+        xy = project_point(point["lat"], point["lon"])
         if xy is None:
             continue
         route_parts.append(f"{'L' if index else 'M'} {xy[0]:.1f} {xy[1]:.1f}")
+        if previous_track_point is not None:
+            prev_xy = project_point(previous_track_point["lat"], previous_track_point["lon"])
+            if prev_xy is not None:
+                mode = point.get("motion_mode") or previous_track_point.get("motion_mode") or "moving"
+                fallback_segments.append(
+                    f'<line class="route-segment motion-{escape(str(mode))}" x1="{prev_xy[0]:.1f}" y1="{prev_xy[1]:.1f}" '
+                    f'x2="{xy[0]:.1f}" y2="{xy[1]:.1f}"></line>'
+                )
+        previous_track_point = point
     fallback_route = " ".join(route_parts)
     tile_images = []
     if finite_points:
@@ -648,7 +741,14 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             f'<text class="label-text" x="{label_dx + 8}" y="{label_dy + 17}">{escape(label)}</text></g>'
         )
     payload = json.dumps(
-        {"date": plan["date"], "track": track, "stops": stops, "namedPlaces": named_places},
+        {
+            "date": plan["date"],
+            "track": track,
+            "sampledTrack": plan.get("sampled_track", []),
+            "stops": stops,
+            "namedPlaces": named_places,
+            "motionSummary": plan.get("motion_summary") or {},
+        },
         ensure_ascii=False,
     ).replace("</", "<\\/")
     escaped_title = escape(title)
@@ -846,12 +946,29 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       position: absolute;
       z-index: 2;
     }}
-    .route {{
+    .route-segment {{
       fill: none;
-      stroke: #2563eb;
       stroke-linecap: round;
       stroke-linejoin: round;
-      stroke-width: 4;
+      stroke-width: 5;
+    }}
+    .route-segment.motion-stationary {{
+      stroke: {MOTION_COLORS["stationary"]};
+    }}
+    .route-segment.motion-walking {{
+      stroke: {MOTION_COLORS["walking"]};
+    }}
+    .route-segment.motion-cycling {{
+      stroke: {MOTION_COLORS["cycling"]};
+    }}
+    .route-segment.motion-automotive {{
+      stroke: {MOTION_COLORS["automotive"]};
+    }}
+    .route-segment.motion-moving {{
+      stroke: {MOTION_COLORS["moving"]};
+    }}
+    .route-segment.motion-unknown {{
+      stroke: {MOTION_COLORS["unknown"]};
     }}
     .tile {{
       image-rendering: auto;
@@ -860,6 +977,43 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       fill: #2563eb;
       stroke: white;
       stroke-width: 3;
+    }}
+    .motion-summary {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .motion-chip {{
+      align-items: center;
+      border-radius: 999px;
+      color: white;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 800;
+      gap: 6px;
+      padding: 5px 9px;
+    }}
+    .motion-chip .dot {{
+      background: rgb(255 255 255 / 0.9);
+      border-radius: 999px;
+      height: 8px;
+      width: 8px;
+    }}
+    .motion-chip.stationary {{
+      background: {MOTION_COLORS["stationary"]};
+    }}
+    .motion-chip.walking {{
+      background: {MOTION_COLORS["walking"]};
+    }}
+    .motion-chip.cycling {{
+      background: {MOTION_COLORS["cycling"]};
+    }}
+    .motion-chip.automotive {{
+      background: {MOTION_COLORS["automotive"]};
+    }}
+    .motion-chip.moving {{
+      background: {MOTION_COLORS["moving"]};
     }}
     .stop {{
       cursor: pointer;
@@ -943,7 +1097,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         <rect x="-100000" y="-100000" width="200000" height="200000" fill="url(#grid)"/>
         <g id="viewport">
           <g id="tiles">{"".join(tile_images)}</g>
-          <path id="route" class="route" d="{fallback_route}"/>
+          <g id="route">{''.join(fallback_segments)}</g>
           <g id="places">{"".join(fallback_places)}</g>
           <g id="stops">{"".join(fallback_stops)}</g>
           {empty_svg}
@@ -959,6 +1113,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         </div>
         <button id="centerSelected" class="secondary" type="button" style="margin-top: 8px; width: 100%">Center selected</button>
         <p class="hint">Tap map labels or check rows, rename selected stops, then paste the generated command back into Telegram.</p>
+        <div class="motion-summary">{''.join(motion_chips) if motion_chips else '<span class="hint">Motion summary unavailable</span>'}</div>
       </section>
       {empty_panel}
       <section class="panel">
@@ -1375,15 +1530,27 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
     location_points = [event for event in scope_events if event.is_location]
     day_points: dict[date, list[Event]] = {}
     buckets: Counter[tuple[float, float]] = Counter()
+    bucket_modes: dict[tuple[float, float], Counter[str]] = {}
     label_sources = heatmap_label_sources(events, scope, user_tags or {})
+    mode_points: Counter[str] = Counter()
+    mode_distance: Counter[str] = Counter()
+    previous: Event | None = None
     for event in location_points:
         if event.lat is None or event.lon is None:
             continue
         day = event_date(event)
         if day is not None:
             day_points.setdefault(day, []).append(event)
+        mode = motion_mode(event)
+        mode_points[mode] += 1
+        if previous and previous.lat is not None and previous.lon is not None:
+            segment = haversine_km(previous.lat, previous.lon, event.lat, event.lon)
+            if segment <= 5:
+                mode_distance[mode] += segment
+        previous = event
         bucket = (round(event.lat, 4), round(event.lon, 4))
         buckets[bucket] += 1
+        bucket_modes.setdefault(bucket, Counter())[mode] += 1
 
     heat_points: list[dict] = []
     hotspots: list[dict] = []
@@ -1392,7 +1559,15 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         label = match.get("label") if match else None
         display_label = label or f"{lat:.4f}, {lon:.4f}"
         tags = match.get("tags", []) if match else []
-        heat_point = {"lat": round(lat, 6), "lon": round(lon, 6), "weight": count, "label": display_label, "tags": tags}
+        dominant_mode = bucket_modes[(lat, lon)].most_common(1)[0][0] if bucket_modes.get((lat, lon)) else "moving"
+        heat_point = {
+            "lat": round(lat, 6),
+            "lon": round(lon, 6),
+            "weight": count,
+            "label": display_label,
+            "tags": tags,
+            "mode": dominant_mode,
+        }
         heat_points.append(heat_point)
         hotspots.append({"lat": heat_point["lat"], "lon": heat_point["lon"], "count": count, "label": display_label, "tags": tags})
 
@@ -1414,6 +1589,11 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
             "max_visits": max(buckets.values()) if buckets else 0,
             "min_visits": min(buckets.values()) if buckets else 0,
             "sampled_distance_km": total_distance_km,
+        },
+        "motion_summary": {
+            "counts": dict(mode_points),
+            "distance_km": {mode: round(distance, 2) for mode, distance in mode_distance.items()},
+            "dominant": mode_points.most_common(1)[0][0] if mode_points else "unknown",
         },
         "heat_points": heat_points,
         "most_visited": most_visited,
@@ -1441,6 +1621,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                     "lon": stop.get("lon"),
                     "label": label,
                     "tags": list(stop.get("user_tags") or stop.get("tags") or []),
+                    "mode": str(stop.get("motion_mode") or "stationary"),
                     "priority": 4,
                     "date": day.isoformat(),
                 }
@@ -1455,6 +1636,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                     "lon": place.get("lon"),
                     "label": label,
                     "tags": list(place.get("tags") or []),
+                    "mode": "moving",
                     "priority": 3,
                     "date": day.isoformat(),
                 }
@@ -1474,6 +1656,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                 "lon": event.lon,
                 "label": label,
                 "tags": [f"place:{slug(label)}", f"geofence:{event.payload.get('event')}"],
+                "mode": "moving",
                 "priority": 2,
                 "date": day.isoformat(),
             }
@@ -1655,35 +1838,29 @@ def render_heatmap_html(summary: dict) -> str:
       border-color: #0f172a;
       color: white;
     }}
-    .filter-row {{
+    .mode-summary {{
       display: flex;
+      flex-wrap: wrap;
       gap: 6px;
-      margin-bottom: 6px;
+      margin: 0 0 6px;
     }}
-    .filter-row input {{
-      background: #fff;
-      border: 1px solid #cbd5e1;
-      border-radius: 6px;
-      box-sizing: border-box;
-      color: #0f172a;
-      flex: 1 1 auto;
-      font: inherit;
-      min-width: 0;
-      padding: 7px 8px;
-    }}
-    .filter-row button {{
+    .mode-chip {{
       appearance: none;
-      background: #0f172a;
-      border: 0;
-      border-radius: 6px;
-      color: white;
+      background: #e2e8f0;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      color: #0f172a;
       cursor: pointer;
-      flex: 0 0 auto;
       font-size: 12px;
-      font-weight: 800;
-      padding: 7px 10px;
+      font-weight: 700;
+      padding: 5px 9px;
     }}
-    .filter-summary {{
+    .mode-chip.active {{
+      background: #0f172a;
+      border-color: #0f172a;
+      color: white;
+    }}
+    .mode-summary-text {{
       color: #475569;
       font-size: 12px;
       margin-bottom: 8px;
@@ -1846,11 +2023,8 @@ def render_heatmap_html(summary: dict) -> str:
       <div class="panel-actions">
         <button type="button" id="toggleHeatmapPoints" class="panel-action">Show points</button>
       </div>
-      <div class="filter-row">
-        <input id="heatmapFilter" type="search" placeholder="Filter tags or keywords">
-        <button type="button" id="applyHeatmapFilter">Apply</button>
-      </div>
-      <div class="filter-summary" id="filterSummary"></div>
+      <div class="mode-summary" id="modeSummary"></div>
+      <div class="mode-summary-text" id="modeSummaryText"></div>
       <div class="stat-grid">
         <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
         <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
@@ -1879,17 +2053,18 @@ def render_heatmap_html(summary: dict) -> str:
       count: item.weight,
       label: item.label || `${{item.lat}}, ${{item.lon}}`,
       tags: item.tags || [],
+      mode: item.mode || "moving",
     }}));
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     const panel = document.getElementById("heatmapPanel");
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     const togglePointsButton = document.getElementById("toggleHeatmapPoints");
-    const filterInput = document.getElementById("heatmapFilter");
-    const applyFilterButton = document.getElementById("applyHeatmapFilter");
-    const filterSummary = document.getElementById("filterSummary");
+    const modeSummary = document.getElementById("modeSummary");
+    const modeSummaryText = document.getElementById("modeSummaryText");
     const pointLayer = L.layerGroup();
     let pointsVisible = false;
     let filteredSpots = allSpots;
+    let activeMode = "all";
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const legend = L.control({{ position: "bottomleft" }});
@@ -1935,12 +2110,12 @@ def render_heatmap_html(summary: dict) -> str:
       }});
       marker.bindTooltip(`${{spot.label}} · ${{spot.count}}`, {{ permanent: false, direction: "right", className: "place-label" }});
       marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{spot.count}} visits`);
-      marker.on("click", () => centerAndZoom(spot));
+      marker.on("click", () => {{
+        centerAndZoom(spot);
+        marker.openPopup();
+      }});
       pointLayer.addLayer(marker);
     }};
-    const searchTextFor = (spot) => `${{spot.label}} ${{spot.tags.join(" ")}}`.toLowerCase();
-    const filterTerms = () => filterInput.value.toLowerCase().split(/[\\s,]+/).map((term) => term.trim()).filter(Boolean);
-    const matchesFilter = (spot, terms) => !terms.length || terms.every((term) => searchTextFor(spot).includes(term));
     const topSpots = (items) => [...items].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label)).slice(0, 10);
     const leastSpots = (items) => [...items].sort((a, b) => a.count - b.count || a.label.localeCompare(b.label)).slice(0, 10);
     const refreshPointLayer = (items) => {{
@@ -1958,6 +2133,30 @@ def render_heatmap_html(summary: dict) -> str:
       togglePointsButton.textContent = pointsVisible ? "Hide points" : "Show points";
       togglePointsButton.classList.toggle("active", pointsVisible);
     }};
+    const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
+    const modeCounts = data.motion_summary?.counts || {{}};
+    const modeDistances = data.motion_summary?.distance_km || {{}};
+    const renderModeSummary = () => {{
+      modeSummary.innerHTML = motionModes.map((mode) => {{
+        const count = mode === "all" ? allSpots.length : (modeCounts[mode] || 0);
+        const label = mode === "all" ? `All (${{allSpots.length}})` : `${{mode}} (${{count}})`;
+        return `<button type="button" class="mode-chip ${{activeMode === mode ? "active" : ""}}" data-mode="${{mode}}">${{escapeHtml(label)}}</button>`;
+      }}).join("");
+      modeSummary.querySelectorAll("[data-mode]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          activeMode = button.dataset.mode;
+          applyFilter(true);
+        }});
+      }});
+      const dominant = data.motion_summary?.dominant || "unknown";
+      const distanceBits = motionModes
+        .filter((mode) => mode !== "all" && modeDistances[mode])
+        .map((mode) => `${{mode}}: ${{modeDistances[mode]}} km`);
+      modeSummaryText.textContent = distanceBits.length
+        ? `Dominant motion: ${{dominant}} · ${{distanceBits.join(" · ")}}`
+        : `Dominant motion: ${{dominant}}`;
+    }};
+    const modeMatches = (spot) => activeMode === "all" || (spot.mode || "moving") === activeMode;
     const setPointsVisible = (visible) => {{
       pointsVisible = visible;
       if (pointsVisible) {{
@@ -1968,22 +2167,15 @@ def render_heatmap_html(summary: dict) -> str:
       syncPointsButton();
     }};
     const applyFilter = (fit = false) => {{
-      const terms = filterTerms();
-      filteredSpots = allSpots.filter((spot) => matchesFilter(spot, terms));
+      filteredSpots = allSpots.filter((spot) => modeMatches(spot));
       heat.setLatLngs(filteredSpots.map((spot) => [spot.lat, spot.lon, spot.count]));
       refreshPointLayer(filteredSpots);
       listFor(topSpots(filteredSpots), "mostVisited");
       listFor(leastSpots(filteredSpots), "leastVisited");
-      filterSummary.textContent = terms.length
-        ? `${{filteredSpots.length}} of ${{allSpots.length}} locations match`
-        : `${{allSpots.length}} locations`;
+      renderModeSummary();
       if (fit) fitToSpots(filteredSpots);
     }};
     togglePointsButton.addEventListener("click", () => setPointsVisible(!pointsVisible));
-    applyFilterButton.addEventListener("click", () => applyFilter(true));
-    filterInput.addEventListener("keydown", (event) => {{
-      if (event.key === "Enter") applyFilter(true);
-    }});
     togglePanelButton.addEventListener("click", () => {{
       panel.classList.toggle("collapsed");
       syncPanelButton();
@@ -1993,8 +2185,7 @@ def render_heatmap_html(summary: dict) -> str:
     }}
     setPointsVisible(false);
     syncPanelButton();
-    const params = new URLSearchParams(window.location.search);
-    filterInput.value = params.get("filter") || params.get("q") || params.get("tag") || params.get("keyword") || "";
+    renderModeSummary();
     const listFor = (items, target) => {{
       const root = document.getElementById(target);
       if (!items.length) {{
@@ -2063,8 +2254,25 @@ def render_leaflet_map_html(plan: dict) -> str:
         for place in plan.get("named_places", [])
         if place.get("lat") is not None and place.get("lon") is not None
     ]
+    motion_summary = plan.get("motion_summary") or {}
+    motion_counts = motion_summary.get("counts") or {}
+    motion_dom = motion_summary.get("dominant") or "unknown"
+    motion_chips = []
+    for mode in ("stationary", "walking", "cycling", "automotive", "moving"):
+        count = motion_counts.get(mode)
+        if count:
+            motion_chips.append(f'<span class="motion-chip {escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</span>')
+    if motion_chips:
+        motion_chips.insert(0, f'<span class="motion-chip {escape(motion_dom)}"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
     payload = json.dumps(
-        {"date": plan["date"], "track": track, "stops": stops, "namedPlaces": named_places},
+        {
+            "date": plan["date"],
+            "track": track,
+            "sampledTrack": plan.get("sampled_track", []),
+            "stops": stops,
+            "namedPlaces": named_places,
+            "motionSummary": motion_summary,
+        },
         ensure_ascii=False,
     ).replace("</", "<\\/")
     escaped_title = escape(title)
@@ -2210,6 +2418,67 @@ def render_leaflet_map_html(plan: dict) -> str:
       line-height: 1.35;
       margin-top: 5px;
     }}
+    .route-segment {{
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 5;
+    }}
+    .route-segment.motion-stationary {{
+      stroke: {MOTION_COLORS["stationary"]};
+    }}
+    .route-segment.motion-walking {{
+      stroke: {MOTION_COLORS["walking"]};
+    }}
+    .route-segment.motion-cycling {{
+      stroke: {MOTION_COLORS["cycling"]};
+    }}
+    .route-segment.motion-automotive {{
+      stroke: {MOTION_COLORS["automotive"]};
+    }}
+    .route-segment.motion-moving {{
+      stroke: {MOTION_COLORS["moving"]};
+    }}
+    .route-segment.motion-unknown {{
+      stroke: {MOTION_COLORS["unknown"]};
+    }}
+    .motion-summary {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .motion-chip {{
+      align-items: center;
+      border-radius: 999px;
+      color: white;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 800;
+      gap: 6px;
+      padding: 5px 9px;
+    }}
+    .motion-chip .dot {{
+      background: rgb(255 255 255 / 0.9);
+      border-radius: 999px;
+      height: 8px;
+      width: 8px;
+    }}
+    .motion-chip.stationary {{
+      background: {MOTION_COLORS["stationary"]};
+    }}
+    .motion-chip.walking {{
+      background: {MOTION_COLORS["walking"]};
+    }}
+    .motion-chip.cycling {{
+      background: {MOTION_COLORS["cycling"]};
+    }}
+    .motion-chip.automotive {{
+      background: {MOTION_COLORS["automotive"]};
+    }}
+    .motion-chip.moving {{
+      background: {MOTION_COLORS["moving"]};
+    }}
     .stop-label {{
       background: #111827;
       border: 0;
@@ -2317,6 +2586,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="fitAll" type="button" class="secondary">Fit</button>
       </div>
       <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
+      <div class="motion-summary">{''.join(motion_chips) if motion_chips else '<span class="hint">Motion summary unavailable</span>'}</div>
       <label for="groupDistance">Nearby grouping distance, meters</label>
       <input id="groupDistance" type="number" min="20" step="10" value="150">
       <div class="row">
@@ -2356,6 +2626,15 @@ def render_leaflet_map_html(plan: dict) -> str:
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const bounds = [];
     const markers = new Map();
+    const routeLayer = L.layerGroup().addTo(map);
+    const motionColors = {{
+      stationary: "{MOTION_COLORS["stationary"]}",
+      walking: "{MOTION_COLORS["walking"]}",
+      cycling: "{MOTION_COLORS["cycling"]}",
+      automotive: "{MOTION_COLORS["automotive"]}",
+      moving: "{MOTION_COLORS["moving"]}",
+      unknown: "{MOTION_COLORS["unknown"]}"
+    }};
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
       "&": "&amp;",
       "<": "&lt;",
@@ -2421,6 +2700,26 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (autoCopy && commands.value) copyCommandsToClipboard(true);
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
+    const trackPoints = data.sampledTrack || [];
+    const drawRoute = () => {{
+      routeLayer.clearLayers();
+      if (trackPoints.length < 2) return;
+      for (let index = 1; index < trackPoints.length; index += 1) {{
+        const prev = trackPoints[index - 1];
+        const current = trackPoints[index];
+        const mode = current.motion_mode || prev.motion_mode || "moving";
+        L.polyline(
+          [[prev.lat, prev.lon], [current.lat, current.lon]],
+          {{
+            color: motionColors[mode] || motionColors.moving,
+            weight: 5,
+            opacity: 0.9,
+            lineCap: "round",
+            lineJoin: "round"
+          }}
+        ).addTo(routeLayer);
+      }}
+    }};
     const iconFor = (stop) => L.divIcon({{
       className: "",
       html: `<div style="background:${{selected.has(stop.alias) ? "#f59e0b" : "#dc2626"}};border:3px solid white;border-radius:999px;box-shadow:0 1px 7px rgb(0 0 0 / .35);height:18px;width:18px"></div>`,
@@ -2552,8 +2851,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       setSelected(stop.alias, !selected.has(stop.alias), true);
     }};
     if (data.track.length) {{
-      const route = L.polyline(data.track, {{ color: "#2563eb", weight: 4, opacity: 0.8 }}).addTo(map);
-      bounds.push(route.getBounds());
+      drawRoute();
+      bounds.push(L.latLngBounds(data.track.map((point) => [point[0], point[1]])));
     }}
     for (const place of data.namedPlaces) {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
@@ -2663,6 +2962,7 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
     stops = candidate_stops(window_events)
     speeds = [event.speed_kmh for event in track_points if event.speed_kmh is not None]
     batteries = [event.payload.get("batt") for event in track_points if event.payload.get("batt") is not None]
+    motion = motion_summary(track_points)
     place_tags = [tag for place in places for tag in place["tags"]]
     stop_tags = [tag for stop in stops for tag in stop["tags"]]
     recommended_tags = ["activity:daily-review", "source:owntracks", *place_tags, *stop_tags]
@@ -2682,6 +2982,7 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
             "battery_start": batteries[0] if batteries else None,
             "battery_end": batteries[-1] if batteries else None,
         },
+        "motion_summary": motion,
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
