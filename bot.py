@@ -337,6 +337,8 @@ def is_fuel_target(update: Update, config: Config) -> bool:
 
 
 async def fuel_guarded(update: Update, config: Config) -> bool:
+    if not is_fuel_target(update, config):
+        return False
     reason = fuel_unauthorized_reason(update, config)
     if not reason:
         return True
