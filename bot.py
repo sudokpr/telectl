@@ -1159,7 +1159,7 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
     errors: list[str] = []
     for line in pair_lines:
         try:
-            stop_ref, update = parse_owntracks_review_line(line)
+            stop_ref, review_update = parse_owntracks_review_line(line)
         except ValueError as exc:
             errors.append(str(exc))
             continue
@@ -1167,30 +1167,32 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
         if not stop:
             errors.append(f"Unknown stop: {stop_ref}")
             continue
-        if not update.get("name"):
+        if not review_update.get("name"):
             errors.append(f"Missing name: {stop_ref}")
             continue
-        updates.append((stop, update))
+        updates.append((stop, review_update))
     if not updates:
         await message.reply_text("No reviews saved. " + "; ".join(errors[:5]))
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
     stops = data.setdefault(plan["date"], {}).setdefault("stops", {})
-    for stop, update in updates:
+    for stop, review_update in updates:
         stop_id = stop["id"]
         stop_data = stops.setdefault(stop_id, {})
         annotate_saved_stop(stop_data, stop)
-        if update.get("name"):
-            stop_data["name"] = update["name"]
-        if "tags" in update:
-            stop_data["tags"] = update["tags"]
-        if "note" in update:
-            stop_data["note"] = update["note"]
+        if review_update.get("name"):
+            stop_data["name"] = review_update["name"]
+        if "tags" in review_update:
+            stop_data["tags"] = review_update["tags"]
+        if "note" in review_update:
+            stop_data["note"] = review_update["note"]
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, plan["date"])
-    suffix = f"\nSkipped: {'; '.join(errors[:5])}" if errors else ""
-    await message.reply_text(f"Saved {len(updates)} OwnTracks stop reviews for {plan['date']}.{suffix}")
+    summary = f"Saved {len(updates)} OwnTracks stop reviews for {plan['date']}."
+    if errors:
+        summary += f"\nSkipped: {'; '.join(errors[:5])}"
+    await message.reply_text(summary)
 
 
 async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
