@@ -1455,9 +1455,40 @@ def render_heatmap_html(summary: dict) -> str:
       top: 10px;
       z-index: 1000;
     }}
+    .panel-header {{
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }}
     .panel h1 {{
       font-size: 16px;
-      margin: 0 0 6px;
+      margin: 0;
+    }}
+    .panel-toggle {{
+      appearance: none;
+      background: #0f172a;
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      cursor: pointer;
+      flex: 0 0 auto;
+      font-size: 12px;
+      font-weight: 800;
+      padding: 6px 10px;
+    }}
+    .panel-body {{
+      display: block;
+    }}
+    .panel.collapsed {{
+      max-height: none;
+      overflow: visible;
+      padding: 10px;
+      width: auto;
+    }}
+    .panel.collapsed .panel-body {{
+      display: none;
     }}
     .panel .subtle {{
       color: #475569;
@@ -1554,24 +1585,29 @@ def render_heatmap_html(summary: dict) -> str:
 </head>
 <body>
   <div id="map"></div>
-  <div class="panel">
-    <h1>{title}</h1>
-    <div class="subtle">{scope["start"]} to {scope["end"]}</div>
-    <div class="stat-grid">
-      <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
-      <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
-      <div class="stat"><span class="label">Locations</span><span class="value">{stats["unique_locations"]}</span></div>
-      <div class="stat"><span class="label">Max visits</span><span class="value">{stats["max_visits"]}</span></div>
-      <div class="stat"><span class="label">Min visits</span><span class="value">{stats["min_visits"]}</span></div>
-      <div class="stat"><span class="label">Distance</span><span class="value">{stats["sampled_distance_km"]} km</span></div>
+  <div class="panel" id="heatmapPanel">
+    <div class="panel-header">
+      <h1>{title}</h1>
+      <button type="button" id="toggleHeatmapPanel" class="panel-toggle">Hide</button>
     </div>
-    <div class="list">
-      <h2>Most visited</h2>
-      <div id="mostVisited"></div>
-    </div>
-    <div class="list">
-      <h2>Least visited</h2>
-      <div id="leastVisited"></div>
+    <div class="panel-body">
+      <div class="subtle">{scope["start"]} to {scope["end"]}</div>
+      <div class="stat-grid">
+        <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
+        <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
+        <div class="stat"><span class="label">Locations</span><span class="value">{stats["unique_locations"]}</span></div>
+        <div class="stat"><span class="label">Max visits</span><span class="value">{stats["max_visits"]}</span></div>
+        <div class="stat"><span class="label">Min visits</span><span class="value">{stats["min_visits"]}</span></div>
+        <div class="stat"><span class="label">Distance</span><span class="value">{stats["sampled_distance_km"]} km</span></div>
+      </div>
+      <div class="list">
+        <h2>Most visited</h2>
+        <div id="mostVisited"></div>
+      </div>
+      <div class="list">
+        <h2>Least visited</h2>
+        <div id="leastVisited"></div>
+      </div>
     </div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -1580,6 +1616,8 @@ def render_heatmap_html(summary: dict) -> str:
     const data = {payload};
     const heatPoints = data.heat_points.map((item) => [item.lat, item.lon, item.weight]);
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
+    const panel = document.getElementById("heatmapPanel");
+    const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const heat = heatPoints.length ? L.heatLayer(heatPoints, {{
@@ -1606,6 +1644,17 @@ def render_heatmap_html(summary: dict) -> str:
       markers.push(marker);
     }};
     data.most_visited.forEach((spot, index) => makeSpot(spot, index));
+    const syncPanelButton = () => {{
+      togglePanelButton.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
+    }};
+    togglePanelButton.addEventListener("click", () => {{
+      panel.classList.toggle("collapsed");
+      syncPanelButton();
+    }});
+    if (window.matchMedia("(max-width: 800px)").matches) {{
+      panel.classList.add("collapsed");
+    }}
+    syncPanelButton();
     const listFor = (items, target) => {{
       const root = document.getElementById(target);
       root.innerHTML = items.map((spot) => `
