@@ -1375,6 +1375,7 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
     location_points = [event for event in scope_events if event.is_location]
     day_points: dict[date, list[Event]] = {}
     buckets: Counter[tuple[float, float]] = Counter()
+    label_sources = heatmap_label_sources(events, scope, user_tags or {})
     for event in location_points:
         if event.lat is None or event.lon is None:
             continue
@@ -1387,7 +1388,7 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
     heat_points: list[dict] = []
     hotspots: list[dict] = []
     for (lat, lon), count in sorted(buckets.items(), key=lambda item: (-item[1], item[0])):
-        label = location_override_for({"lat": lat, "lon": lon}, user_tags or {}, scope.end_date.isoformat()).get("name")
+        label = best_heatmap_label(lat, lon, label_sources)
         display_label = label or f"{lat:.4f}, {lon:.4f}"
         heat_points.append({"lat": round(lat, 6), "lon": round(lon, 6), "weight": count})
         hotspots.append({"lat": round(lat, 6), "lon": round(lon, 6), "count": count, "label": display_label})
@@ -1415,6 +1416,82 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "most_visited": most_visited,
         "least_visited": least_visited,
     }
+
+
+def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags: dict) -> list[dict]:
+    sources: list[dict] = []
+    day_events: dict[date, list[Event]] = {}
+    for event in events:
+        day = event_date(event)
+        if day is None or day < scope.start_date or day > scope.end_date or not event.is_location:
+            continue
+        day_events.setdefault(day, []).append(event)
+    for day, scoped_events in day_events.items():
+        plan, _track_points = build_plan(scoped_events, day, user_tags)
+        for stop in plan.get("candidate_stops", []):
+            label = str(stop.get("reviewed_name") or stop.get("name") or "").strip()
+            if not label:
+                continue
+            sources.append(
+                {
+                    "lat": stop.get("lat"),
+                    "lon": stop.get("lon"),
+                    "label": label,
+                    "priority": 4,
+                    "date": day.isoformat(),
+                }
+            )
+        for place in plan.get("named_places", []):
+            label = str(place.get("name") or "").strip()
+            if not label:
+                continue
+            sources.append(
+                {
+                    "lat": place.get("lat"),
+                    "lon": place.get("lon"),
+                    "label": label,
+                    "priority": 3,
+                    "date": day.isoformat(),
+                }
+            )
+    for event in events:
+        if event.kind != "transition":
+            continue
+        label = str(event.payload.get("desc") or "").strip()
+        if not label or event.lat is None or event.lon is None:
+            continue
+        day = event_date(event)
+        if day is None or day > scope.end_date:
+            continue
+        sources.append(
+            {
+                "lat": event.lat,
+                "lon": event.lon,
+                "label": label,
+                "priority": 2,
+                "date": day.isoformat(),
+            }
+        )
+    return sources
+
+
+def best_heatmap_label(lat: float, lon: float, sources: list[dict], radius_m: int = 400) -> str | None:
+    best: tuple[int, str, float, str] | None = None
+    for source in sources:
+        source_lat = as_float(source.get("lat"))
+        source_lon = as_float(source.get("lon"))
+        label = str(source.get("label") or "").strip()
+        if source_lat is None or source_lon is None or not label:
+            continue
+        distance_m = haversine_km(lat, lon, source_lat, source_lon) * 1000
+        if distance_m > radius_m:
+            continue
+        priority = int(source.get("priority") or 0)
+        date_key = str(source.get("date") or "")
+        candidate = (-priority, date_key, distance_m, label.lower())
+        if best is None or candidate < best:
+            best = candidate
+    return best[3] if best is not None else None
 
 
 def render_heatmap_html(summary: dict) -> str:
@@ -1675,10 +1752,10 @@ def render_heatmap_html(summary: dict) -> str:
       maxZoom: 17,
       minOpacity: 0.25,
       gradient: {{
-        0.2: "#2c7bb6",
-        0.45: "#abd9e9",
-        0.7: "#fdae61",
-        1.0: "#d7191c",
+        0.15: "#0b3d91",
+        0.45: "#00bcd4",
+        0.75: "#ff9800",
+        1.0: "#d32f2f",
       }},
     }}).addTo(map) : null;
     const markers = [];
