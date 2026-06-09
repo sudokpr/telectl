@@ -13,7 +13,7 @@ from typing import Any
 
 import requests
 
-from image_summary import IST, env_bool, env_int, log
+from image_summary import IST, env_bool, env_int, env_topic_id, log
 
 
 DEFAULT_FIELDS = [
@@ -82,7 +82,7 @@ def build_fuel_config(env: dict[str, str], fallback_chat_id: int) -> FuelConfig:
     return FuelConfig(
         enabled=env_bool(env.get("FUEL_ENABLED"), True),
         chat_id=env_int(env.get("FUEL_CHAT_ID"), fallback_chat_id),
-        topic_id=env_int(env.get("FUEL_TOPIC_ID"), 349),
+        topic_id=env_topic_id(env.get("FUEL_TOPIC_ID"), 349),
         work_dir=work_dir,
         csv_path=Path(env.get("FUEL_CSV_PATH", str(work_dir / "fuel.csv"))).expanduser(),
         model=env.get("FUEL_MODEL", "minicpm-v:latest"),

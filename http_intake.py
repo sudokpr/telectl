@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from typing import Any
 
 from telegram.ext import Application
 
 from image_summary import ImageSummaryConfig, log, split_message
 from memory_processor import save_memory
+from owntracks.digest import generate_hosted_map
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,7 @@ class HttpIntakeConfig:
     token: str
     notify_telegram: bool
     fuel_csv_path: str
+    owntracks_derived_dir: str
 
 
 def build_http_config(env: dict[str, str]) -> HttpIntakeConfig:
@@ -34,6 +38,7 @@ def build_http_config(env: dict[str, str]) -> HttpIntakeConfig:
         notify_telegram=env.get("HTTP_INTAKE_NOTIFY_TELEGRAM", "true").strip().lower()
         in {"1", "true", "yes", "on"},
         fuel_csv_path=env.get("FUEL_CSV_PATH", "./data/fuel/fuel.csv"),
+        owntracks_derived_dir=env.get("OWNTRACKS_DERIVED_DIR", "./data/owntracks/derived"),
     )
 
 
@@ -55,6 +60,21 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def authorized(handler: BaseHTTPRequestHandler, token: str) -> bool:
+    if not token:
+        return True
+    supplied = handler.headers.get("X-Intake-Token", "")
+    auth = handler.headers.get("Authorization", "")
+    bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    query_token = parse_qs(urlparse(handler.path).query).get("token", [""])[0]
+    return supplied == token or bearer == token or query_token == token
+
+
+def project_relative_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    return path if path.is_absolute() else Path(__file__).resolve().parent / path
 
 
 async def send_telegram_confirmation(
@@ -82,10 +102,11 @@ def make_handler(
         server_version = "TelegramControlIntake/0.1"
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed = urlparse(self.path)
+            if parsed.path == "/health":
                 write_json(self, HTTPStatus.OK, {"ok": True})
                 return
-            if self.path == "/fuel.csv":
+            if parsed.path == "/fuel.csv":
                 path = Path(http_cfg.fuel_csv_path)
                 if not path.exists():
                     self.send_response(HTTPStatus.NOT_FOUND.value)
@@ -99,19 +120,36 @@ def make_handler(
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            match = parsed.path.removeprefix("/owntracks/map/").removesuffix(".html")
+            if parsed.path.startswith("/owntracks/map/") and match:
+                if not authorized(self, http_cfg.token):
+                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                    return
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", match):
+                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid date"})
+                    return
+                try:
+                    _plan, html = generate_hosted_map(match)
+                except Exception as exc:
+                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                body = html.encode("utf-8")
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
         def do_POST(self) -> None:
             if self.path != "/memory":
                 write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 return
-            if http_cfg.token:
-                supplied = self.headers.get("X-Intake-Token", "")
-                auth = self.headers.get("Authorization", "")
-                bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-                if supplied != http_cfg.token and bearer != http_cfg.token:
-                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
-                    return
+            if not authorized(self, http_cfg.token):
+                write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                return
 
             try:
                 data = read_json(self)

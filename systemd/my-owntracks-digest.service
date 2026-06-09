@@ -1,0 +1,8 @@
+[Unit]
+Description=Telegram Control OwnTracks daily digest
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/telectl
+Environment=TZ=Asia/Kolkata
+ExecStart=%h/.local/bin/uv --cache-dir .uv-cache run python -m owntracks.digest --date today --send

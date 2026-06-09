@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram Control OwnTracks MQTT raw event logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/telectl
+ExecStart=%h/.local/bin/uv --cache-dir .uv-cache run python -m owntracks.listener
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

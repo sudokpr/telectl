@@ -115,6 +115,14 @@ def env_int(value: str | None, default: int) -> int:
     return int(value)
 
 
+def env_topic_id(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    if not value.strip():
+        return 0
+    return int(value)
+
+
 def env_list(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     if not value:
         return default
@@ -139,7 +147,7 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
     vision_model = env.get("IMAGE_SUMMARY_VISION_LLM_MODEL", "gemma4:e2b")
     return ImageSummaryConfig(
         chat_id=env_int(env.get("IMAGE_SUMMARY_CHAT_ID"), fallback_chat_id),
-        topic_id=env_int(env.get("IMAGE_SUMMARY_TOPIC_ID"), 145),
+        topic_id=env_topic_id(env.get("IMAGE_SUMMARY_TOPIC_ID"), 145),
         max_reply_chars=env_int(env.get("IMAGE_SUMMARY_MAX_REPLY_CHARS"), 3600),
         summary_mode=mode,
         work_dir=work_dir,
