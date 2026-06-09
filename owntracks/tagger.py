@@ -1555,6 +1555,28 @@ def render_heatmap_html(summary: dict) -> str:
       font-weight: 800;
       padding: 6px 10px;
     }}
+    .panel-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }}
+    .panel-action {{
+      appearance: none;
+      background: #e2e8f0;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      color: #0f172a;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+    }}
+    .panel-action.active {{
+      background: #0f172a;
+      border-color: #0f172a;
+      color: white;
+    }}
     .panel-body {{
       display: block;
     }}
@@ -1689,6 +1711,16 @@ def render_heatmap_html(summary: dict) -> str:
       height: 10px;
       width: 36px;
     }}
+    .place-label {{
+      background: rgb(15 23 42 / 0.92);
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 6px;
+      box-shadow: 0 1px 4px rgb(15 23 42 / 0.22);
+    }}
   </style>
 </head>
 <body>
@@ -1700,6 +1732,9 @@ def render_heatmap_html(summary: dict) -> str:
     </div>
     <div class="panel-body">
       <div class="subtle">{scope["start"]} to {scope["end"]}</div>
+      <div class="panel-actions">
+        <button type="button" id="toggleHeatmapPoints" class="panel-action">Show points</button>
+      </div>
       <div class="stat-grid">
         <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
         <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
@@ -1726,6 +1761,9 @@ def render_heatmap_html(summary: dict) -> str:
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     const panel = document.getElementById("heatmapPanel");
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
+    const togglePointsButton = document.getElementById("toggleHeatmapPoints");
+    const pointLayer = L.layerGroup();
+    let pointsVisible = false;
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const legend = L.control({{ position: "bottomleft" }});
@@ -1757,28 +1795,41 @@ def render_heatmap_html(summary: dict) -> str:
         0.75: "#ff9800",
         1.0: "#d32f2f",
       }},
-    }}).addTo(map) : null;
-    const markers = [];
+      }}).addTo(map) : null;
     const centerAndZoom = (spot) => {{
       map.setView([spot.lat, spot.lon], Math.max(map.getZoom(), 14), {{ animate: true }});
     }};
-    const makeSpot = (spot, index) => {{
+    const makeSpot = (spot) => {{
       const marker = L.circleMarker([spot.lat, spot.lon], {{
         radius: Math.min(16, 5 + Math.log2(spot.count + 1) * 2.5),
-        color: index === 0 ? "#b91c1c" : "#1e3a8a",
+        color: "#1e3a8a",
         weight: 2,
-        fillColor: index === 0 ? "#ef4444" : "#3b82f6",
+        fillColor: "#3b82f6",
         fillOpacity: 0.78,
-      }}).addTo(map);
-      marker.bindTooltip(`${{spot.label}} · ${{spot.count}}`, {{ permanent: index < 3, direction: "right", className: "place-label" }});
+      }});
+      marker.bindTooltip(`${{spot.label}} · ${{spot.count}}`, {{ permanent: false, direction: "right", className: "place-label" }});
       marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{spot.count}} visits`);
       marker.on("click", () => centerAndZoom(spot));
-      markers.push(marker);
+      pointLayer.addLayer(marker);
     }};
-    data.most_visited.forEach((spot, index) => makeSpot(spot, index));
+    data.most_visited.forEach((spot) => makeSpot(spot));
     const syncPanelButton = () => {{
       togglePanelButton.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
     }};
+    const syncPointsButton = () => {{
+      togglePointsButton.textContent = pointsVisible ? "Hide points" : "Show points";
+      togglePointsButton.classList.toggle("active", pointsVisible);
+    }};
+    const setPointsVisible = (visible) => {{
+      pointsVisible = visible;
+      if (pointsVisible) {{
+        pointLayer.addTo(map);
+      }} else {{
+        pointLayer.removeFrom(map);
+      }}
+      syncPointsButton();
+    }};
+    togglePointsButton.addEventListener("click", () => setPointsVisible(!pointsVisible));
     togglePanelButton.addEventListener("click", () => {{
       panel.classList.toggle("collapsed");
       syncPanelButton();
@@ -1786,6 +1837,7 @@ def render_heatmap_html(summary: dict) -> str:
     if (window.matchMedia("(max-width: 800px)").matches) {{
       panel.classList.add("collapsed");
     }}
+    setPointsVisible(false);
     syncPanelButton();
     const listFor = (items, target) => {{
       const root = document.getElementById(target);
