@@ -15,7 +15,7 @@ from telegram.ext import Application
 
 from image_summary import ImageSummaryConfig, log, split_message
 from memory_processor import save_memory
-from owntracks.digest import generate_hosted_map
+from owntracks.digest import generate_hosted_map, generate_sample_heatmap
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,23 @@ def make_handler(
                 self.send_response(HTTPStatus.OK.value)
                 self.send_header("Content-Type", "text/csv; charset=utf-8")
                 self.send_header("Content-Disposition", 'attachment; filename="fuel.csv"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path in {"/owntracks/sample", "/owntracks/sample.html"}:
+                if not authorized(self, http_cfg.token):
+                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                    return
+                try:
+                    _summary, html = generate_sample_heatmap()
+                except Exception as exc:
+                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                body = html.encode("utf-8")
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

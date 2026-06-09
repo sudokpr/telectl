@@ -1388,10 +1388,13 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
     heat_points: list[dict] = []
     hotspots: list[dict] = []
     for (lat, lon), count in sorted(buckets.items(), key=lambda item: (-item[1], item[0])):
-        label = best_heatmap_label(lat, lon, label_sources)
+        match = best_heatmap_match(lat, lon, label_sources)
+        label = match.get("label") if match else None
         display_label = label or f"{lat:.4f}, {lon:.4f}"
-        heat_points.append({"lat": round(lat, 6), "lon": round(lon, 6), "weight": count})
-        hotspots.append({"lat": round(lat, 6), "lon": round(lon, 6), "count": count, "label": display_label})
+        tags = match.get("tags", []) if match else []
+        heat_point = {"lat": round(lat, 6), "lon": round(lon, 6), "weight": count, "label": display_label, "tags": tags}
+        heat_points.append(heat_point)
+        hotspots.append({"lat": heat_point["lat"], "lon": heat_point["lon"], "count": count, "label": display_label, "tags": tags})
 
     least_visited = sorted(hotspots, key=lambda item: (item["count"], item["label"]))[:10]
     most_visited = hotspots[:10]
@@ -1437,6 +1440,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                     "lat": stop.get("lat"),
                     "lon": stop.get("lon"),
                     "label": label,
+                    "tags": list(stop.get("user_tags") or stop.get("tags") or []),
                     "priority": 4,
                     "date": day.isoformat(),
                 }
@@ -1450,6 +1454,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                     "lat": place.get("lat"),
                     "lon": place.get("lon"),
                     "label": label,
+                    "tags": list(place.get("tags") or []),
                     "priority": 3,
                     "date": day.isoformat(),
                 }
@@ -1468,6 +1473,7 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
                 "lat": event.lat,
                 "lon": event.lon,
                 "label": label,
+                "tags": [f"place:{slug(label)}", f"geofence:{event.payload.get('event')}"],
                 "priority": 2,
                 "date": day.isoformat(),
             }
@@ -1475,8 +1481,9 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
     return sources
 
 
-def best_heatmap_label(lat: float, lon: float, sources: list[dict], radius_m: int = 400) -> str | None:
+def best_heatmap_match(lat: float, lon: float, sources: list[dict], radius_m: int = 400) -> dict | None:
     best: tuple[int, str, float, str] | None = None
+    best_source: dict | None = None
     for source in sources:
         source_lat = as_float(source.get("lat"))
         source_lon = as_float(source.get("lon"))
@@ -1491,7 +1498,78 @@ def best_heatmap_label(lat: float, lon: float, sources: list[dict], radius_m: in
         candidate = (-priority, date_key, distance_m, label.lower())
         if best is None or candidate < best:
             best = candidate
-    return best[3] if best is not None else None
+            tags = source.get("tags") or []
+            best_source = {
+                "label": label,
+                "tags": [str(tag) for tag in tags if str(tag).strip()],
+            }
+    return best_source
+
+
+def build_sample_heatmap_summary() -> dict:
+    points: list[dict] = []
+
+    def add_cluster(
+        label: str,
+        lat: float,
+        lon: float,
+        visits: list[int],
+        tags: list[str],
+        spread: float,
+    ) -> None:
+        for index, count in enumerate(visits):
+            row = (index % 5) - 2
+            col = (index // 5) - 2
+            points.append(
+                {
+                    "lat": round(lat + row * spread, 6),
+                    "lon": round(lon + col * spread, 6),
+                    "weight": count,
+                    "label": label if index == 0 else f"{label} area {index + 1}",
+                    "tags": tags,
+                }
+            )
+
+    add_cluster("Bengaluru errands", 12.9716, 77.5946, [95, 72, 48, 27, 18, 12], ["city", "india", "errands"], 0.018)
+    add_cluster("Mumbai work travel", 19.0760, 72.8777, [64, 41, 22, 13], ["city", "india", "work"], 0.025)
+    add_cluster("Delhi airport loop", 28.5562, 77.1000, [52, 36, 19], ["city", "india", "airport"], 0.02)
+    add_cluster("London commute", 51.5072, -0.1276, [44, 31, 20, 8], ["city", "uk", "commute"], 0.03)
+    add_cluster("New York trip", 40.7128, -74.0060, [58, 33, 16, 9], ["city", "usa", "travel"], 0.035)
+    add_cluster("San Francisco visit", 37.7749, -122.4194, [38, 21, 11], ["city", "usa", "travel"], 0.028)
+    add_cluster("Tokyo vacation", 35.6762, 139.6503, [46, 29, 14], ["city", "japan", "vacation"], 0.025)
+    add_cluster("Singapore stopover", 1.3521, 103.8198, [34, 18, 8], ["city", "singapore", "airport"], 0.018)
+    add_cluster("Sydney holiday", -33.8688, 151.2093, [26, 15, 6], ["city", "australia", "vacation"], 0.03)
+    add_cluster("Sao Paulo conference", -23.5558, -46.6396, [23, 12, 5], ["city", "brazil", "work"], 0.03)
+    add_cluster("Cape Town visit", -33.9249, 18.4241, [19, 10, 4], ["city", "south-africa", "travel"], 0.025)
+
+    most_visited = sorted(
+        [{"lat": p["lat"], "lon": p["lon"], "count": p["weight"], "label": p["label"], "tags": p["tags"]} for p in points],
+        key=lambda item: (-item["count"], item["label"]),
+    )[:10]
+    least_visited = sorted(
+        [{"lat": p["lat"], "lon": p["lon"], "count": p["weight"], "label": p["label"], "tags": p["tags"]} for p in points],
+        key=lambda item: (item["count"], item["label"]),
+    )[:10]
+    return {
+        "title": "OwnTracks sample heatmap",
+        "scope": {
+            "kind": "sample",
+            "value": "sample",
+            "start": "sample",
+            "end": "sample",
+        },
+        "stats": {
+            "days_with_points": 90,
+            "location_points": sum(int(point["weight"]) for point in points),
+            "unique_locations": len(points),
+            "max_visits": max(int(point["weight"]) for point in points),
+            "min_visits": min(int(point["weight"]) for point in points),
+            "sampled_distance_km": 0,
+        },
+        "heat_points": points,
+        "most_visited": most_visited,
+        "least_visited": least_visited,
+    }
 
 
 def render_heatmap_html(summary: dict) -> str:
@@ -1576,6 +1654,39 @@ def render_heatmap_html(summary: dict) -> str:
       background: #0f172a;
       border-color: #0f172a;
       color: white;
+    }}
+    .filter-row {{
+      display: flex;
+      gap: 6px;
+      margin-bottom: 6px;
+    }}
+    .filter-row input {{
+      background: #fff;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      box-sizing: border-box;
+      color: #0f172a;
+      flex: 1 1 auto;
+      font: inherit;
+      min-width: 0;
+      padding: 7px 8px;
+    }}
+    .filter-row button {{
+      appearance: none;
+      background: #0f172a;
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      cursor: pointer;
+      flex: 0 0 auto;
+      font-size: 12px;
+      font-weight: 800;
+      padding: 7px 10px;
+    }}
+    .filter-summary {{
+      color: #475569;
+      font-size: 12px;
+      margin-bottom: 8px;
     }}
     .panel-body {{
       display: block;
@@ -1735,6 +1846,11 @@ def render_heatmap_html(summary: dict) -> str:
       <div class="panel-actions">
         <button type="button" id="toggleHeatmapPoints" class="panel-action">Show points</button>
       </div>
+      <div class="filter-row">
+        <input id="heatmapFilter" type="search" placeholder="Filter tags or keywords">
+        <button type="button" id="applyHeatmapFilter">Apply</button>
+      </div>
+      <div class="filter-summary" id="filterSummary"></div>
       <div class="stat-grid">
         <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
         <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
@@ -1757,13 +1873,23 @@ def render_heatmap_html(summary: dict) -> str:
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
   <script>
     const data = {payload};
-    const heatPoints = data.heat_points.map((item) => [item.lat, item.lon, item.weight]);
+    const allSpots = data.heat_points.map((item) => ({{
+      lat: item.lat,
+      lon: item.lon,
+      count: item.weight,
+      label: item.label || `${{item.lat}}, ${{item.lon}}`,
+      tags: item.tags || [],
+    }}));
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     const panel = document.getElementById("heatmapPanel");
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     const togglePointsButton = document.getElementById("toggleHeatmapPoints");
+    const filterInput = document.getElementById("heatmapFilter");
+    const applyFilterButton = document.getElementById("applyHeatmapFilter");
+    const filterSummary = document.getElementById("filterSummary");
     const pointLayer = L.layerGroup();
     let pointsVisible = false;
+    let filteredSpots = allSpots;
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const legend = L.control({{ position: "bottomleft" }});
@@ -1771,10 +1897,10 @@ def render_heatmap_html(summary: dict) -> str:
       const el = L.DomUtil.create("div", "heatmap-legend");
       el.innerHTML = `
         <div class="title">Heat intensity</div>
-        <div class="row"><span class="swatch" style="background: #2c7bb6;"></span><span>Low</span></div>
-        <div class="row"><span class="swatch" style="background: #abd9e9;"></span><span>Medium</span></div>
-        <div class="row"><span class="swatch" style="background: #fdae61;"></span><span>High</span></div>
-        <div class="row"><span class="swatch" style="background: #d7191c;"></span><span>Most visited</span></div>
+        <div class="row"><span class="swatch" style="background: #0b3d91;"></span><span>Low</span></div>
+        <div class="row"><span class="swatch" style="background: #00bcd4;"></span><span>Medium</span></div>
+        <div class="row"><span class="swatch" style="background: #ff9800;"></span><span>High</span></div>
+        <div class="row"><span class="swatch" style="background: #d32f2f;"></span><span>Most visited</span></div>
       `;
       return el;
     }};
@@ -1784,7 +1910,7 @@ def render_heatmap_html(summary: dict) -> str:
       maxZoom: 19,
       opacity: 0.95,
     }}).addTo(map);
-    const heat = heatPoints.length ? L.heatLayer(heatPoints, {{
+    const heat = L.heatLayer([], {{
       radius: 28,
       blur: 20,
       maxZoom: 17,
@@ -1795,7 +1921,7 @@ def render_heatmap_html(summary: dict) -> str:
         0.75: "#ff9800",
         1.0: "#d32f2f",
       }},
-      }}).addTo(map) : null;
+      }}).addTo(map);
     const centerAndZoom = (spot) => {{
       map.setView([spot.lat, spot.lon], Math.max(map.getZoom(), 14), {{ animate: true }});
     }};
@@ -1812,7 +1938,19 @@ def render_heatmap_html(summary: dict) -> str:
       marker.on("click", () => centerAndZoom(spot));
       pointLayer.addLayer(marker);
     }};
-    data.most_visited.forEach((spot) => makeSpot(spot));
+    const searchTextFor = (spot) => `${{spot.label}} ${{spot.tags.join(" ")}}`.toLowerCase();
+    const filterTerms = () => filterInput.value.toLowerCase().split(/[\\s,]+/).map((term) => term.trim()).filter(Boolean);
+    const matchesFilter = (spot, terms) => !terms.length || terms.every((term) => searchTextFor(spot).includes(term));
+    const topSpots = (items) => [...items].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label)).slice(0, 10);
+    const leastSpots = (items) => [...items].sort((a, b) => a.count - b.count || a.label.localeCompare(b.label)).slice(0, 10);
+    const refreshPointLayer = (items) => {{
+      pointLayer.clearLayers();
+      items.forEach((spot) => makeSpot(spot));
+    }};
+    const fitToSpots = (items) => {{
+      if (!items.length) return;
+      map.fitBounds(L.latLngBounds(items.map((item) => [item.lat, item.lon])).pad(0.2));
+    }};
     const syncPanelButton = () => {{
       togglePanelButton.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
     }};
@@ -1829,7 +1967,23 @@ def render_heatmap_html(summary: dict) -> str:
       }}
       syncPointsButton();
     }};
+    const applyFilter = (fit = false) => {{
+      const terms = filterTerms();
+      filteredSpots = allSpots.filter((spot) => matchesFilter(spot, terms));
+      heat.setLatLngs(filteredSpots.map((spot) => [spot.lat, spot.lon, spot.count]));
+      refreshPointLayer(filteredSpots);
+      listFor(topSpots(filteredSpots), "mostVisited");
+      listFor(leastSpots(filteredSpots), "leastVisited");
+      filterSummary.textContent = terms.length
+        ? `${{filteredSpots.length}} of ${{allSpots.length}} locations match`
+        : `${{allSpots.length}} locations`;
+      if (fit) fitToSpots(filteredSpots);
+    }};
     togglePointsButton.addEventListener("click", () => setPointsVisible(!pointsVisible));
+    applyFilterButton.addEventListener("click", () => applyFilter(true));
+    filterInput.addEventListener("keydown", (event) => {{
+      if (event.key === "Enter") applyFilter(true);
+    }});
     togglePanelButton.addEventListener("click", () => {{
       panel.classList.toggle("collapsed");
       syncPanelButton();
@@ -1839,8 +1993,14 @@ def render_heatmap_html(summary: dict) -> str:
     }}
     setPointsVisible(false);
     syncPanelButton();
+    const params = new URLSearchParams(window.location.search);
+    filterInput.value = params.get("filter") || params.get("q") || params.get("tag") || params.get("keyword") || "";
     const listFor = (items, target) => {{
       const root = document.getElementById(target);
+      if (!items.length) {{
+        root.innerHTML = `<div class="spot"><div class="name">No matches</div><div class="count">0</div></div>`;
+        return;
+      }}
       root.innerHTML = items.map((spot) => `
         <div class="spot" data-lat="${{spot.lat}}" data-lon="${{spot.lon}}">
           <div class="name">${{spot.label}}</div>
@@ -1855,15 +2015,12 @@ def render_heatmap_html(summary: dict) -> str:
         }});
       }});
     }};
-    listFor(data.most_visited, "mostVisited");
-    listFor(data.least_visited, "leastVisited");
-    const allPoints = data.heat_points.map((item) => [item.lat, item.lon]);
-    if (allPoints.length) {{
-      const bounds = L.latLngBounds(allPoints);
-      map.fitBounds(bounds.pad(0.2));
+    applyFilter(false);
+    if (filteredSpots.length) {{
+      fitToSpots(filteredSpots);
     }} else {{
       map.setView([0, 0], 2);
-      document.body.insertAdjacentHTML("beforeend", `<div class="empty"><strong>No OwnTracks points for ${{data.scope.value}}</strong><br>Try a different month or year.</div>`);
+      document.body.insertAdjacentHTML("beforeend", `<div class="empty"><strong>No heatmap points for ${{data.scope.value}}</strong><br>Try a different filter, month, or year.</div>`);
     }}
   </script>
 </body>

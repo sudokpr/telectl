@@ -1027,7 +1027,7 @@ async def owntracks_digest_command(update: Update, context: ContextTypes.DEFAULT
         await update.effective_message.reply_text(chunk, disable_web_page_preview=False)
 
 
-def owntracks_map_url(config: Config, date_text: str) -> str:
+def owntracks_map_url(config: Config, date_text: str, filter_text: str | None = None) -> str:
     base_url = config.owntracks_map_base_url
     if not base_url:
         host = config.http_intake.host
@@ -1035,8 +1035,13 @@ def owntracks_map_url(config: Config, date_text: str) -> str:
             host = "127.0.0.1"
         base_url = f"http://{host}:{config.http_intake.port}"
     url = f"{base_url.rstrip('/')}/owntracks/map/{quote(date_text)}"
+    query: dict[str, str] = {}
     if config.http_intake.token:
-        url += "?" + urlencode({"token": config.http_intake.token})
+        query["token"] = config.http_intake.token
+    if filter_text:
+        query["filter"] = filter_text
+    if query:
+        url += "?" + urlencode(query)
     return url
 
 
@@ -1055,10 +1060,12 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
     if context.args:
         scope_text = context.args[0]
         if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
-            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_MAP_SCOPE_USAGE}]")
+            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]")
             return
+        filter_text = " ".join(context.args[1:]).strip()
     else:
         scope_text = remembered_owntracks_map_scope(update, context) or "today"
+        filter_text = ""
     if config.owntracks_map_delivery == "hosted":
         if not config.http_intake.enabled:
             await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY=hosted requires HTTP_INTAKE_ENABLED=true.")
@@ -1071,7 +1078,7 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
             await update.effective_message.reply_text(f"Could not resolve OwnTracks map scope: {exc}")
             return
         remember_owntracks_map_scope(update, context, resolved_scope.value)
-        url = owntracks_map_url(config, resolved_scope.value)
+        url = owntracks_map_url(config, resolved_scope.value, filter_text or None)
         await update.effective_message.reply_text(
             f"OwnTracks {resolved_scope.kind} visualization for {resolved_scope.value}:\n{url}",
             disable_web_page_preview=True,
@@ -1342,7 +1349,7 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.effective_message.reply_text(
         "OwnTracks commands:\n"
         f"/otd [{OWNTRACKS_DATE_USAGE}]\n"
-        f"/otm [{OWNTRACKS_MAP_SCOPE_USAGE}]\n"
+        f"/otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]\n"
         f"/otb {OWNTRACKS_DATE_USAGE} then lines like: s1 Place | tags: tag1 tag2 | note: text\n"
         "/ott s1 tag1 tag2\n"
         "/otn s1 place name\n"

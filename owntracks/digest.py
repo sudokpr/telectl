@@ -11,6 +11,7 @@ from .tagger import (
     build_geojson,
     build_heatmap_summary,
     build_plan,
+    build_sample_heatmap_summary,
     load_user_tags,
     parse_log,
     render_digest,
@@ -93,6 +94,11 @@ def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
         plan, _track_points = build_plan(events, scope.start_date, user_tags)
         return plan, render_leaflet_map_html(plan)
     summary = build_heatmap_summary(events, scope, user_tags)
+    return summary, render_heatmap_html(summary)
+
+
+def generate_sample_heatmap() -> tuple[dict, str]:
+    summary = build_sample_heatmap_summary()
     return summary, render_heatmap_html(summary)
 
 
