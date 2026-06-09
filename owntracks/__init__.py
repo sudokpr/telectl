@@ -1,0 +1,1 @@
+"""OwnTracks daily digest tooling."""
