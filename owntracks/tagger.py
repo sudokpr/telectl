@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -59,6 +60,14 @@ class Event:
     @property
     def is_location(self) -> bool:
         return self.kind == "location" and self.lat is not None and self.lon is not None
+
+
+@dataclass(frozen=True)
+class OwnTracksScope:
+    kind: str
+    value: str
+    start_date: date
+    end_date: date
 
 
 def as_float(value: object) -> float | None:
@@ -1361,6 +1370,273 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
 </html>"""
 
 
+def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags: dict | None = None) -> dict:
+    scope_events = [event for event in events if (event_date(event) is not None and scope.start_date <= event_date(event) <= scope.end_date)]
+    location_points = [event for event in scope_events if event.is_location]
+    day_points: dict[date, list[Event]] = {}
+    buckets: Counter[tuple[float, float]] = Counter()
+    for event in location_points:
+        if event.lat is None or event.lon is None:
+            continue
+        day = event_date(event)
+        if day is not None:
+            day_points.setdefault(day, []).append(event)
+        bucket = (round(event.lat, 4), round(event.lon, 4))
+        buckets[bucket] += 1
+
+    heat_points: list[dict] = []
+    hotspots: list[dict] = []
+    for (lat, lon), count in sorted(buckets.items(), key=lambda item: (-item[1], item[0])):
+        label = location_override_for({"lat": lat, "lon": lon}, user_tags or {}, scope.end_date.isoformat()).get("name")
+        display_label = label or f"{lat:.4f}, {lon:.4f}"
+        heat_points.append({"lat": round(lat, 6), "lon": round(lon, 6), "weight": count})
+        hotspots.append({"lat": round(lat, 6), "lon": round(lon, 6), "count": count, "label": display_label})
+
+    least_visited = sorted(hotspots, key=lambda item: (item["count"], item["label"]))[:10]
+    most_visited = hotspots[:10]
+    total_distance_km = round(sum(summarize_distance(points) for points in day_points.values()), 2)
+    return {
+        "title": f"OwnTracks heatmap - {scope.value}",
+        "scope": {
+            "kind": scope.kind,
+            "value": scope.value,
+            "start": scope.start_date.isoformat(),
+            "end": scope.end_date.isoformat(),
+        },
+        "stats": {
+            "days_with_points": len(day_points),
+            "location_points": len(location_points),
+            "unique_locations": len(buckets),
+            "max_visits": max(buckets.values()) if buckets else 0,
+            "min_visits": min(buckets.values()) if buckets else 0,
+            "sampled_distance_km": total_distance_km,
+        },
+        "heat_points": heat_points,
+        "most_visited": most_visited,
+        "least_visited": least_visited,
+    }
+
+
+def render_heatmap_html(summary: dict) -> str:
+    payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
+    title = escape(summary["title"])
+    scope = summary["scope"]
+    stats = summary["stats"]
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{
+      height: 100%;
+      margin: 0;
+    }}
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8fafc;
+    }}
+    #map {{
+      background: #e2e8f0;
+    }}
+    .panel {{
+      background: rgb(255 255 255 / 0.96);
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgb(15 23 42 / 0.16);
+      left: 10px;
+      max-height: calc(100vh - 20px);
+      max-width: min(380px, calc(100vw - 20px));
+      overflow: auto;
+      padding: 10px;
+      position: absolute;
+      top: 10px;
+      z-index: 1000;
+    }}
+    .panel h1 {{
+      font-size: 16px;
+      margin: 0 0 6px;
+    }}
+    .panel .subtle {{
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-bottom: 8px;
+    }}
+    .stat-grid {{
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 10px;
+    }}
+    .stat {{
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 6px 8px;
+    }}
+    .stat .label {{
+      color: #64748b;
+      display: block;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }}
+    .stat .value {{
+      color: #0f172a;
+      font-size: 15px;
+      font-weight: 800;
+      margin-top: 2px;
+    }}
+    .list {{
+      margin-top: 10px;
+    }}
+    .list h2 {{
+      font-size: 13px;
+      margin: 0 0 6px;
+    }}
+    .spot {{
+      align-items: center;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      padding: 6px 8px;
+    }}
+    .spot:hover {{
+      border-color: #94a3b8;
+    }}
+    .spot .name {{
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .spot .count {{
+      background: #0f172a;
+      border-radius: 999px;
+      color: white;
+      font-size: 11px;
+      font-weight: 800;
+      min-width: 28px;
+      padding: 2px 6px;
+      text-align: center;
+    }}
+    .empty {{
+      background: white;
+      border-radius: 8px;
+      left: 50%;
+      padding: 16px 18px;
+      position: absolute;
+      text-align: center;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 999;
+    }}
+    .leaflet-control-scale {{
+      margin-bottom: 14px !important;
+      margin-right: 14px !important;
+    }}
+    .leaflet-control-scale-line {{
+      background: rgb(255 255 255 / 0.92);
+      border-color: #111827;
+      border-width: 0 2px 2px;
+      box-shadow: 0 1px 5px rgb(15 23 42 / 0.22);
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>{title}</h1>
+    <div class="subtle">{scope["start"]} to {scope["end"]}</div>
+    <div class="stat-grid">
+      <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
+      <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
+      <div class="stat"><span class="label">Locations</span><span class="value">{stats["unique_locations"]}</span></div>
+      <div class="stat"><span class="label">Max visits</span><span class="value">{stats["max_visits"]}</span></div>
+      <div class="stat"><span class="label">Min visits</span><span class="value">{stats["min_visits"]}</span></div>
+      <div class="stat"><span class="label">Distance</span><span class="value">{stats["sampled_distance_km"]} km</span></div>
+    </div>
+    <div class="list">
+      <h2>Most visited</h2>
+      <div id="mostVisited"></div>
+    </div>
+    <div class="list">
+      <h2>Least visited</h2>
+      <div id="leastVisited"></div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <script>
+    const data = {payload};
+    const heatPoints = data.heat_points.map((item) => [item.lat, item.lon, item.weight]);
+    const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
+    L.control.zoom({{ position: "bottomright" }}).addTo(map);
+    L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
+    const heat = heatPoints.length ? L.heatLayer(heatPoints, {{
+      radius: 28,
+      blur: 20,
+      maxZoom: 17,
+      minOpacity: 0.25,
+    }}).addTo(map) : null;
+    const markers = [];
+    const centerAndZoom = (spot) => {{
+      map.setView([spot.lat, spot.lon], Math.max(map.getZoom(), 14), {{ animate: true }});
+    }};
+    const makeSpot = (spot, index) => {{
+      const marker = L.circleMarker([spot.lat, spot.lon], {{
+        radius: Math.min(16, 5 + Math.log2(spot.count + 1) * 2.5),
+        color: index === 0 ? "#b91c1c" : "#1e3a8a",
+        weight: 2,
+        fillColor: index === 0 ? "#ef4444" : "#3b82f6",
+        fillOpacity: 0.78,
+      }}).addTo(map);
+      marker.bindTooltip(`${{spot.label}} · ${{spot.count}}`, {{ permanent: index < 3, direction: "right", className: "place-label" }});
+      marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{spot.count}} visits`);
+      marker.on("click", () => centerAndZoom(spot));
+      markers.push(marker);
+    }};
+    data.most_visited.forEach((spot, index) => makeSpot(spot, index));
+    const listFor = (items, target) => {{
+      const root = document.getElementById(target);
+      root.innerHTML = items.map((spot) => `
+        <div class="spot" data-lat="${{spot.lat}}" data-lon="${{spot.lon}}">
+          <div class="name">${{spot.label}}</div>
+          <div class="count">${{spot.count}}</div>
+        </div>
+      `).join("");
+      root.querySelectorAll(".spot").forEach((row) => {{
+        row.addEventListener("click", () => {{
+          const lat = Number(row.dataset.lat);
+          const lon = Number(row.dataset.lon);
+          map.setView([lat, lon], Math.max(map.getZoom(), 14), {{ animate: true }});
+        }});
+      }});
+    }};
+    listFor(data.most_visited, "mostVisited");
+    listFor(data.least_visited, "leastVisited");
+    const allPoints = data.heat_points.map((item) => [item.lat, item.lon]);
+    if (allPoints.length) {{
+      const bounds = L.latLngBounds(allPoints);
+      map.fitBounds(bounds.pad(0.2));
+    }} else {{
+      map.setView([0, 0], 2);
+      document.body.insertAdjacentHTML("beforeend", `<div class="empty"><strong>No OwnTracks points for ${{data.scope.value}}</strong><br>Try a different month or year.</div>`);
+    }}
+  </script>
+</body>
+</html>"""
+
+
 def render_leaflet_map_html(plan: dict) -> str:
     title = f"OwnTracks map - {plan['date']}"
     track = [
@@ -2045,6 +2321,44 @@ def target_date_from_text(value: str | None, local_tz: ZoneInfo) -> date:
         year, month, day = (int(part) for part in match.groups())
         return date(year, month, day)
     return date.fromisoformat(text)
+
+
+def target_scope_from_text(value: str | None, local_tz: ZoneInfo) -> OwnTracksScope:
+    today = datetime.now(local_tz).date()
+    text = (value or "").strip().lower()
+    if not text or text == "today":
+        return OwnTracksScope("day", today.isoformat(), today, today)
+    if text == "yesterday":
+        target = today - timedelta(days=1)
+        return OwnTracksScope("day", target.isoformat(), target, target)
+    if re.fullmatch(r"\d{1,2}", text):
+        target = date(today.year, today.month, int(text))
+        return OwnTracksScope("day", target.isoformat(), target, target)
+    match = re.fullmatch(r"(\d{1,2})-(\d{1,2})", text)
+    if match:
+        month, day = (int(part) for part in match.groups())
+        target = date(today.year, month, day)
+        return OwnTracksScope("day", target.isoformat(), target, target)
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        target = date(year, month, day)
+        return OwnTracksScope("day", target.isoformat(), target, target)
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})", text)
+    if match:
+        year, month = (int(part) for part in match.groups())
+        last_day = calendar.monthrange(year, month)[1]
+        start = date(year, month, 1)
+        end = date(year, month, last_day)
+        return OwnTracksScope("month", f"{year:04d}-{month:02d}", start, end)
+    match = re.fullmatch(r"(\d{4})", text)
+    if match:
+        year = int(match.group(1))
+        start = date(year, 1, 1)
+        end = date(year, 12, 31)
+        return OwnTracksScope("year", f"{year:04d}", start, end)
+    target = date.fromisoformat(text)
+    return OwnTracksScope("day", target.isoformat(), target, target)
 
 
 def render_digest(plan: dict) -> str:

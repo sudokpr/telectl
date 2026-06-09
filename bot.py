@@ -33,10 +33,11 @@ from owntracks.env import load_env as load_owntracks_env
 
 BASE_DIR = Path(__file__).resolve().parent
 from owntracks.digest import generate_digest as generate_owntracks_digest
+from owntracks.digest import generate_owntracks_visualization
 from owntracks.env import project_path as owntracks_project_path
 from owntracks.tagger import load_user_tags as load_owntracks_user_tags
 from owntracks.tagger import save_user_tags as save_owntracks_user_tags
-from owntracks.tagger import target_date_from_text as owntracks_target_date_from_text
+from owntracks.tagger import target_scope_from_text as owntracks_target_scope_from_text
 
 RUN_DIR = BASE_DIR / "run"
 LOG_DIR = BASE_DIR / "logs"
@@ -60,6 +61,10 @@ COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
 
 OWNTRACKS_DATE_RE = re.compile(r"(?:today|yesterday|\d{1,2}|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})")
 OWNTRACKS_DATE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD"
+OWNTRACKS_MAP_SCOPE_RE = re.compile(
+    r"(?:today|yesterday|\d{1,2}|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2}|\d{4}-\d{1,2}|\d{4})"
+)
+OWNTRACKS_MAP_SCOPE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY"
 
 
 @dataclass(frozen=True)
@@ -1035,17 +1040,25 @@ def owntracks_map_url(config: Config, date_text: str) -> str:
     return url
 
 
+def remember_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT_TYPE, scope_text: str) -> None:
+    context.bot_data.setdefault("owntracks_last_map_scope", {})[owntracks_session_key(update)] = scope_text
+
+
+def remembered_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    return context.bot_data.setdefault("owntracks_last_map_scope", {}).get(owntracks_session_key(update))
+
+
 async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
     if context.args:
-        date_text = context.args[0]
-        if not OWNTRACKS_DATE_RE.fullmatch(date_text):
-            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_DATE_USAGE}]")
+        scope_text = context.args[0]
+        if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
+            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_MAP_SCOPE_USAGE}]")
             return
     else:
-        date_text = remembered_owntracks_date(update, context) or "today"
+        scope_text = remembered_owntracks_map_scope(update, context) or "today"
     if config.owntracks_map_delivery == "hosted":
         if not config.http_intake.enabled:
             await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY=hosted requires HTTP_INTAKE_ENABLED=true.")
@@ -1053,14 +1066,14 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             owntracks_env = load_owntracks_env()
             owntracks_tz = ZoneInfo(owntracks_env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
-            resolved_date = owntracks_target_date_from_text(date_text, owntracks_tz).isoformat()
+            resolved_scope = owntracks_target_scope_from_text(scope_text, owntracks_tz)
         except Exception as exc:
-            await update.effective_message.reply_text(f"Could not resolve OwnTracks map date: {exc}")
+            await update.effective_message.reply_text(f"Could not resolve OwnTracks map scope: {exc}")
             return
-        remember_owntracks_date(update, context, resolved_date)
-        url = owntracks_map_url(config, resolved_date)
+        remember_owntracks_map_scope(update, context, resolved_scope.value)
+        url = owntracks_map_url(config, resolved_scope.value)
         await update.effective_message.reply_text(
-            f"OwnTracks map for {resolved_date}:\n{url}",
+            f"OwnTracks {resolved_scope.kind} visualization for {resolved_scope.value}:\n{url}",
             disable_web_page_preview=True,
         )
         return
@@ -1068,16 +1081,16 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY must be 'file' or 'hosted'.")
         return
     try:
-        plan, _digest, digest_path = await asyncio.to_thread(generate_owntracks_digest, date_text)
+        summary, _html, map_path = await asyncio.to_thread(generate_owntracks_visualization, scope_text)
     except Exception as exc:
         await update.effective_message.reply_text(f"Could not generate OwnTracks map: {exc}")
         return
-    remember_owntracks_date(update, context, plan["date"])
-    map_path = digest_path.with_name(f"activity-map-{plan['date']}.html")
     if not map_path.exists():
         await update.effective_message.reply_text(f"OwnTracks map was not written: {map_path}")
         return
-    caption = f"OwnTracks map for {plan['date']} with labeled stops."
+    remember_owntracks_map_scope(update, context, summary["scope"]["value"])
+    caption_kind = "heatmap" if summary["scope"]["kind"] != "day" else "map"
+    caption = f"OwnTracks {caption_kind} for {summary['scope']['value']}."
     with map_path.open("rb") as handle:
         await update.effective_message.reply_document(
             document=handle,
@@ -1329,7 +1342,7 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.effective_message.reply_text(
         "OwnTracks commands:\n"
         f"/otd [{OWNTRACKS_DATE_USAGE}]\n"
-        f"/otm [{OWNTRACKS_DATE_USAGE}]\n"
+        f"/otm [{OWNTRACKS_MAP_SCOPE_USAGE}]\n"
         f"/otb {OWNTRACKS_DATE_USAGE} then lines like: s1 Place | tags: tag1 tag2 | note: text\n"
         "/ott s1 tag1 tag2\n"
         "/otn s1 place name\n"

@@ -125,8 +125,8 @@ def make_handler(
                 if not authorized(self, http_cfg.token):
                     write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
                     return
-                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", match):
-                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid date"})
+                if not re.fullmatch(r"\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?", match):
+                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid scope"})
                     return
                 try:
                     _plan, html = generate_hosted_map(match)
