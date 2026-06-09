@@ -1581,6 +1581,37 @@ def render_heatmap_html(summary: dict) -> str:
       font-size: 12px;
       font-weight: 800;
     }}
+    .heatmap-legend {{
+      background: rgb(255 255 255 / 0.94);
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      box-shadow: 0 2px 10px rgb(15 23 42 / 0.12);
+      color: #0f172a;
+      font-size: 12px;
+      line-height: 1.35;
+      padding: 8px 10px;
+    }}
+    .heatmap-legend .title {{
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }}
+    .heatmap-legend .row {{
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+      white-space: nowrap;
+    }}
+    .heatmap-legend .swatch {{
+      border-radius: 4px;
+      display: inline-block;
+      flex: 0 0 auto;
+      height: 10px;
+      width: 36px;
+    }}
   </style>
 </head>
 <body>
@@ -1620,6 +1651,19 @@ def render_heatmap_html(summary: dict) -> str:
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
+    const legend = L.control({{ position: "bottomleft" }});
+    legend.onAdd = () => {{
+      const el = L.DomUtil.create("div", "heatmap-legend");
+      el.innerHTML = `
+        <div class="title">Heat intensity</div>
+        <div class="row"><span class="swatch" style="background: #2c7bb6;"></span><span>Low</span></div>
+        <div class="row"><span class="swatch" style="background: #abd9e9;"></span><span>Medium</span></div>
+        <div class="row"><span class="swatch" style="background: #fdae61;"></span><span>High</span></div>
+        <div class="row"><span class="swatch" style="background: #d7191c;"></span><span>Most visited</span></div>
+      `;
+      return el;
+    }};
+    legend.addTo(map);
     L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
@@ -1630,6 +1674,12 @@ def render_heatmap_html(summary: dict) -> str:
       blur: 20,
       maxZoom: 17,
       minOpacity: 0.25,
+      gradient: {{
+        0.2: "#2c7bb6",
+        0.45: "#abd9e9",
+        0.7: "#fdae61",
+        1.0: "#d7191c",
+      }},
     }}).addTo(map) : null;
     const markers = [];
     const centerAndZoom = (spot) => {{
