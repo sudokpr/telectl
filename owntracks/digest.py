@@ -11,6 +11,19 @@ from .tagger import build_geojson, build_plan, load_user_tags, parse_log, render
 from .telegram_send import send_telegram_message
 
 
+def load_send_env() -> dict[str, str]:
+    env = load_env()
+    fallback_path = env.get("TELEGRAM_ENV_PATH") or env.get("JOURGRAM_ENV_PATH")
+    if not fallback_path:
+        return env
+    fallback_env = load_env(Path(fallback_path).expanduser())
+    merged = fallback_env.copy()
+    for key, value in env.items():
+        if value or key not in merged:
+            merged[key] = value
+    return merged
+
+
 def generate_digest(date_text: str | None = None) -> tuple[dict, str, Path]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
@@ -61,13 +74,13 @@ def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
 
 
 def send_daily(date_text: str | None = None) -> None:
-    env = load_env()
+    env = load_send_env()
     _plan, digest, _path = generate_digest(date_text)
     token = env.get("BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
     chat_id = env.get("TELEGRAM_CHAT_ID") or env.get("TELEGRAM__CHAT_ID")
     topic_id = env_int(env.get("OWNTRACKS_TOPIC_ID"))
     if not token or not chat_id:
-        raise RuntimeError("BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+        raise RuntimeError("BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env or fallback Telegram env")
     if not topic_id:
         raise RuntimeError("OWNTRACKS_TOPIC_ID must be set in .env before sending the OwnTracks digest")
     send_telegram_message(token, chat_id, digest, topic_id)

@@ -306,9 +306,12 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
     stop_lon = as_float(stop.get("lon"))
     if stop_lat is None or stop_lon is None:
         return {}
-    best: tuple[float, dict] | None = None
+    best_key: tuple[bool, str, float] | None = None
+    best_override: dict | None = None
     for date_key, day_tags in user_tags.items():
         if not isinstance(day_tags, dict):
+            continue
+        if date_key > current_date:
             continue
         for saved_stop in day_tags.get("stops", {}).values():
             if not isinstance(saved_stop, dict) or not saved_stop.get("name"):
@@ -320,11 +323,13 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
             distance_m = haversine_km(stop_lat, stop_lon, saved_lat, saved_lon) * 1000
             if distance_m > radius_m:
                 continue
-            if best is None or (date_key == current_date, -distance_m) > (best[1].get("_date") == current_date, -best[0]):
-                best = (distance_m, {**saved_stop, "_date": date_key, "_distance_m": round(distance_m)})
-    if best is None:
+            candidate_key = (date_key == current_date, date_key, -distance_m)
+            if best_key is None or candidate_key > best_key:
+                best_key = candidate_key
+                best_override = {**saved_stop, "_date": date_key, "_distance_m": round(distance_m)}
+    if best_override is None:
         return {}
-    override = best[1].copy()
+    override = best_override.copy()
     override.pop("note", None)
     override.pop("_date", None)
     return override
@@ -1571,7 +1576,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     .leaflet-control-scale {{
       margin-bottom: 14px !important;
-      margin-left: 14px !important;
+      margin-right: 14px !important;
     }}
     .leaflet-control-scale-line {{
       background: rgb(255 255 255 / 0.92);
@@ -1681,8 +1686,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
     }}).addTo(map);
-    L.control.zoom({{ position: "bottomleft" }}).addTo(map);
-    L.control.scale({{ position: "bottomleft", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
+    L.control.zoom({{ position: "bottomright" }}).addTo(map);
+    L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const bounds = [];
     const markers = new Map();
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
@@ -1738,7 +1743,9 @@ def render_leaflet_map_html(plan: dict) -> str:
             ...changed.map((stop) => {{
               const parts = [`${{stop.alias}} ${{stop.name}}`];
               if ((stop.tags || []).length) parts.push(`tags: ${{stop.tags.join(" ")}}`);
+              else if (originalTags.get(stop.alias)) parts.push("tags:");
               if (stop.note) parts.push(`note: ${{stop.note}}`);
+              else if (originalNotes.get(stop.alias)) parts.push("note:");
               return parts.join(" | ");
             }})
           ].join("\\n")
