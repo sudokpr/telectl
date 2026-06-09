@@ -1620,6 +1620,11 @@ def render_heatmap_html(summary: dict) -> str:
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
+    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19,
+      opacity: 0.95,
+    }}).addTo(map);
     const heat = heatPoints.length ? L.heatLayer(heatPoints, {{
       radius: 28,
       blur: 20,
