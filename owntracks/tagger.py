@@ -200,11 +200,17 @@ def motion_summary(points: list[Event]) -> dict:
 
 
 def point_dict(event: Event) -> dict:
+    dt = event_time(event)
+    altitude = event.payload.get("alt")
+    if altitude is None:
+        altitude = event.payload.get("ele")
     return {
         "line": event.line_no,
-        "time": fmt_dt(event_time(event)),
+        "time": fmt_dt(dt),
+        "timestamp": int(dt.timestamp()) if dt.tzinfo is not None else None,
         "lat": event.lat,
         "lon": event.lon,
+        "alt_m": as_float(altitude),
         "motion": event.motion,
         "motion_mode": motion_mode(event),
         "speed_kmh": event.speed_kmh,
@@ -267,6 +273,39 @@ def summarize_distance(points: list[Event]) -> float:
                 distance += segment
         previous = point
     return distance
+
+
+def summarize_elevation(points: list[Event]) -> dict:
+    min_alt: float | None = None
+    max_alt: float | None = None
+    ascent = 0.0
+    descent = 0.0
+    samples = 0
+    previous_alt: float | None = None
+    for point in points:
+        alt = as_float(point.payload.get("alt"))
+        if alt is None:
+            alt = as_float(point.payload.get("ele"))
+        if alt is None:
+            continue
+        samples += 1
+        min_alt = alt if min_alt is None else min(min_alt, alt)
+        max_alt = alt if max_alt is None else max(max_alt, alt)
+        if previous_alt is not None:
+            delta = alt - previous_alt
+            if delta > 0:
+              ascent += delta
+            else:
+                descent += abs(delta)
+        previous_alt = alt
+    return {
+        "samples": samples,
+        "min_alt_m": round(min_alt, 1) if min_alt is not None else None,
+        "max_alt_m": round(max_alt, 1) if max_alt is not None else None,
+        "ascent_m": round(ascent, 1),
+        "descent_m": round(descent, 1),
+        "range_m": round((max_alt - min_alt), 1) if min_alt is not None and max_alt is not None else None,
+    }
 
 
 def named_place_events(events: list[Event]) -> list[dict]:
@@ -598,15 +637,15 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     motion_summary = plan.get("motion_summary") or {}
     motion_counts = motion_summary.get("counts") or {}
     motion_dom = motion_summary.get("dominant") or "unknown"
-    motion_chips = []
+    motion_chips = ['<button type="button" class="motion-chip all active" data-motion-mode="all"><span class="dot"></span>all</button>']
     for mode in ("stationary", "walking", "cycling", "automotive", "moving"):
         count = motion_counts.get(mode)
         if count:
             motion_chips.append(
-                f'<span class="motion-chip {escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</span>'
+                f'<button type="button" class="motion-chip {escape(mode)}" data-motion-mode="{escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</button>'
             )
     if motion_chips:
-        motion_chips.insert(0, f'<span class="motion-chip {escape(motion_dom)}"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
+        motion_chips.insert(1, f'<span class="motion-chip dominant"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
     all_points = [
         *track,
         *[[stop["lat"], stop["lon"]] for stop in stops],
@@ -970,6 +1009,18 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     .route-segment.motion-unknown {{
       stroke: {MOTION_COLORS["unknown"]};
     }}
+    .route-arrow-marker {{
+      background: transparent;
+      border: 0;
+    }}
+    .route-arrow {{
+      color: rgba(15, 23, 42, 0.92);
+      font-size: 16px;
+      font-weight: 900;
+      line-height: 1;
+      text-shadow: 0 1px 2px rgb(255 255 255 / 0.75);
+      transform-origin: center;
+    }}
     .tile {{
       image-rendering: auto;
     }}
@@ -986,13 +1037,22 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}
     .motion-chip {{
       align-items: center;
+      appearance: none;
       border-radius: 999px;
+      border: 0;
+      cursor: pointer;
       color: white;
       display: inline-flex;
       font-size: 12px;
       font-weight: 800;
       gap: 6px;
       padding: 5px 9px;
+    }}
+    .motion-chip:hover {{
+      filter: brightness(1.08);
+    }}
+    .motion-chip.active {{
+      box-shadow: 0 0 0 2px rgb(255 255 255 / 0.65) inset;
     }}
     .motion-chip .dot {{
       background: rgb(255 255 255 / 0.9);
@@ -1014,6 +1074,10 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}
     .motion-chip.moving {{
       background: {MOTION_COLORS["moving"]};
+    }}
+    .motion-chip.dominant {{
+      background: #0f172a;
+      cursor: default;
     }}
     .stop {{
       cursor: pointer;
@@ -1145,7 +1209,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
   </div>
   <script>
     const data = {payload};
-    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+    const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
       "&": "&amp;",
       "<": "&lt;",
       ">": "&gt;",
@@ -2134,13 +2198,14 @@ def render_heatmap_html(summary: dict) -> str:
       togglePointsButton.classList.toggle("active", pointsVisible);
     }};
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
-    const modeCounts = data.motion_summary?.counts || {{}};
-    const modeDistances = data.motion_summary?.distance_km || {{}};
+    const motionSummary = data.motion_summary || {{}};
+    const modeCounts = motionSummary.counts || {{}};
+    const modeDistances = motionSummary.distance_km || {{}};
     const renderModeSummary = () => {{
       modeSummary.innerHTML = motionModes.map((mode) => {{
         const count = mode === "all" ? allSpots.length : (modeCounts[mode] || 0);
         const label = mode === "all" ? `All (${{allSpots.length}})` : `${{mode}} (${{count}})`;
-        return `<button type="button" class="mode-chip ${{activeMode === mode ? "active" : ""}}" data-mode="${{mode}}">${{escapeHtml(label)}}</button>`;
+        return `<button type="button" class="mode-chip ${{activeMode === mode ? "active" : ""}}" data-mode="${{mode}}">${{label}}</button>`;
       }}).join("");
       modeSummary.querySelectorAll("[data-mode]").forEach((button) => {{
         button.addEventListener("click", () => {{
@@ -2148,7 +2213,7 @@ def render_heatmap_html(summary: dict) -> str:
           applyFilter(true);
         }});
       }});
-      const dominant = data.motion_summary?.dominant || "unknown";
+      const dominant = motionSummary.dominant || "unknown";
       const distanceBits = motionModes
         .filter((mode) => mode !== "all" && modeDistances[mode])
         .map((mode) => `${{mode}}: ${{modeDistances[mode]}} km`);
@@ -2169,6 +2234,7 @@ def render_heatmap_html(summary: dict) -> str:
     const applyFilter = (fit = false) => {{
       filteredSpots = allSpots.filter((spot) => modeMatches(spot));
       heat.setLatLngs(filteredSpots.map((spot) => [spot.lat, spot.lon, spot.count]));
+      if (heat.redraw) heat.redraw();
       refreshPointLayer(filteredSpots);
       listFor(topSpots(filteredSpots), "mostVisited");
       listFor(leastSpots(filteredSpots), "leastVisited");
@@ -2257,13 +2323,13 @@ def render_leaflet_map_html(plan: dict) -> str:
     motion_summary = plan.get("motion_summary") or {}
     motion_counts = motion_summary.get("counts") or {}
     motion_dom = motion_summary.get("dominant") or "unknown"
-    motion_chips = []
+    motion_chips = ['<button type="button" class="motion-chip all active" data-motion-mode="all"><span class="dot"></span>all</button>']
     for mode in ("stationary", "walking", "cycling", "automotive", "moving"):
         count = motion_counts.get(mode)
         if count:
-            motion_chips.append(f'<span class="motion-chip {escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</span>')
+            motion_chips.append(f'<button type="button" class="motion-chip {escape(mode)}" data-motion-mode="{escape(mode)}"><span class="dot"></span>{escape(mode)}: {count}</button>')
     if motion_chips:
-        motion_chips.insert(0, f'<span class="motion-chip {escape(motion_dom)}"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
+        motion_chips.insert(1, f'<span class="motion-chip dominant"><span class="dot"></span>dominant: {escape(motion_dom)}</span>')
     payload = json.dumps(
         {
             "date": plan["date"],
@@ -2450,13 +2516,22 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     .motion-chip {{
       align-items: center;
+      appearance: none;
+      border: 0;
       border-radius: 999px;
+      cursor: pointer;
       color: white;
       display: inline-flex;
       font-size: 12px;
       font-weight: 800;
       gap: 6px;
       padding: 5px 9px;
+    }}
+    .motion-chip:hover {{
+      filter: brightness(1.08);
+    }}
+    .motion-chip.active {{
+      box-shadow: 0 0 0 2px rgb(255 255 255 / 0.65) inset;
     }}
     .motion-chip .dot {{
       background: rgb(255 255 255 / 0.9);
@@ -2478,6 +2553,71 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     .motion-chip.moving {{
       background: {MOTION_COLORS["moving"]};
+    }}
+    .motion-chip.dominant {{
+      background: #0f172a;
+      cursor: default;
+    }}
+    .profile {{
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      margin-top: 10px;
+      padding: 8px;
+    }}
+    .profile-title {{
+      color: #334155;
+      font-size: 11px;
+      font-weight: 800;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }}
+    .elevation-chart {{
+      display: block;
+      height: 160px;
+      width: 100%;
+    }}
+    .profile-summary {{
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.35;
+      margin-top: 6px;
+    }}
+    .route-legend {{
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      margin: 8px 0 10px;
+      min-height: 22px;
+    }}
+    .route-legend .legend-title {{
+      color: #334155;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }}
+    .route-legend .legend-item {{
+      align-items: center;
+      display: inline-flex;
+      gap: 5px;
+      font-size: 11px;
+      color: #334155;
+      white-space: nowrap;
+    }}
+    .route-legend .legend-swatch {{
+      border-radius: 999px;
+      display: inline-block;
+      height: 10px;
+      width: 10px;
+    }}
+    .route-legend-map {{
+      background: rgb(255 255 255 / 0.94);
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 1px 6px rgb(15 23 42 / 0.18);
+      max-width: 230px;
+      padding: 8px 10px;
     }}
     .stop-label {{
       background: #111827;
@@ -2586,7 +2726,23 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="fitAll" type="button" class="secondary">Fit</button>
       </div>
       <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
+      <button id="toggleEdges" type="button" class="secondary" style="margin-top: 8px; width: 100%">Hide edges</button>
       <div class="motion-summary">{''.join(motion_chips) if motion_chips else '<span class="hint">Motion summary unavailable</span>'}</div>
+      <div class="profile">
+        <div class="profile-title">Elevation profile</div>
+        <div class="row">
+          <button id="profileDistance" type="button" class="secondary">Distance</button>
+          <button id="profileTime" type="button" class="secondary">Time</button>
+        </div>
+        <div class="row" style="margin-top: 8px">
+          <button id="routeMotion" type="button" class="secondary">Motion colors</button>
+          <button id="routeElevationBands" type="button" class="secondary">Elevation bands</button>
+          <button id="routeElevationSlope" type="button" class="secondary">Ascent / descent</button>
+        </div>
+        <div id="routeLegend" class="route-legend"></div>
+        <svg id="elevationChart" class="elevation-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-label="Elevation profile"></svg>
+        <div id="elevationSummary" class="profile-summary"></div>
+      </div>
       <label for="groupDistance">Nearby grouping distance, meters</label>
       <input id="groupDistance" type="number" min="20" step="10" value="150">
       <div class="row">
@@ -2624,9 +2780,25 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}).addTo(map);
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
-    const bounds = [];
+    const fitPoints = [];
+    let fitMinLat = Infinity;
+    let fitMaxLat = -Infinity;
+    let fitMinLon = Infinity;
+    let fitMaxLon = -Infinity;
+    let fitCount = 0;
     const markers = new Map();
+    const routeRenderer = L.svg();
+    routeRenderer.addTo(map);
+    const edgeLayer = L.layerGroup().addTo(map);
+    const arrowLayer = L.layerGroup().addTo(map);
     const routeLayer = L.layerGroup().addTo(map);
+    let activeMotionMode = "all";
+    let edgesVisible = true;
+    let routeColorMode = "motion";
+    let profileAxis = "distance";
+    const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
+    const routeColorModes = ["motion", "bands", "slope"];
+    const profileAxes = ["distance", "time"];
     const motionColors = {{
       stationary: "{MOTION_COLORS["stationary"]}",
       walking: "{MOTION_COLORS["walking"]}",
@@ -2635,7 +2807,20 @@ def render_leaflet_map_html(plan: dict) -> str:
       moving: "{MOTION_COLORS["moving"]}",
       unknown: "{MOTION_COLORS["unknown"]}"
     }};
-    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+    const elevationSummaryData = data.elevation_summary || {{}};
+    const elevationPalette = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#f97316", "#ef4444"];
+    const elevationMin = Number.isFinite(Number(elevationSummaryData.min_alt_m)) ? Number(elevationSummaryData.min_alt_m) : 0;
+    const elevationMax = Number.isFinite(Number(elevationSummaryData.max_alt_m)) ? Number(elevationSummaryData.max_alt_m) : 0;
+    const elevationSpan = Math.max(1, elevationMax - elevationMin);
+    const slopeColors = {{
+      descentStrong: "#1d4ed8",
+      descent: "#38bdf8",
+      flat: "#6b7280",
+      ascent: "#fb923c",
+      ascentStrong: "#dc2626",
+    }};
+    let elevationBandBounds = {{ min: elevationMin, max: elevationMax }};
+    const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
       "&": "&amp;",
       "<": "&lt;",
       ">": "&gt;",
@@ -2659,7 +2844,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     const copyCommandsToClipboard = async (automatic = false) => {{
       if (!commands.value) return false;
       try {{
-        if (navigator.clipboard?.writeText) {{
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
           await navigator.clipboard.writeText(commands.value);
         }} else if (automatic) {{
           throw new Error("automatic clipboard unavailable");
@@ -2700,25 +2885,296 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (autoCopy && commands.value) copyCommandsToClipboard(true);
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
-    const trackPoints = data.sampledTrack || [];
+    const rawTrackPoints = data.sampledTrack || [];
+    const trackPoints = [];
+    const routeLegend = document.getElementById("routeLegend");
+    const routeLegendControl = L.control({{ position: "topright" }});
+    routeLegendControl.onAdd = () => {{
+      const el = L.DomUtil.create("div", "route-legend route-legend-map");
+      L.DomEvent.disableClickPropagation(el);
+      return el;
+    }};
+    routeLegendControl.addTo(map);
+    const toTimestamp = (value) => {{
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    }};
+    const timeOrigin = rawTrackPoints.length ? toTimestamp(rawTrackPoints[0].timestamp) : null;
+    let cumulativeTrackDistanceKm = 0;
+    let previousTrackPoint = null;
+    for (const point of rawTrackPoints) {{
+      const lat = Number(point.lat);
+      const lon = Number(point.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const alt = Number(point.alt_m);
+      const timestamp = toTimestamp(point.timestamp);
+      if (previousTrackPoint) cumulativeTrackDistanceKm += distanceMeters(previousTrackPoint, {{ lat, lon }}) / 1000;
+      trackPoints.push({{
+        lat,
+        lon,
+        alt_m: Number.isFinite(alt) ? alt : null,
+        motion_mode: point.motion_mode || "moving",
+        timestamp,
+        cumulativeDistanceKm: cumulativeTrackDistanceKm,
+      }});
+      previousTrackPoint = {{ lat, lon }};
+    }}
+    const refreshElevationBandBounds = () => {{
+      const samples = visibleTrackPoints().filter((point) => Number.isFinite(point.alt_m));
+      if (!samples.length) {{
+        elevationBandBounds = {{ min: elevationMin, max: elevationMax }};
+        return;
+      }}
+      const values = samples.map((point) => Number(point.alt_m));
+      elevationBandBounds = {{
+        min: Math.min(...values),
+        max: Math.max(...values),
+      }};
+    }};
+    const routeColorFor = (point, prev = null) => {{
+      if (routeColorMode === "bands") {{
+        const alt = Number.isFinite(Number(point.alt_m)) ? Number(point.alt_m) : (prev && Number.isFinite(Number(prev.alt_m)) ? Number(prev.alt_m) : null);
+        if (!Number.isFinite(Number(alt))) return motionColors.unknown;
+        const minAlt = Number.isFinite(Number(elevationBandBounds.min)) ? Number(elevationBandBounds.min) : elevationMin;
+        const maxAlt = Number.isFinite(Number(elevationBandBounds.max)) ? Number(elevationBandBounds.max) : elevationMax;
+        const span = Math.max(1, maxAlt - minAlt);
+        const ratio = Math.max(0, Math.min(1, (Number(alt) - minAlt) / span));
+        const index = Math.min(elevationPalette.length - 1, Math.floor(ratio * elevationPalette.length));
+        return elevationPalette[index];
+      }}
+      if (routeColorMode === "slope") {{
+        const currentAlt = Number.isFinite(Number(point.alt_m)) ? Number(point.alt_m) : null;
+        const previousAlt = prev && Number.isFinite(Number(prev.alt_m)) ? Number(prev.alt_m) : null;
+        if (!Number.isFinite(currentAlt) || !Number.isFinite(previousAlt)) {{
+          return motionColors.unknown;
+        }}
+        const delta = currentAlt - previousAlt;
+        if (delta >= 12) return slopeColors.ascentStrong;
+        if (delta >= 4) return slopeColors.ascent;
+        if (delta <= -12) return slopeColors.descentStrong;
+        if (delta <= -4) return slopeColors.descent;
+        return slopeColors.flat;
+      }}
+      const mode = point.motion_mode || (prev && prev.motion_mode) || "moving";
+      return motionColors[mode] || motionColors.moving;
+    }};
+    const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
     const drawRoute = () => {{
       routeLayer.clearLayers();
-      if (trackPoints.length < 2) return;
-      for (let index = 1; index < trackPoints.length; index += 1) {{
-        const prev = trackPoints[index - 1];
-        const current = trackPoints[index];
-        const mode = current.motion_mode || prev.motion_mode || "moving";
-        L.polyline(
-          [[prev.lat, prev.lon], [current.lat, current.lon]],
-          {{
-            color: motionColors[mode] || motionColors.moving,
-            weight: 5,
-            opacity: 0.9,
-            lineCap: "round",
-            lineJoin: "round"
-          }}
-        ).addTo(routeLayer);
+      refreshElevationBandBounds();
+      const points = visibleTrackPoints();
+      if (!points.length) {{
+        renderRouteLegend();
+        return;
       }}
+      let previous = null;
+      for (const point of points) {{
+        L.circleMarker([point.lat, point.lon], {{
+          radius: 3.5,
+          color: routeColorFor(point, previous),
+          fillColor: routeColorFor(point, previous),
+          fillOpacity: 0.9,
+          weight: 0,
+        }}).addTo(routeLayer);
+        previous = point;
+      }}
+      drawEdges();
+      renderRouteLegend();
+    }};
+    const drawEdges = () => {{
+      edgeLayer.clearLayers();
+      arrowLayer.clearLayers();
+      const points = visibleTrackPoints();
+      if (!edgesVisible || points.length < 2) return;
+      const bearingBetween = (fromLat, fromLon, toLat, toLon) => {{
+        const startLat = fromLat * Math.PI / 180;
+        const endLat = toLat * Math.PI / 180;
+        const dLon = (toLon - fromLon) * Math.PI / 180;
+        const y = Math.sin(dLon) * Math.cos(endLat);
+        const x = Math.cos(startLat) * Math.sin(endLat) - Math.sin(startLat) * Math.cos(endLat) * Math.cos(dLon);
+        return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+      }};
+      for (let index = 1; index < points.length; index += 1) {{
+        const prev = points[index - 1];
+        const current = points[index];
+        const prevLat = Number(prev.lat);
+        const prevLon = Number(prev.lon);
+        const currentLat = Number(current.lat);
+        const currentLon = Number(current.lon);
+        if (!Number.isFinite(prevLat) || !Number.isFinite(prevLon) || !Number.isFinite(currentLat) || !Number.isFinite(currentLon)) continue;
+        const mode = current.motion_mode || prev.motion_mode || "moving";
+        if (activeMotionMode !== "all" && mode !== activeMotionMode) continue;
+        const color = routeColorFor(current, prev);
+        L.polyline(
+          [[prevLat, prevLon], [currentLat, currentLon]],
+          {{
+            renderer: routeRenderer,
+            color,
+            weight: 3,
+            opacity: 0.55,
+            noClip: true,
+            interactive: false,
+          }}
+        ).addTo(edgeLayer);
+        const arrowLat = (prevLat + currentLat) / 2;
+        const arrowLon = (prevLon + currentLon) / 2;
+        const angle = bearingBetween(prevLat, prevLon, currentLat, currentLon);
+        L.marker([arrowLat, arrowLon], {{
+          interactive: false,
+          icon: L.divIcon({{
+            className: "route-arrow-marker",
+            html: `<div class="route-arrow" style="color: ${{color}}; transform: rotate(${{angle - 90}}deg)">➤</div>`,
+            iconSize: [18, 18],
+            iconAnchor: [9, 9],
+          }}),
+        }}).addTo(arrowLayer);
+      }}
+    }};
+    const renderRouteLegend = () => {{
+      const target = routeLegendControl && routeLegendControl._container ? routeLegendControl._container : routeLegend;
+      if (!target) return;
+      const renderItems = (items, title) => `
+        <span class="legend-title">${{escapeHtml(title)}}</span>
+        ${{items.map((item) => `
+          <span class="legend-item">
+            <span class="legend-swatch" style="background:${{item.color}}"></span>
+            <span>${{escapeHtml(item.label)}}</span>
+          </span>
+        `).join("")}}
+      `;
+      if (routeColorMode === "motion") {{
+        target.innerHTML = renderItems([
+          {{ color: motionColors.stationary, label: "stationary" }},
+          {{ color: motionColors.walking, label: "walking" }},
+          {{ color: motionColors.cycling, label: "cycling" }},
+          {{ color: motionColors.automotive, label: "automotive" }},
+          {{ color: motionColors.moving, label: "moving" }},
+        ], "Motion");
+        return;
+      }}
+      if (routeColorMode === "bands") {{
+        const minAlt = Number.isFinite(Number(elevationBandBounds.min)) ? Number(elevationBandBounds.min) : elevationMin;
+        const maxAlt = Number.isFinite(Number(elevationBandBounds.max)) ? Number(elevationBandBounds.max) : elevationMax;
+        const span = Math.max(1, maxAlt - minAlt);
+        const swatches = elevationPalette.map((color, index) => {{
+          const start = minAlt + (index / elevationPalette.length) * span;
+          const end = minAlt + ((index + 1) / elevationPalette.length) * span;
+          return {{ color, label: `${{Math.round(start)}}-${{Math.round(end)}}m` }};
+        }});
+        target.innerHTML = renderItems(swatches, "Elevation bands");
+        return;
+      }}
+      target.innerHTML = renderItems([
+        {{ color: slopeColors.descentStrong, label: "strong descent" }},
+        {{ color: slopeColors.descent, label: "descent" }},
+        {{ color: slopeColors.flat, label: "flat" }},
+        {{ color: slopeColors.ascent, label: "ascent" }},
+        {{ color: slopeColors.ascentStrong, label: "strong ascent" }},
+      ], "Elevation slope");
+    }};
+    const setActiveMotionMode = (mode) => {{
+      activeMotionMode = motionModes.includes(mode) ? mode : "all";
+      document.querySelectorAll("[data-motion-mode]").forEach((button) => {{
+        button.classList.toggle("active", button.dataset.motionMode === activeMotionMode);
+      }});
+      drawRoute();
+    }};
+    const syncEdgeButton = () => {{
+      const button = document.getElementById("toggleEdges");
+      if (!button) return;
+      button.textContent = edgesVisible ? "Hide edges" : "Show edges";
+      button.classList.toggle("active", edgesVisible);
+    }};
+    const setEdgesVisible = (visible) => {{
+      edgesVisible = visible;
+      if (edgesVisible) edgeLayer.addTo(map);
+      else edgeLayer.remove();
+      if (edgesVisible) arrowLayer.addTo(map);
+      else arrowLayer.remove();
+      drawEdges();
+      syncEdgeButton();
+    }};
+    const syncRouteColorButtons = () => {{
+      document.getElementById("routeMotion")?.classList.toggle("active", routeColorMode === "motion");
+      document.getElementById("routeElevationBands")?.classList.toggle("active", routeColorMode === "bands");
+      document.getElementById("routeElevationSlope")?.classList.toggle("active", routeColorMode === "slope");
+    }};
+    const setRouteColorMode = (mode) => {{
+      routeColorMode = routeColorModes.includes(mode) ? mode : "motion";
+      syncRouteColorButtons();
+      drawRoute();
+      renderElevationProfile();
+    }};
+    const syncProfileAxisButtons = () => {{
+      document.getElementById("profileDistance")?.classList.toggle("active", profileAxis === "distance");
+      document.getElementById("profileTime")?.classList.toggle("active", profileAxis === "time");
+    }};
+    const formatProfileValue = (value) => {{
+      if (profileAxis === "time") return `${{value.toFixed(1)}} h`;
+      return `${{value.toFixed(1)}} km`;
+    }};
+    const renderElevationProfile = () => {{
+      if (!elevationChart || !elevationSummary) return;
+      const samples = visibleTrackPoints().filter((point) => Number.isFinite(point.alt_m));
+      if (samples.length < 2) {{
+        elevationChart.innerHTML = '<text x="300" y="82" text-anchor="middle" fill="#64748b" font-size="13">No altitude data</text>';
+        elevationSummary.textContent = "No altitude samples in this track.";
+        return;
+      }}
+      let ascent = 0;
+      let descent = 0;
+      for (let index = 1; index < samples.length; index += 1) {{
+        const previousAlt = Number(samples[index - 1].alt_m);
+        const currentAlt = Number(samples[index].alt_m);
+        if (!Number.isFinite(previousAlt) || !Number.isFinite(currentAlt)) continue;
+        const delta = currentAlt - previousAlt;
+        if (delta > 0) ascent += delta;
+        else descent += Math.abs(delta);
+      }}
+      const profilePoints = samples.map((point) => {{
+        const x = profileAxis === "time"
+          ? ((Number(point.timestamp) || 0) - (timeOrigin || 0)) / 3600
+          : Number(point.cumulativeDistanceKm) || 0;
+        return {{ x, alt: Number(point.alt_m) }};
+      }});
+      const minX = Math.min(...profilePoints.map((point) => point.x));
+      const maxX = Math.max(...profilePoints.map((point) => point.x));
+      const minY = Math.min(...profilePoints.map((point) => point.alt));
+      const maxY = Math.max(...profilePoints.map((point) => point.alt));
+      const width = 600;
+      const height = 160;
+      const pad = {{ left: 46, right: 10, top: 10, bottom: 26 }};
+      const spanX = Math.max(0.001, maxX - minX);
+      const spanY = Math.max(1, maxY - minY);
+      const sx = (x) => pad.left + ((x - minX) / spanX) * (width - pad.left - pad.right);
+      const sy = (y) => height - pad.bottom - ((y - minY) / spanY) * (height - pad.top - pad.bottom);
+      const line = profilePoints.map((point, index) => `${{index ? "L" : "M"}} ${{sx(point.x).toFixed(1)}} ${{sy(point.alt).toFixed(1)}}`).join(" ");
+      const area = `${{line}} L ${{sx(maxX).toFixed(1)}} ${{sy(minY).toFixed(1)}} L ${{sx(minX).toFixed(1)}} ${{sy(minY).toFixed(1)}} Z`;
+      const gridLines = Array.from({{ length: 4 }}, (_, index) => {{
+        const value = minY + ((index + 1) / 5) * spanY;
+        const y = sy(value).toFixed(1);
+        return `
+          <line x1="${{pad.left}}" y1="${{y}}" x2="${{width - pad.right}}" y2="${{y}}" stroke="#e2e8f0" stroke-width="1" />
+          <text x="6" y="${{Number(y) + 4}}" fill="#64748b" font-size="11">${{Math.round(value)}} m</text>
+        `;
+      }}).join("");
+      const axisLabelLeft = formatProfileValue(minX);
+      const axisLabelRight = formatProfileValue(maxX);
+      elevationChart.innerHTML = `
+        <rect x="0" y="0" width="${{width}}" height="${{height}}" fill="#f8fafc" rx="6"></rect>
+        ${{gridLines}}
+        <path d="${{area}}" fill="rgba(37, 99, 235, 0.12)" stroke="none"></path>
+        <path d="${{line}}" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></path>
+        <line x1="${{pad.left}}" y1="${{height - pad.bottom}}" x2="${{width - pad.right}}" y2="${{height - pad.bottom}}" stroke="#94a3b8" stroke-width="1" />
+        <text x="${{pad.left}}" y="${{height - 8}}" fill="#64748b" font-size="11">${{axisLabelLeft}}</text>
+        <text x="${{width - pad.right}}" y="${{height - 8}}" text-anchor="end" fill="#64748b" font-size="11">${{axisLabelRight}}</text>
+      `;
+      elevationSummary.textContent = [
+        `min ${{Math.round(minY)}} m`,
+        `max ${{Math.round(maxY)}} m`,
+        `gain ${{Math.round(ascent)}} m`,
+        `loss ${{Math.round(descent)}} m`,
+      ].join(" · ");
     }};
     const iconFor = (stop) => L.divIcon({{
       className: "",
@@ -2727,7 +3183,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       iconAnchor: [12, 12]
     }});
     const shorten = (value, maxLength = 18) => {{
-      const text = String(value ?? "");
+      const text = String(value == null ? "" : value);
       return text.length > maxLength ? text.slice(0, maxLength - 3) + "..." : text;
     }};
     const labelFor = (stop) => `${{stop.alias}}: ${{stop.name}}`;
@@ -2750,7 +3206,8 @@ def render_leaflet_map_html(plan: dict) -> str:
     `;
     const attachPopupHandlers = (stop) => {{
       const marker = markers.get(stop.alias);
-      const element = marker?.getPopup()?.getElement();
+      const popup = marker && marker.getPopup ? marker.getPopup() : null;
+      const element = popup && popup.getElement ? popup.getElement() : null;
       if (!element) return;
       L.DomEvent.disableClickPropagation(element);
     }};
@@ -2759,7 +3216,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (!marker) return;
       marker.setIcon(iconFor(stop));
       marker.setTooltipContent(escapeHtml(shortLabelFor(stop)));
-      marker.getElement()?.setAttribute("title", labelFor(stop));
+      const element = marker.getElement ? marker.getElement() : null;
+      if (element) element.setAttribute("title", labelFor(stop));
       if (refreshPopup) marker.setPopupContent(popupFor(stop));
     }};
     const applyPopupEdit = (target) => {{
@@ -2837,6 +3295,17 @@ def render_leaflet_map_html(plan: dict) -> str:
     const centerStop = (stop) => {{
       map.panTo([stop.lat, stop.lon]);
     }};
+    const addFitPoint = (lat, lon) => {{
+      const latNum = Number(lat);
+      const lonNum = Number(lon);
+      if (!Number.isFinite(latNum) || !Number.isFinite(lonNum)) return;
+      fitPoints.push([latNum, lonNum]);
+      fitMinLat = Math.min(fitMinLat, latNum);
+      fitMaxLat = Math.max(fitMaxLat, latNum);
+      fitMinLon = Math.min(fitMinLon, lonNum);
+      fitMaxLon = Math.max(fitMaxLon, lonNum);
+      fitCount += 1;
+    }};
     const setSelected = (alias, isSelected, center = false) => {{
       const stop = data.stops.find((item) => item.alias === alias);
       if (!stop) return;
@@ -2852,14 +3321,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     if (data.track.length) {{
       drawRoute();
-      bounds.push(L.latLngBounds(data.track.map((point) => [point[0], point[1]])));
+      data.track.forEach((point) => addFitPoint(point[0], point[1]));
     }}
     for (const place of data.namedPlaces) {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
       const marker = L.circleMarker([place.lat, place.lon], {{ radius: 6, color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(map);
       marker.bindTooltip(escapeHtml(label), {{ permanent: true, direction: "right", className: "place-label" }});
       marker.bindPopup(`<strong>${{escapeHtml(label)}}</strong><br>${{escapeHtml(place.time)}}`);
-      bounds.push(marker.getLatLng());
+      addFitPoint(place.lat, place.lon);
     }}
     for (const stop of data.stops) {{
       const marker = L.marker([stop.lat, stop.lon], {{ icon: iconFor(stop) }}).addTo(map);
@@ -2873,12 +3342,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       marker.on("mouseover", () => marker.setTooltipContent(escapeHtml(labelFor(stop))));
       marker.on("mouseout", () => marker.setTooltipContent(escapeHtml(shortLabelFor(stop))));
       marker.on("popupopen", () => attachPopupHandlers(stop));
-      bounds.push(marker.getLatLng());
+      addFitPoint(stop.lat, stop.lon);
       refreshStop(stop);
     }}
-    if (bounds.length) {{
-      const group = L.featureGroup(bounds.map((item) => item instanceof L.LatLngBounds ? L.rectangle(item, {{ opacity: 0, fillOpacity: 0 }}) : L.marker(item, {{ opacity: 0 }})));
-      map.fitBounds(group.getBounds().pad(0.18));
+    if (fitCount) {{
+      if (fitCount === 1) {{
+        map.setView([fitMinLat, fitMinLon], Math.max(map.getZoom(), 14));
+      }} else {{
+        map.fitBounds([[fitMinLat, fitMinLon], [fitMaxLat, fitMaxLon]], {{ padding: [70, 70] }});
+      }}
     }} else {{
       map.setView([0, 0], 2);
       document.body.insertAdjacentHTML("beforeend", `<div class="empty"><strong>No OwnTracks points for ${{escapeHtml(data.date)}}</strong><br>Try another date.</div>`);
@@ -2901,6 +3373,40 @@ def render_leaflet_map_html(plan: dict) -> str:
       const stop = selectedStops()[0];
       if (stop) centerStop(stop);
     }});
+    document.getElementById("toggleEdges").addEventListener("click", () => {{
+      setEdgesVisible(!edgesVisible);
+    }});
+    document.getElementById("routeMotion").addEventListener("click", () => {{
+      setRouteColorMode("motion");
+    }});
+    document.getElementById("routeElevationBands").addEventListener("click", () => {{
+      setRouteColorMode("bands");
+    }});
+    document.getElementById("routeElevationSlope").addEventListener("click", () => {{
+      setRouteColorMode("slope");
+    }});
+    document.getElementById("profileDistance").addEventListener("click", () => {{
+      profileAxis = "distance";
+      syncProfileAxisButtons();
+      renderElevationProfile();
+    }});
+    document.getElementById("profileTime").addEventListener("click", () => {{
+      profileAxis = "time";
+      syncProfileAxisButtons();
+      renderElevationProfile();
+    }});
+    document.querySelectorAll("[data-motion-mode]").forEach((button) => {{
+      button.addEventListener("click", () => {{
+        setActiveMotionMode(button.dataset.motionMode || "all");
+      }});
+    }});
+    syncEdgeButton();
+    syncRouteColorButtons();
+    syncProfileAxisButtons();
+    renderRouteLegend();
+    setActiveMotionMode("all");
+    setEdgesVisible(true);
+    renderElevationProfile();
     document.getElementById("selectNearby").addEventListener("click", () => {{
       const picked = selectedStops()[0] || data.stops[0];
       const threshold = Number(document.getElementById("groupDistance").value) || 150;
@@ -2924,9 +3430,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       await copyCommandsToClipboard(false);
     }});
     document.getElementById("fitAll").addEventListener("click", () => {{
-      if (bounds.length) {{
-        const group = L.featureGroup(bounds.map((item) => item instanceof L.LatLngBounds ? L.rectangle(item, {{ opacity: 0, fillOpacity: 0 }}) : L.marker(item, {{ opacity: 0 }})));
-        map.fitBounds(group.getBounds().pad(0.18));
+      if (fitPoints.length) {{
+        map.fitBounds(L.latLngBounds(fitPoints).pad(0.18));
       }}
     }});
     map.on("zoomend moveend", updateStatus);
@@ -2963,6 +3468,7 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
     speeds = [event.speed_kmh for event in track_points if event.speed_kmh is not None]
     batteries = [event.payload.get("batt") for event in track_points if event.payload.get("batt") is not None]
     motion = motion_summary(track_points)
+    elevation = summarize_elevation(track_points)
     place_tags = [tag for place in places for tag in place["tags"]]
     stop_tags = [tag for stop in stops for tag in stop["tags"]]
     recommended_tags = ["activity:daily-review", "source:owntracks", *place_tags, *stop_tags]
@@ -2983,6 +3489,7 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
             "battery_end": batteries[-1] if batteries else None,
         },
         "motion_summary": motion,
+        "elevation_summary": elevation,
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
