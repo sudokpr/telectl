@@ -397,6 +397,52 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
     return stops
 
 
+def heatmap_visit_clusters(events: list[Event], min_minutes: int = 10, radius_m: int = 180, max_gap_minutes: int = 45) -> list[dict]:
+    low_motion = [
+        event
+        for event in events
+        if event.is_location
+        and event.lat is not None
+        and event.lon is not None
+        and motion_mode(event) != "automotive"
+        and (event.speed_kmh is None or event.speed_kmh <= 3)
+    ]
+    clusters: list[list[Event]] = []
+    current: list[Event] = []
+    for event in low_motion:
+        if not current:
+            current = [event]
+            continue
+        center_lat = sum(item.lat or 0 for item in current) / len(current)
+        center_lon = sum(item.lon or 0 for item in current) / len(current)
+        dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
+        dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
+        if dist_m <= radius_m and dt_gap <= max_gap_minutes * 60:
+            current.append(event)
+        else:
+            clusters.append(current)
+            current = [event]
+    if current:
+        clusters.append(current)
+
+    visits = []
+    for cluster in clusters:
+        start = event_time(cluster[0])
+        end = event_time(cluster[-1])
+        duration_minutes = max(0, round((end - start).total_seconds() / 60))
+        if duration_minutes < min_minutes and len(cluster) < 3:
+            continue
+        visits.append(
+            {
+                "lat": sum(item.lat or 0 for item in cluster) / len(cluster),
+                "lon": sum(item.lon or 0 for item in cluster) / len(cluster),
+                "duration_minutes": duration_minutes,
+                "mode": Counter(motion_mode(item) for item in cluster).most_common(1)[0][0],
+            }
+        )
+    return visits
+
+
 def load_user_tags(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -1015,10 +1061,11 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}
     .route-arrow {{
       color: rgba(15, 23, 42, 0.92);
-      font-size: 16px;
+      -webkit-text-stroke: 2px white;
+      font-size: 20px;
       font-weight: 900;
       line-height: 1;
-      text-shadow: 0 1px 2px rgb(255 255 255 / 0.75);
+      text-shadow: 0 1px 4px rgb(15 23 42 / 0.35);
       transform-origin: center;
     }}
     .tile {{
@@ -1594,6 +1641,9 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
     location_points = [event for event in scope_events if event.is_location]
     day_points: dict[date, list[Event]] = {}
     buckets: Counter[tuple[float, float]] = Counter()
+    bucket_minutes: Counter[tuple[float, float]] = Counter()
+    bucket_visits: Counter[tuple[float, float]] = Counter()
+    bucket_visit_minutes: Counter[tuple[float, float]] = Counter()
     bucket_modes: dict[tuple[float, float], Counter[str]] = {}
     label_sources = heatmap_label_sources(events, scope, user_tags or {})
     mode_points: Counter[str] = Counter()
@@ -1611,14 +1661,32 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
             segment = haversine_km(previous.lat, previous.lon, event.lat, event.lon)
             if segment <= 5:
                 mode_distance[mode] += segment
+            previous_day = event_date(previous)
+            elapsed_minutes = max(0, (event_time(event) - event_time(previous)).total_seconds() / 60)
+            if previous_day == day and elapsed_minutes <= 12 * 60:
+                previous_mode = motion_mode(previous)
+                previous_bucket = (round(previous.lat, 4), round(previous.lon, 4))
+                if previous_mode == "stationary" or segment <= 0.2:
+                    bucket_minutes[previous_bucket] += min(elapsed_minutes, 60)
         previous = event
         bucket = (round(event.lat, 4), round(event.lon, 4))
         buckets[bucket] += 1
         bucket_modes.setdefault(bucket, Counter())[mode] += 1
 
+    for points in day_points.values():
+        for visit in heatmap_visit_clusters(points):
+            bucket = (round(visit["lat"], 4), round(visit["lon"], 4))
+            bucket_visits[bucket] += 1
+            bucket_visit_minutes[bucket] += int(visit["duration_minutes"])
+            bucket_modes.setdefault(bucket, Counter())[str(visit.get("mode") or "stationary")] += 1
+
     heat_points: list[dict] = []
     hotspots: list[dict] = []
-    for (lat, lon), count in sorted(buckets.items(), key=lambda item: (-item[1], item[0])):
+    all_buckets = set(buckets) | set(bucket_minutes) | set(bucket_visits)
+    for lat, lon in sorted(all_buckets, key=lambda item: (-max(bucket_minutes[item], buckets[item], bucket_visits[item]), item)):
+        count = buckets[(lat, lon)]
+        duration_minutes = int(round(bucket_minutes[(lat, lon)] or bucket_visit_minutes[(lat, lon)]))
+        visit_count = bucket_visits[(lat, lon)]
         match = best_heatmap_match(lat, lon, label_sources)
         label = match.get("label") if match else None
         display_label = label or f"{lat:.4f}, {lon:.4f}"
@@ -1628,15 +1696,27 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
             "lat": round(lat, 6),
             "lon": round(lon, 6),
             "weight": count,
+            "duration_minutes": duration_minutes,
+            "visit_count": visit_count,
             "label": display_label,
             "tags": tags,
             "mode": dominant_mode,
         }
         heat_points.append(heat_point)
-        hotspots.append({"lat": heat_point["lat"], "lon": heat_point["lon"], "count": count, "label": display_label, "tags": tags})
+        hotspots.append(
+            {
+                "lat": heat_point["lat"],
+                "lon": heat_point["lon"],
+                "count": count,
+                "duration_minutes": duration_minutes,
+                "visit_count": visit_count,
+                "label": display_label,
+                "tags": tags,
+            }
+        )
 
-    least_visited = sorted(hotspots, key=lambda item: (item["count"], item["label"]))[:10]
-    most_visited = hotspots[:10]
+    least_visited = sorted(hotspots, key=lambda item: (item["duration_minutes"], item["label"]))[:10]
+    most_visited = sorted(hotspots, key=lambda item: (-item["duration_minutes"], item["label"]))[:10]
     total_distance_km = round(sum(summarize_distance(points) for points in day_points.values()), 2)
     return {
         "title": f"OwnTracks heatmap - {scope.value}",
@@ -1649,9 +1729,10 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "stats": {
             "days_with_points": len(day_points),
             "location_points": len(location_points),
-            "unique_locations": len(buckets),
-            "max_visits": max(buckets.values()) if buckets else 0,
-            "min_visits": min(buckets.values()) if buckets else 0,
+            "unique_locations": len(all_buckets),
+            "max_visits": max(bucket_visits.values()) if bucket_visits else 0,
+            "min_visits": min(bucket_visits.values()) if bucket_visits else 0,
+            "max_time_minutes": int(max(bucket_minutes.values())) if bucket_minutes else 0,
             "sampled_distance_km": total_distance_km,
         },
         "motion_summary": {
@@ -1772,8 +1853,11 @@ def build_sample_heatmap_summary() -> dict:
                     "lat": round(lat + row * spread, 6),
                     "lon": round(lon + col * spread, 6),
                     "weight": count,
+                    "duration_minutes": count * 12,
+                    "visit_count": max(1, round(count / 8)),
                     "label": label if index == 0 else f"{label} area {index + 1}",
                     "tags": tags,
+                    "mode": "stationary",
                 }
             )
 
@@ -1790,12 +1874,34 @@ def build_sample_heatmap_summary() -> dict:
     add_cluster("Cape Town visit", -33.9249, 18.4241, [19, 10, 4], ["city", "south-africa", "travel"], 0.025)
 
     most_visited = sorted(
-        [{"lat": p["lat"], "lon": p["lon"], "count": p["weight"], "label": p["label"], "tags": p["tags"]} for p in points],
-        key=lambda item: (-item["count"], item["label"]),
+        [
+            {
+                "lat": p["lat"],
+                "lon": p["lon"],
+                "count": p["weight"],
+                "duration_minutes": p["duration_minutes"],
+                "visit_count": p["visit_count"],
+                "label": p["label"],
+                "tags": p["tags"],
+            }
+            for p in points
+        ],
+        key=lambda item: (-item["duration_minutes"], item["label"]),
     )[:10]
     least_visited = sorted(
-        [{"lat": p["lat"], "lon": p["lon"], "count": p["weight"], "label": p["label"], "tags": p["tags"]} for p in points],
-        key=lambda item: (item["count"], item["label"]),
+        [
+            {
+                "lat": p["lat"],
+                "lon": p["lon"],
+                "count": p["weight"],
+                "duration_minutes": p["duration_minutes"],
+                "visit_count": p["visit_count"],
+                "label": p["label"],
+                "tags": p["tags"],
+            }
+            for p in points
+        ],
+        key=lambda item: (item["duration_minutes"], item["label"]),
     )[:10]
     return {
         "title": "OwnTracks sample heatmap",
@@ -1809,8 +1915,9 @@ def build_sample_heatmap_summary() -> dict:
             "days_with_points": 90,
             "location_points": sum(int(point["weight"]) for point in points),
             "unique_locations": len(points),
-            "max_visits": max(int(point["weight"]) for point in points),
-            "min_visits": min(int(point["weight"]) for point in points),
+            "max_visits": max(int(point["visit_count"]) for point in points),
+            "min_visits": min(int(point["visit_count"]) for point in points),
+            "max_time_minutes": max(int(point["duration_minutes"]) for point in points),
             "sampled_distance_km": 0,
         },
         "heat_points": points,
@@ -2085,6 +2192,9 @@ def render_heatmap_html(summary: dict) -> str:
     <div class="panel-body">
       <div class="subtle">{scope["start"]} to {scope["end"]}</div>
       <div class="panel-actions">
+        <button type="button" class="panel-action active" data-heat-metric="time">Time spent</button>
+        <button type="button" class="panel-action" data-heat-metric="visits">Visits</button>
+        <button type="button" class="panel-action" data-heat-metric="raw">Raw points</button>
         <button type="button" id="toggleHeatmapPoints" class="panel-action">Show points</button>
       </div>
       <div class="mode-summary" id="modeSummary"></div>
@@ -2098,11 +2208,11 @@ def render_heatmap_html(summary: dict) -> str:
         <div class="stat"><span class="label">Distance</span><span class="value">{stats["sampled_distance_km"]} km</span></div>
       </div>
       <div class="list">
-        <h2>Most visited</h2>
+        <h2 id="mostVisitedTitle">Most time spent</h2>
         <div id="mostVisited"></div>
       </div>
       <div class="list">
-        <h2>Least visited</h2>
+        <h2 id="leastVisitedTitle">Least time spent</h2>
         <div id="leastVisited"></div>
       </div>
     </div>
@@ -2114,7 +2224,9 @@ def render_heatmap_html(summary: dict) -> str:
     const allSpots = data.heat_points.map((item) => ({{
       lat: item.lat,
       lon: item.lon,
-      count: item.weight,
+      rawCount: item.weight || 0,
+      durationMinutes: item.duration_minutes || 0,
+      visitCount: item.visit_count || 0,
       label: item.label || `${{item.lat}}, ${{item.lon}}`,
       tags: item.tags || [],
       mode: item.mode || "moving",
@@ -2129,6 +2241,36 @@ def render_heatmap_html(summary: dict) -> str:
     let pointsVisible = false;
     let filteredSpots = allSpots;
     let activeMode = "all";
+    let activeMetric = "time";
+    const heatMetrics = {{
+      time: {{
+        title: "Time spent",
+        highLabel: "Most time",
+        mostTitle: "Most time spent",
+        leastTitle: "Least time spent",
+        value: (spot) => spot.durationMinutes || Math.min(spot.rawCount * 5, 60),
+        format: (value) => `${{Math.round(value)}} min`,
+      }},
+      visits: {{
+        title: "Visits",
+        highLabel: "Most visits",
+        mostTitle: "Most visits",
+        leastTitle: "Fewest visits",
+        value: (spot) => spot.visitCount || 0,
+        format: (value) => `${{Math.round(value)}} visits`,
+      }},
+      raw: {{
+        title: "Raw points",
+        highLabel: "Most points",
+        mostTitle: "Most raw points",
+        leastTitle: "Fewest raw points",
+        value: (spot) => spot.rawCount || 0,
+        format: (value) => `${{Math.round(value)}} points`,
+      }},
+    }};
+    const metricConfig = () => heatMetrics[activeMetric] || heatMetrics.time;
+    const metricValue = (spot) => metricConfig().value(spot);
+    const metricLabel = (spot) => metricConfig().format(metricValue(spot));
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
     const legend = L.control({{ position: "bottomleft" }});
@@ -2139,7 +2281,7 @@ def render_heatmap_html(summary: dict) -> str:
         <div class="row"><span class="swatch" style="background: #0b3d91;"></span><span>Low</span></div>
         <div class="row"><span class="swatch" style="background: #00bcd4;"></span><span>Medium</span></div>
         <div class="row"><span class="swatch" style="background: #ff9800;"></span><span>High</span></div>
-        <div class="row"><span class="swatch" style="background: #d32f2f;"></span><span>Most visited</span></div>
+        <div class="row"><span class="swatch" style="background: #d32f2f;"></span><span id="heatLegendHigh">Most time</span></div>
       `;
       return el;
     }};
@@ -2165,23 +2307,24 @@ def render_heatmap_html(summary: dict) -> str:
       map.setView([spot.lat, spot.lon], Math.max(map.getZoom(), 14), {{ animate: true }});
     }};
     const makeSpot = (spot) => {{
+      const value = metricValue(spot);
       const marker = L.circleMarker([spot.lat, spot.lon], {{
-        radius: Math.min(16, 5 + Math.log2(spot.count + 1) * 2.5),
+        radius: Math.min(16, 5 + Math.log2(value + 1) * 2.5),
         color: "#1e3a8a",
         weight: 2,
         fillColor: "#3b82f6",
         fillOpacity: 0.78,
       }});
-      marker.bindTooltip(`${{spot.label}} · ${{spot.count}}`, {{ permanent: false, direction: "right", className: "place-label" }});
-      marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{spot.count}} visits`);
+      marker.bindTooltip(`${{spot.label}} · ${{metricLabel(spot)}}`, {{ permanent: false, direction: "right", className: "place-label" }});
+      marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{metricConfig().title}}: ${{metricLabel(spot)}}<br>Visits: ${{spot.visitCount || 0}}<br>Raw points: ${{spot.rawCount || 0}}`);
       marker.on("click", () => {{
         centerAndZoom(spot);
         marker.openPopup();
       }});
       pointLayer.addLayer(marker);
     }};
-    const topSpots = (items) => [...items].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label)).slice(0, 10);
-    const leastSpots = (items) => [...items].sort((a, b) => a.count - b.count || a.label.localeCompare(b.label)).slice(0, 10);
+    const topSpots = (items) => [...items].sort((a, b) => metricValue(b) - metricValue(a) || a.label.localeCompare(b.label)).slice(0, 10);
+    const leastSpots = (items) => [...items].filter((spot) => metricValue(spot) > 0).sort((a, b) => metricValue(a) - metricValue(b) || a.label.localeCompare(b.label)).slice(0, 10);
     const refreshPointLayer = (items) => {{
       pointLayer.clearLayers();
       items.forEach((spot) => makeSpot(spot));
@@ -2196,6 +2339,15 @@ def render_heatmap_html(summary: dict) -> str:
     const syncPointsButton = () => {{
       togglePointsButton.textContent = pointsVisible ? "Hide points" : "Show points";
       togglePointsButton.classList.toggle("active", pointsVisible);
+    }};
+    const syncMetricButtons = () => {{
+      document.querySelectorAll("[data-heat-metric]").forEach((button) => {{
+        button.classList.toggle("active", button.dataset.heatMetric === activeMetric);
+      }});
+      document.getElementById("mostVisitedTitle").textContent = metricConfig().mostTitle;
+      document.getElementById("leastVisitedTitle").textContent = metricConfig().leastTitle;
+      const high = document.getElementById("heatLegendHigh");
+      if (high) high.textContent = metricConfig().highLabel;
     }};
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
     const motionSummary = data.motion_summary || {{}};
@@ -2233,15 +2385,25 @@ def render_heatmap_html(summary: dict) -> str:
     }};
     const applyFilter = (fit = false) => {{
       filteredSpots = allSpots.filter((spot) => modeMatches(spot));
-      heat.setLatLngs(filteredSpots.map((spot) => [spot.lat, spot.lon, spot.count]));
+      const weightedSpots = filteredSpots
+        .map((spot) => [spot.lat, spot.lon, metricValue(spot)])
+        .filter((spot) => spot[2] > 0);
+      heat.setLatLngs(weightedSpots);
       if (heat.redraw) heat.redraw();
       refreshPointLayer(filteredSpots);
       listFor(topSpots(filteredSpots), "mostVisited");
       listFor(leastSpots(filteredSpots), "leastVisited");
+      syncMetricButtons();
       renderModeSummary();
       if (fit) fitToSpots(filteredSpots);
     }};
     togglePointsButton.addEventListener("click", () => setPointsVisible(!pointsVisible));
+    document.querySelectorAll("[data-heat-metric]").forEach((button) => {{
+      button.addEventListener("click", () => {{
+        activeMetric = button.dataset.heatMetric || "time";
+        applyFilter(false);
+      }});
+    }});
     togglePanelButton.addEventListener("click", () => {{
       panel.classList.toggle("collapsed");
       syncPanelButton();
@@ -2261,7 +2423,7 @@ def render_heatmap_html(summary: dict) -> str:
       root.innerHTML = items.map((spot) => `
         <div class="spot" data-lat="${{spot.lat}}" data-lon="${{spot.lon}}">
           <div class="name">${{spot.label}}</div>
-          <div class="count">${{spot.count}}</div>
+          <div class="count">${{metricLabel(spot)}}</div>
         </div>
       `).join("");
       root.querySelectorAll(".spot").forEach((row) => {{
@@ -2508,6 +2670,18 @@ def render_leaflet_map_html(plan: dict) -> str:
     .route-segment.motion-unknown {{
       stroke: {MOTION_COLORS["unknown"]};
     }}
+    .route-arrow-marker {{
+      background: transparent;
+      border: 0;
+    }}
+    .route-arrow {{
+      -webkit-text-stroke: 2px white;
+      font-size: 20px;
+      font-weight: 900;
+      line-height: 1;
+      text-shadow: 0 1px 4px rgb(15 23 42 / 0.35);
+      transform-origin: center;
+    }}
     .motion-summary {{
       display: flex;
       flex-wrap: wrap;
@@ -2725,8 +2899,35 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="clearSelection" type="button" class="secondary">Clear</button>
         <button id="fitAll" type="button" class="secondary">Fit</button>
       </div>
+      <div class="row" style="margin-top: 8px">
+        <button id="prevDay" type="button" class="secondary">Previous day</button>
+        <button id="nextDay" type="button" class="secondary">Next day</button>
+      </div>
       <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
-      <button id="toggleEdges" type="button" class="secondary" style="margin-top: 8px; width: 100%">Hide edges</button>
+      <div class="row" style="margin-top: 8px">
+        <button id="toggleEdges" type="button" class="secondary">Hide edges</button>
+        <button id="toggleArrows" type="button" class="secondary">Hide arrows</button>
+      </div>
+      <div class="row" style="margin-top: 8px">
+        <button id="toggleStopLabels" type="button" class="secondary">Hide stop labels</button>
+        <button id="togglePlaceLabels" type="button" class="secondary">Hide point labels</button>
+      </div>
+      <div class="profile">
+        <div class="profile-title">Route animation</div>
+        <div class="row">
+          <button id="routeAnimPlay" type="button" class="secondary">Play</button>
+          <button id="routeAnimReset" type="button" class="secondary">Reset</button>
+        </div>
+        <label for="routeAnimDuration">Playback duration</label>
+        <select id="routeAnimDuration">
+          <option value="5">5 sec</option>
+          <option value="10">10 sec</option>
+          <option value="15" selected>15 sec</option>
+          <option value="20">20 sec</option>
+          <option value="30">30 sec</option>
+        </select>
+        <div id="routeAnimStatus" class="profile-summary">ready</div>
+      </div>
       <div class="motion-summary">{''.join(motion_chips) if motion_chips else '<span class="hint">Motion summary unavailable</span>'}</div>
       <div class="profile">
         <div class="profile-title">Elevation profile</div>
@@ -2787,15 +2988,25 @@ def render_leaflet_map_html(plan: dict) -> str:
     let fitMaxLon = -Infinity;
     let fitCount = 0;
     const markers = new Map();
+    const placeMarkers = [];
     const routeRenderer = L.svg();
     routeRenderer.addTo(map);
     const edgeLayer = L.layerGroup().addTo(map);
     const arrowLayer = L.layerGroup().addTo(map);
     const routeLayer = L.layerGroup().addTo(map);
+    const animationLayer = L.layerGroup().addTo(map);
     let activeMotionMode = "all";
     let edgesVisible = true;
+    let arrowsVisible = true;
+    let stopLabelsVisible = true;
+    let placeLabelsVisible = true;
     let routeColorMode = "motion";
     let profileAxis = "distance";
+    let routeAnimationFrame = null;
+    let routeAnimationRunning = false;
+    let routeAnimationStartMs = null;
+    let routeAnimationElapsedMs = 0;
+    let routeAnimationStaticVisibility = null;
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
     const routeColorModes = ["motion", "bands", "slope"];
     const profileAxes = ["distance", "time"];
@@ -2827,6 +3038,31 @@ def render_leaflet_map_html(plan: dict) -> str:
       '"': "&quot;",
       "'": "&#39;"
     }}[char]));
+    const dateForOffset = (dateText, offsetDays) => {{
+      const match = String(dateText || "").match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})$/);
+      if (!match) return null;
+      const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+      if (!Number.isFinite(date.getTime())) return null;
+      date.setUTCDate(date.getUTCDate() + offsetDays);
+      return date.toISOString().slice(0, 10);
+    }};
+    const mapPathForDate = (dateText) => {{
+      const path = window.location.pathname;
+      if (/\\/owntracks\\/map\\/[^/]+$/.test(path)) {{
+        return path.replace(/\\/owntracks\\/map\\/[^/]+$/, `/owntracks/map/${{dateText}}`);
+      }}
+      return `/owntracks/map/${{dateText}}`;
+    }};
+    const navigateDay = (offsetDays) => {{
+      const targetDate = dateForOffset(data.date, offsetDays);
+      if (!targetDate) return;
+      window.location.href = `${{mapPathForDate(targetDate)}}${{window.location.search}}${{window.location.hash}}`;
+    }};
+    const syncDayNavigationButtons = () => {{
+      const canNavigate = Boolean(dateForOffset(data.date, 0));
+      document.getElementById("prevDay").disabled = !canNavigate;
+      document.getElementById("nextDay").disabled = !canNavigate;
+    }};
     const updateStatus = () => {{
       status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · stops ${{data.stops.length}}${{clipboardStatus}}`;
     }};
@@ -2959,6 +3195,18 @@ def render_leaflet_map_html(plan: dict) -> str:
       return motionColors[mode] || motionColors.moving;
     }};
     const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const routePointRadius = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 12) return 1.8;
+      if (zoom <= 15) return 2.6;
+      return 3.5;
+    }};
+    const routeArrowSize = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 12) return {{ size: 10, stroke: 1 }};
+      if (zoom <= 15) return {{ size: 14, stroke: 1.4 }};
+      return {{ size: 20, stroke: 2 }};
+    }};
     const drawRoute = () => {{
       routeLayer.clearLayers();
       refreshElevationBandBounds();
@@ -2968,9 +3216,10 @@ def render_leaflet_map_html(plan: dict) -> str:
         return;
       }}
       let previous = null;
+      const pointRadius = routePointRadius();
       for (const point of points) {{
         L.circleMarker([point.lat, point.lon], {{
-          radius: 3.5,
+          radius: pointRadius,
           color: routeColorFor(point, previous),
           fillColor: routeColorFor(point, previous),
           fillOpacity: 0.9,
@@ -2985,7 +3234,13 @@ def render_leaflet_map_html(plan: dict) -> str:
       edgeLayer.clearLayers();
       arrowLayer.clearLayers();
       const points = visibleTrackPoints();
-      if (!edgesVisible || points.length < 2) return;
+      if ((!edgesVisible && !arrowsVisible) || points.length < 2) return;
+      const arrowSpacingMeters = () => {{
+        const zoom = map.getZoom();
+        if (zoom <= 12) return 1600;
+        if (zoom <= 15) return 600;
+        return 220;
+      }};
       const bearingBetween = (fromLat, fromLon, toLat, toLon) => {{
         const startLat = fromLat * Math.PI / 180;
         const endLat = toLat * Math.PI / 180;
@@ -2994,6 +3249,13 @@ def render_leaflet_map_html(plan: dict) -> str:
         const x = Math.cos(startLat) * Math.sin(endLat) - Math.sin(startLat) * Math.cos(endLat) * Math.cos(dLon);
         return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
       }};
+      const arrowSpacing = arrowSpacingMeters();
+      const arrowStyle = routeArrowSize();
+      const arrowSize = arrowStyle.size;
+      const arrowAnchor = arrowSize / 2;
+      const stationaryArrowMinMeters = 500;
+      let metersSinceArrow = arrowSpacing / 2;
+      let stationaryRunHasArrow = false;
       for (let index = 1; index < points.length; index += 1) {{
         const prev = points[index - 1];
         const current = points[index];
@@ -3005,17 +3267,31 @@ def render_leaflet_map_html(plan: dict) -> str:
         const mode = current.motion_mode || prev.motion_mode || "moving";
         if (activeMotionMode !== "all" && mode !== activeMotionMode) continue;
         const color = routeColorFor(current, prev);
-        L.polyline(
-          [[prevLat, prevLon], [currentLat, currentLon]],
-          {{
-            renderer: routeRenderer,
-            color,
-            weight: 3,
-            opacity: 0.55,
-            noClip: true,
-            interactive: false,
-          }}
-        ).addTo(edgeLayer);
+        if (edgesVisible) {{
+          L.polyline(
+            [[prevLat, prevLon], [currentLat, currentLon]],
+            {{
+              renderer: routeRenderer,
+              color,
+              weight: 5,
+              opacity: 1,
+              noClip: true,
+              interactive: false,
+            }}
+          ).addTo(edgeLayer);
+        }}
+        if (!arrowsVisible) continue;
+        const segmentMeters = distanceMeters({{ lat: prevLat, lon: prevLon }}, {{ lat: currentLat, lon: currentLon }});
+        if (!Number.isFinite(segmentMeters) || segmentMeters < 25) continue;
+        if (mode === "stationary") {{
+          if (stationaryRunHasArrow || segmentMeters < stationaryArrowMinMeters) continue;
+          stationaryRunHasArrow = true;
+        }} else {{
+          stationaryRunHasArrow = false;
+          metersSinceArrow += segmentMeters;
+          if (metersSinceArrow < arrowSpacing) continue;
+          metersSinceArrow = 0;
+        }}
         const arrowLat = (prevLat + currentLat) / 2;
         const arrowLon = (prevLon + currentLon) / 2;
         const angle = bearingBetween(prevLat, prevLon, currentLat, currentLon);
@@ -3023,12 +3299,131 @@ def render_leaflet_map_html(plan: dict) -> str:
           interactive: false,
           icon: L.divIcon({{
             className: "route-arrow-marker",
-            html: `<div class="route-arrow" style="color: ${{color}}; transform: rotate(${{angle - 90}}deg)">➤</div>`,
-            iconSize: [18, 18],
-            iconAnchor: [9, 9],
+            html: `<div class="route-arrow" style="color: ${{color}}; -webkit-text-stroke: ${{arrowStyle.stroke}}px white; font-size: ${{arrowSize}}px; transform: rotate(${{angle - 90}}deg)">➤</div>`,
+            iconSize: [arrowSize + 4, arrowSize + 4],
+            iconAnchor: [arrowAnchor + 2, arrowAnchor + 2],
           }}),
         }}).addTo(arrowLayer);
       }}
+    }};
+    const routeAnimationSegments = () => {{
+      const points = visibleTrackPoints();
+      const segments = [];
+      for (let index = 1; index < points.length; index += 1) {{
+        const prev = points[index - 1];
+        const current = points[index];
+        const prevLat = Number(prev.lat);
+        const prevLon = Number(prev.lon);
+        const currentLat = Number(current.lat);
+        const currentLon = Number(current.lon);
+        if (!Number.isFinite(prevLat) || !Number.isFinite(prevLon) || !Number.isFinite(currentLat) || !Number.isFinite(currentLon)) continue;
+        const segmentMeters = distanceMeters({{ lat: prevLat, lon: prevLon }}, {{ lat: currentLat, lon: currentLon }});
+        if (!Number.isFinite(segmentMeters) || segmentMeters < 2) continue;
+        segments.push({{
+          start: [prevLat, prevLon],
+          end: [currentLat, currentLon],
+          color: routeColorFor(current, prev),
+          timestamp: Number.isFinite(Number(current.timestamp)) ? Number(current.timestamp) : index,
+        }});
+      }}
+      return segments;
+    }};
+    const routeAnimationDurationMs = () => {{
+      const value = Number(document.getElementById("routeAnimDuration")?.value);
+      return (Number.isFinite(value) && value > 0 ? value : 60) * 1000;
+    }};
+    const routeAnimationStatus = (text) => {{
+      const el = document.getElementById("routeAnimStatus");
+      if (el) el.textContent = text;
+    }};
+    const syncRouteAnimationButton = () => {{
+      const button = document.getElementById("routeAnimPlay");
+      if (!button) return;
+      button.textContent = routeAnimationRunning ? "Pause" : "Play";
+      button.classList.toggle("active", routeAnimationRunning);
+    }};
+    const hideStaticRouteForAnimation = () => {{
+      if (!routeAnimationStaticVisibility) {{
+        routeAnimationStaticVisibility = {{
+          edges: edgesVisible,
+          arrows: arrowsVisible,
+        }};
+      }}
+      edgeLayer.remove();
+      arrowLayer.remove();
+    }};
+    const restoreStaticRouteAfterAnimation = () => {{
+      if (!routeAnimationStaticVisibility) return;
+      if (routeAnimationStaticVisibility.edges) edgeLayer.addTo(map);
+      else edgeLayer.remove();
+      if (routeAnimationStaticVisibility.arrows) arrowLayer.addTo(map);
+      else arrowLayer.remove();
+      routeAnimationStaticVisibility = null;
+    }};
+    const renderRouteAnimation = (elapsedMs) => {{
+      const segments = routeAnimationSegments();
+      animationLayer.clearLayers();
+      if (!segments.length) {{
+        routeAnimationStatus("no route points");
+        return true;
+      }}
+      const durationMs = routeAnimationDurationMs();
+      const progress = Math.max(0, Math.min(1, elapsedMs / durationMs));
+      const maxIndex = Math.max(0, Math.ceil(progress * segments.length) - 1);
+      for (let index = 0; index <= maxIndex && index < segments.length; index += 1) {{
+        const segment = segments[index];
+        L.polyline([segment.start, segment.end], {{
+          renderer: routeRenderer,
+          color: segment.color,
+          weight: 7,
+          opacity: 1,
+          noClip: true,
+          interactive: false,
+        }}).addTo(animationLayer);
+      }}
+      const current = segments[Math.min(maxIndex, segments.length - 1)];
+      const timeText = current && Number.isFinite(current.timestamp)
+        ? new Date(current.timestamp * 1000).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit" }})
+        : "";
+      routeAnimationStatus(`${{Math.round(progress * 100)}}%${{timeText ? " · " + timeText : ""}}`);
+      return progress >= 1;
+    }};
+    const stopRouteAnimation = () => {{
+      routeAnimationRunning = false;
+      if (routeAnimationFrame) cancelAnimationFrame(routeAnimationFrame);
+      routeAnimationFrame = null;
+      routeAnimationStartMs = null;
+      restoreStaticRouteAfterAnimation();
+      syncRouteAnimationButton();
+    }};
+    const tickRouteAnimation = (now) => {{
+      if (!routeAnimationRunning) return;
+      if (routeAnimationStartMs == null) routeAnimationStartMs = now - routeAnimationElapsedMs;
+      routeAnimationElapsedMs = now - routeAnimationStartMs;
+      const finished = renderRouteAnimation(routeAnimationElapsedMs);
+      if (finished) {{
+        routeAnimationElapsedMs = routeAnimationDurationMs();
+        stopRouteAnimation();
+        return;
+      }}
+      routeAnimationFrame = requestAnimationFrame(tickRouteAnimation);
+    }};
+    const playRouteAnimation = () => {{
+      if (routeAnimationRunning) {{
+        stopRouteAnimation();
+        return;
+      }}
+      hideStaticRouteForAnimation();
+      routeAnimationRunning = true;
+      routeAnimationStartMs = null;
+      syncRouteAnimationButton();
+      routeAnimationFrame = requestAnimationFrame(tickRouteAnimation);
+    }};
+    const resetRouteAnimation = () => {{
+      stopRouteAnimation();
+      routeAnimationElapsedMs = 0;
+      animationLayer.clearLayers();
+      routeAnimationStatus("ready");
     }};
     const renderRouteLegend = () => {{
       const target = routeLegendControl && routeLegendControl._container ? routeLegendControl._container : routeLegend;
@@ -3073,6 +3468,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       ], "Elevation slope");
     }};
     const setActiveMotionMode = (mode) => {{
+      resetRouteAnimation();
       activeMotionMode = motionModes.includes(mode) ? mode : "all";
       document.querySelectorAll("[data-motion-mode]").forEach((button) => {{
         button.classList.toggle("active", button.dataset.motionMode === activeMotionMode);
@@ -3085,14 +3481,69 @@ def render_leaflet_map_html(plan: dict) -> str:
       button.textContent = edgesVisible ? "Hide edges" : "Show edges";
       button.classList.toggle("active", edgesVisible);
     }};
+    const syncArrowButton = () => {{
+      const button = document.getElementById("toggleArrows");
+      if (!button) return;
+      button.textContent = arrowsVisible ? "Hide arrows" : "Show arrows";
+      button.classList.toggle("active", arrowsVisible);
+    }};
     const setEdgesVisible = (visible) => {{
       edgesVisible = visible;
       if (edgesVisible) edgeLayer.addTo(map);
       else edgeLayer.remove();
-      if (edgesVisible) arrowLayer.addTo(map);
-      else arrowLayer.remove();
       drawEdges();
       syncEdgeButton();
+    }};
+    const setArrowsVisible = (visible) => {{
+      arrowsVisible = visible;
+      if (arrowsVisible) arrowLayer.addTo(map);
+      else arrowLayer.remove();
+      drawEdges();
+      syncArrowButton();
+    }};
+    const syncLabelButtons = () => {{
+      const stopButton = document.getElementById("toggleStopLabels");
+      if (stopButton) {{
+        stopButton.textContent = stopLabelsVisible ? "Hide stop labels" : "Show stop labels";
+        stopButton.classList.toggle("active", stopLabelsVisible);
+      }}
+      const placeButton = document.getElementById("togglePlaceLabels");
+      if (placeButton) {{
+        placeButton.textContent = placeLabelsVisible ? "Hide point labels" : "Show point labels";
+        placeButton.classList.toggle("active", placeLabelsVisible);
+      }}
+    }};
+    const applyLabelVisibility = () => {{
+      for (const stop of data.stops) {{
+        const marker = markers.get(stop.alias);
+        if (!marker) continue;
+        marker.setTooltipContent(escapeHtml(stopLabelTextForZoom(stop)));
+      }}
+      for (const marker of markers.values()) {{
+        if (stopLabelsVisible && stopLabelMode() !== "hidden") marker.openTooltip();
+        else marker.closeTooltip();
+      }}
+      for (const marker of placeMarkers) {{
+        if (placeLabelsVisible && placeLabelsAllowedByZoom()) marker.openTooltip();
+        else marker.closeTooltip();
+      }}
+      syncLabelButtons();
+    }};
+    const setStopLabelsVisible = (visible) => {{
+      stopLabelsVisible = visible;
+      applyLabelVisibility();
+    }};
+    const setPlaceLabelsVisible = (visible) => {{
+      placeLabelsVisible = visible;
+      applyLabelVisibility();
+    }};
+    const refreshZoomSensitiveMarkers = () => {{
+      for (const stop of data.stops) refreshStop(stop, false);
+      const radius = placeMarkerRadius();
+      for (const marker of placeMarkers) {{
+        if (marker.setRadius) marker.setRadius(radius);
+      }}
+      applyLabelVisibility();
     }};
     const syncRouteColorButtons = () => {{
       document.getElementById("routeMotion")?.classList.toggle("active", routeColorMode === "motion");
@@ -3100,6 +3551,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       document.getElementById("routeElevationSlope")?.classList.toggle("active", routeColorMode === "slope");
     }};
     const setRouteColorMode = (mode) => {{
+      resetRouteAnimation();
       routeColorMode = routeColorModes.includes(mode) ? mode : "motion";
       syncRouteColorButtons();
       drawRoute();
@@ -3176,12 +3628,41 @@ def render_leaflet_map_html(plan: dict) -> str:
         `loss ${{Math.round(descent)}} m`,
       ].join(" · ");
     }};
-    const iconFor = (stop) => L.divIcon({{
+    const stopMarkerSize = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 12) return 8;
+      if (zoom <= 15) return 12;
+      return 18;
+    }};
+    const stopLabelMode = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 12) return "hidden";
+      if (zoom <= 15) return "alias";
+      return "short";
+    }};
+    const placeLabelsAllowedByZoom = () => map.getZoom() >= 14;
+    const placeMarkerRadius = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 12) return 3;
+      if (zoom <= 15) return 4.5;
+      return 6;
+    }};
+    const stopLabelTextForZoom = (stop) => {{
+      const mode = stopLabelMode();
+      if (mode === "alias") return stop.alias;
+      return shortLabelFor(stop);
+    }};
+    const iconFor = (stop) => {{
+      const size = stopMarkerSize();
+      const wrapperSize = size + 6;
+      const anchor = wrapperSize / 2;
+      return L.divIcon({{
       className: "",
-      html: `<div style="background:${{selected.has(stop.alias) ? "#f59e0b" : "#dc2626"}};border:3px solid white;border-radius:999px;box-shadow:0 1px 7px rgb(0 0 0 / .35);height:18px;width:18px"></div>`,
-      iconSize: [24, 24],
-      iconAnchor: [12, 12]
-    }});
+      html: `<div style="background:${{selected.has(stop.alias) ? "#f59e0b" : "#dc2626"}};border:2px solid white;border-radius:999px;box-shadow:0 1px 7px rgb(0 0 0 / .35);height:${{size}}px;width:${{size}}px"></div>`,
+      iconSize: [wrapperSize, wrapperSize],
+      iconAnchor: [anchor, anchor]
+      }});
+    }};
     const shorten = (value, maxLength = 18) => {{
       const text = String(value == null ? "" : value);
       return text.length > maxLength ? text.slice(0, maxLength - 3) + "..." : text;
@@ -3215,7 +3696,9 @@ def render_leaflet_map_html(plan: dict) -> str:
       const marker = markers.get(stop.alias);
       if (!marker) return;
       marker.setIcon(iconFor(stop));
-      marker.setTooltipContent(escapeHtml(shortLabelFor(stop)));
+      marker.setTooltipContent(escapeHtml(stopLabelTextForZoom(stop)));
+      if (stopLabelsVisible && stopLabelMode() !== "hidden") marker.openTooltip();
+      else marker.closeTooltip();
       const element = marker.getElement ? marker.getElement() : null;
       if (element) element.setAttribute("title", labelFor(stop));
       if (refreshPopup) marker.setPopupContent(popupFor(stop));
@@ -3325,7 +3808,8 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     for (const place of data.namedPlaces) {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
-      const marker = L.circleMarker([place.lat, place.lon], {{ radius: 6, color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(map);
+      const marker = L.circleMarker([place.lat, place.lon], {{ radius: placeMarkerRadius(), color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(map);
+      placeMarkers.push(marker);
       marker.bindTooltip(escapeHtml(label), {{ permanent: true, direction: "right", className: "place-label" }});
       marker.bindPopup(`<strong>${{escapeHtml(label)}}</strong><br>${{escapeHtml(place.time)}}`);
       addFitPoint(place.lat, place.lon);
@@ -3339,8 +3823,14 @@ def render_leaflet_map_html(plan: dict) -> str:
         toggleStop(stop);
         marker.openPopup();
       }});
-      marker.on("mouseover", () => marker.setTooltipContent(escapeHtml(labelFor(stop))));
-      marker.on("mouseout", () => marker.setTooltipContent(escapeHtml(shortLabelFor(stop))));
+      marker.on("mouseover", () => {{
+        if (!stopLabelsVisible || stopLabelMode() === "hidden") return;
+        marker.setTooltipContent(escapeHtml(labelFor(stop)));
+      }});
+      marker.on("mouseout", () => {{
+        marker.setTooltipContent(escapeHtml(stopLabelTextForZoom(stop)));
+        if (!stopLabelsVisible || stopLabelMode() === "hidden") marker.closeTooltip();
+      }});
       marker.on("popupopen", () => attachPopupHandlers(stop));
       addFitPoint(stop.lat, stop.lon);
       refreshStop(stop);
@@ -3369,12 +3859,37 @@ def render_leaflet_map_html(plan: dict) -> str:
       selected.clear();
       refreshSelectedStops();
     }});
+    document.getElementById("prevDay").addEventListener("click", () => {{
+      navigateDay(-1);
+    }});
+    document.getElementById("nextDay").addEventListener("click", () => {{
+      navigateDay(1);
+    }});
     document.getElementById("centerSelected").addEventListener("click", () => {{
       const stop = selectedStops()[0];
       if (stop) centerStop(stop);
     }});
     document.getElementById("toggleEdges").addEventListener("click", () => {{
       setEdgesVisible(!edgesVisible);
+    }});
+    document.getElementById("toggleArrows").addEventListener("click", () => {{
+      setArrowsVisible(!arrowsVisible);
+    }});
+    document.getElementById("toggleStopLabels").addEventListener("click", () => {{
+      setStopLabelsVisible(!stopLabelsVisible);
+    }});
+    document.getElementById("togglePlaceLabels").addEventListener("click", () => {{
+      setPlaceLabelsVisible(!placeLabelsVisible);
+    }});
+    document.getElementById("routeAnimPlay").addEventListener("click", () => {{
+      playRouteAnimation();
+    }});
+    document.getElementById("routeAnimReset").addEventListener("click", () => {{
+      resetRouteAnimation();
+    }});
+    document.getElementById("routeAnimDuration").addEventListener("change", () => {{
+      routeAnimationElapsedMs = Math.min(routeAnimationElapsedMs, routeAnimationDurationMs());
+      if (!routeAnimationRunning) renderRouteAnimation(routeAnimationElapsedMs);
     }});
     document.getElementById("routeMotion").addEventListener("click", () => {{
       setRouteColorMode("motion");
@@ -3400,12 +3915,24 @@ def render_leaflet_map_html(plan: dict) -> str:
         setActiveMotionMode(button.dataset.motionMode || "all");
       }});
     }});
+    map.on("zoomend", () => {{
+      drawRoute();
+      refreshZoomSensitiveMarkers();
+      if (!routeAnimationRunning && routeAnimationElapsedMs > 0) renderRouteAnimation(routeAnimationElapsedMs);
+    }});
     syncEdgeButton();
+    syncArrowButton();
+    syncDayNavigationButtons();
+    syncLabelButtons();
+    applyLabelVisibility();
     syncRouteColorButtons();
     syncProfileAxisButtons();
+    syncRouteAnimationButton();
+    routeAnimationStatus("ready");
     renderRouteLegend();
     setActiveMotionMode("all");
     setEdgesVisible(true);
+    setArrowsVisible(true);
     renderElevationProfile();
     document.getElementById("selectNearby").addEventListener("click", () => {{
       const picked = selectedStops()[0] || data.stops[0];
