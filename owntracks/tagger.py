@@ -308,6 +308,170 @@ def summarize_elevation(points: list[Event]) -> dict:
     }
 
 
+def best_segment_speed_kmh(previous: Event, current: Event) -> tuple[float | None, float | None, str]:
+    reported = current.speed_kmh
+    derived: float | None = None
+    seconds = (event_time(current) - event_time(previous)).total_seconds()
+    if (
+        seconds > 0
+        and previous.lat is not None
+        and previous.lon is not None
+        and current.lat is not None
+        and current.lon is not None
+    ):
+        distance_km = haversine_km(previous.lat, previous.lon, current.lat, current.lon)
+        candidate = distance_km / (seconds / 3600)
+        if math.isfinite(candidate) and candidate <= 160:
+            derived = candidate
+    if derived is None:
+        return reported, derived, "OwnTracks vel" if reported is not None else "unknown"
+    if reported is None:
+        return derived, derived, "GPS distance/time"
+    if reported <= 1 and derived > 3:
+        return derived, derived, "GPS distance/time"
+    if reported < derived * 0.4 and derived > 5:
+        return derived, derived, "GPS distance/time"
+    return reported, derived, "OwnTracks vel"
+
+
+def ride_segment_stats(points: list[Event], start_ts: int, end_ts: int, label: str, start_name: str, end_name: str, index: int) -> dict | None:
+    segment_points = [
+        point
+        for point in points
+        if point.is_location
+        and point.recorded_at is not None
+        and start_ts <= int(point.recorded_at.timestamp()) <= end_ts
+    ]
+    if len(segment_points) < 2:
+        return None
+
+    distance_km = 0.0
+    moving_seconds = 0.0
+    speeds: list[float] = []
+    derived_speeds: list[float] = []
+    speed_sources: Counter[str] = Counter()
+    motion_counts: Counter[str] = Counter()
+    moving_motion_counts: Counter[str] = Counter()
+    previous: Event | None = None
+    for point in segment_points:
+        motion_counts[motion_mode(point)] += 1
+        if previous is not None:
+            seconds = (event_time(point) - event_time(previous)).total_seconds()
+            segment_distance = 0.0
+            if seconds > 0 and previous.lat is not None and previous.lon is not None and point.lat is not None and point.lon is not None:
+                segment_distance = haversine_km(previous.lat, previous.lon, point.lat, point.lon)
+                if segment_distance <= 5:
+                    distance_km += segment_distance
+            best_speed, derived_speed, source = best_segment_speed_kmh(previous, point)
+            current_mode = motion_mode(point)
+            if seconds > 0 and (current_mode in {"walking", "cycling", "automotive", "moving"} or (best_speed is not None and best_speed > 3) or segment_distance > 0.03):
+                moving_seconds += seconds
+                moving_motion_counts[current_mode if current_mode in {"walking", "cycling", "automotive", "moving"} else "moving"] += 1
+            if best_speed is not None:
+                speeds.append(best_speed)
+            if derived_speed is not None:
+                derived_speeds.append(derived_speed)
+            speed_sources[source] += 1
+        previous = point
+
+    duration_seconds = max(0, end_ts - start_ts)
+    if duration_seconds <= 0 or distance_km < 0.05:
+        return None
+    average_speed = distance_km / (duration_seconds / 3600)
+    moving_modes = {"walking", "cycling", "automotive", "moving"}
+    moving_points = sum(count for mode, count in motion_counts.items() if mode in moving_modes)
+    dominant_motion = motion_counts.most_common(1)[0][0] if motion_counts else "unknown"
+    dominant_moving_motion = moving_motion_counts.most_common(1)[0][0] if moving_motion_counts else dominant_motion
+    return {
+        "id": f"r{index}",
+        "label": label,
+        "start_name": start_name,
+        "end_name": end_name,
+        "start_time": fmt_dt(datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(segment_points[0].local_tz)),
+        "end_time": fmt_dt(datetime.fromtimestamp(end_ts, tz=timezone.utc).astimezone(segment_points[0].local_tz)),
+        "start_timestamp": start_ts,
+        "end_timestamp": end_ts,
+        "duration_seconds": duration_seconds,
+        "duration": fmt_duration(round(duration_seconds / 60)),
+        "moving_duration_seconds": round(moving_seconds),
+        "moving_duration": fmt_duration(round(moving_seconds / 60)),
+        "distance_km": round(distance_km, 2),
+        "average_speed_kmh": round(average_speed, 1),
+        "moving_average_speed_kmh": round(distance_km / (moving_seconds / 3600), 1) if moving_seconds > 0 else None,
+        "mean_point_speed_kmh": round(statistics_mean(speeds), 1) if speeds else None,
+        "max_speed_kmh": round(max(speeds), 1) if speeds else None,
+        "max_derived_speed_kmh": round(max(derived_speeds), 1) if derived_speeds else None,
+        "point_count": len(segment_points),
+        "moving_points": moving_points,
+        "dominant_motion": dominant_motion,
+        "dominant_moving_motion": dominant_moving_motion,
+        "motion_counts": dict(motion_counts),
+        "moving_motion_counts": dict(moving_motion_counts),
+        "speed_sources": dict(speed_sources),
+        "start_lat": segment_points[0].lat,
+        "start_lon": segment_points[0].lon,
+        "end_lat": segment_points[-1].lat,
+        "end_lon": segment_points[-1].lon,
+    }
+
+
+def statistics_mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def build_ride_segments(points: list[Event], stops: list[dict], places: list[dict]) -> list[dict]:
+    anchors: list[dict] = []
+    for place in places:
+        timestamp = place.get("timestamp")
+        if not isinstance(timestamp, int):
+            continue
+        name = str(place.get("name") or "place")
+        anchors.append(
+            {
+                "entry": timestamp,
+                "exit": timestamp,
+                "name": name,
+                "kind": f"geofence:{place.get('action') or 'event'}",
+            }
+        )
+    for stop in stops:
+        start_ts = stop.get("start_timestamp")
+        end_ts = stop.get("end_timestamp")
+        if not isinstance(start_ts, int) or not isinstance(end_ts, int):
+            continue
+        name = str(stop.get("reviewed_name") or stop.get("name") or stop.get("alias") or "stop")
+        anchors.append(
+            {
+                "entry": start_ts,
+                "exit": end_ts,
+                "name": name,
+                "kind": "stop",
+            }
+        )
+
+    deduped: list[dict] = []
+    for anchor in sorted(anchors, key=lambda item: (item["entry"], item["exit"], item["name"])):
+        if deduped and abs(anchor["entry"] - deduped[-1]["entry"]) <= 30 and anchor["name"] == deduped[-1]["name"]:
+            deduped[-1]["exit"] = max(deduped[-1]["exit"], anchor["exit"])
+            deduped[-1]["kind"] = f"{deduped[-1]['kind']}+{anchor['kind']}"
+            continue
+        deduped.append(anchor)
+
+    segments: list[dict] = []
+    for previous_anchor, next_anchor in zip(deduped, deduped[1:]):
+        start_ts = previous_anchor["exit"]
+        end_ts = next_anchor["entry"]
+        if end_ts <= start_ts:
+            continue
+        start_name = previous_anchor["name"]
+        end_name = next_anchor["name"]
+        segment = ride_segment_stats(points, start_ts, end_ts, f"{start_name} to {end_name}", str(start_name), str(end_name), len(segments) + 1)
+        if segment is not None:
+            segment["anchor_type"] = f"{previous_anchor['kind']} to {next_anchor['kind']}"
+            segments.append(segment)
+    return segments
+
+
 def named_place_events(events: list[Event]) -> list[dict]:
     places = []
     for event in events:
@@ -324,6 +488,7 @@ def named_place_events(events: list[Event]) -> list[dict]:
                 "name": desc,
                 "action": event.payload.get("event"),
                 "time": fmt_dt(event_time(event)),
+                "timestamp": int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else None,
                 "lat": lat,
                 "lon": lon,
                 "line": event.line_no,
@@ -382,6 +547,8 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
                 "name": name,
                 "start": fmt_dt(start),
                 "end": fmt_dt(end),
+                "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+                "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
                 "duration_minutes": duration_minutes,
                 "duration": fmt_duration(duration_minutes),
                 "lat": round(lat, 6),
@@ -643,6 +810,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             "lat": point["lat"],
             "lon": point["lon"],
             "motion_mode": point.get("motion_mode") or "moving",
+            "speed_kmh": point.get("speed_kmh"),
         }
         for point in plan.get("sampled_track", [])
         if point.get("lat") is not None and point.get("lon") is not None
@@ -743,12 +911,18 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
 
     route_parts = []
     fallback_segments = []
+    fallback_track_markers = []
     previous_track_point: dict | None = None
     for index, point in enumerate(track_points):
         xy = project_point(point["lat"], point["lon"])
         if xy is None:
             continue
         route_parts.append(f"{'L' if index else 'M'} {xy[0]:.1f} {xy[1]:.1f}")
+        if len(track_points) == 1:
+            fallback_track_markers.append(
+                f'<g class="track-point"><circle cx="{xy[0]:.1f}" cy="{xy[1]:.1f}" r="11"></circle>'
+                f'<text class="place-label" x="{xy[0] + 14:.1f}" y="{xy[1] - 12:.1f}">location point</text></g>'
+            )
         if previous_track_point is not None:
             prev_xy = project_point(previous_track_point["lat"], previous_track_point["lon"])
             if prev_xy is not None:
@@ -760,6 +934,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         previous_track_point = point
     fallback_route = " ".join(route_parts)
     tile_images = []
+    embed_tiles = tile_cache_dir is not None
     if finite_points:
         lon_span = max(0.00001, (max_x - min_x) / cos_lat)
         tile_zoom = int(clamp(round(math.log2(5 * 360 / lon_span)), 1, 19))
@@ -785,13 +960,15 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
                 if xy1 is None or xy2 is None:
                     continue
                 href = fetch_tile_data_uri(tile_zoom, tile_x, tile_y, tile_cache_dir)
-                if href is None:
+                if href is None and not embed_tiles:
                     href = f"https://tile.openstreetmap.org/{tile_zoom}/{tile_x}/{tile_y}.png"
+                if href is None:
+                    continue
                 tile_images.append(
                     f'<image class="tile" href="{href}" x="{min(xy1[0], xy2[0]):.1f}" y="{min(xy1[1], xy2[1]):.1f}" '
                     f'width="{abs(xy2[0] - xy1[0]):.1f}" height="{abs(xy2[1] - xy1[1]):.1f}" preserveAspectRatio="none"></image>'
                 )
-    embedded_tile_images = bool(tile_images) and all("data:image/png;base64," in image for image in tile_images)
+    embedded_tile_images = embed_tiles
     fallback_places = []
     for place in named_places:
         xy = project_point(place["lat"], place["lon"])
@@ -1070,11 +1247,17 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}
     .tile {{
       image-rendering: auto;
+      pointer-events: none;
     }}
     .place {{
       fill: #2563eb;
       stroke: white;
       stroke-width: 3;
+    }}
+    .track-point circle {{
+      fill: #7c3aed;
+      stroke: white;
+      stroke-width: 4;
     }}
     .motion-summary {{
       display: flex;
@@ -1128,6 +1311,11 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     }}
     .stop {{
       cursor: pointer;
+    }}
+    .hit-target {{
+      fill: white;
+      opacity: 0.001;
+      pointer-events: all;
     }}
     .leader {{
       stroke: #111827;
@@ -1208,7 +1396,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         <rect x="-100000" y="-100000" width="200000" height="200000" fill="url(#grid)"/>
         <g id="viewport">
           <g id="tiles">{"".join(tile_images)}</g>
-          <g id="route">{''.join(fallback_segments)}</g>
+          <g id="route">{''.join(fallback_segments)}{''.join(fallback_track_markers)}</g>
           <g id="places">{"".join(fallback_places)}</g>
           <g id="stops">{"".join(fallback_stops)}</g>
           {empty_svg}
@@ -1283,6 +1471,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     let viewBox = [0, 0, width, height];
     let dragStart = null;
     let stopTapStart = null;
+    let suppressStopClick = false;
     const activePointers = new Map();
     let pinchStart = null;
     let currentTileZoom = null;
@@ -1391,6 +1580,10 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
       return 2 * radius * Math.asin(Math.sqrt(h));
     }};
+    const zoomAtLeast = (minimum) => {{
+      const zoom = map.getZoom();
+      return Number.isFinite(Number(zoom)) ? Math.max(Number(zoom), minimum) : minimum;
+    }};
     const setViewBox = () => {{
       svg.setAttribute("viewBox", viewBox.join(" "));
       drawTiles();
@@ -1414,6 +1607,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     const pointerDistance = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
     const pointerMidpoint = (a, b) => [(a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2];
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
+    const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
     const centerStop = (alias) => {{
       const stop = data.stops.find((item) => item.alias === alias);
       if (!stop) return;
@@ -1423,9 +1617,23 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       setViewBox();
     }};
     const updateCommands = () => {{
-      const changed = data.stops.filter((stop) => stop.name !== originalNames.get(stop.alias));
+      const changed = data.stops.filter((stop) =>
+        stop.name !== originalNames.get(stop.alias)
+        || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
+        || (stop.note || "") !== originalNotes.get(stop.alias)
+      );
       commands.value = changed.length
-        ? ["/otb " + data.date, ...changed.map((stop) => `${{stop.alias}} ${{stop.name}}`)].join("\\n")
+        ? [
+            "/otb " + data.date,
+            ...changed.map((stop) => {{
+              const parts = [`${{stop.alias}} ${{stop.name}}`];
+              if ((stop.tags || []).length) parts.push(`tags: ${{stop.tags.join(" ")}}`);
+              else if (originalTags.get(stop.alias)) parts.push("tags:");
+              if (stop.note) parts.push(`note: ${{stop.note}}`);
+              else if (originalNotes.get(stop.alias)) parts.push("note:");
+              return parts.join(" | ");
+            }})
+          ].join("\\n")
         : "";
     }};
     const draw = () => {{
@@ -1458,8 +1666,13 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         const drawY = y + Math.sin(angle) * spread;
         const label = `${{stop.alias}}: ${{stop.name}}`;
         const labelWidth = Math.max(58, Math.min(260, label.length * 8 + 16));
+        const hitX = Math.min(-16, labelDx - 4);
+        const hitY = Math.min(-16, labelDy - 4);
+        const hitWidth = Math.max(16, labelDx + labelWidth + 4) - hitX;
+        const hitHeight = Math.max(16, labelDy + 28) - hitY;
         stopsLayer.insertAdjacentHTML("beforeend", `
           <g class="stop ${{selected.has(stop.alias) ? "selected" : ""}}" data-alias="${{escapeHtml(stop.alias)}}" transform="translate(${{drawX}}, ${{drawY}})">
+            <rect class="hit-target" x="${{hitX}}" y="${{hitY}}" width="${{hitWidth}}" height="${{hitHeight}}"></rect>
             <line class="leader" x1="0" y1="0" x2="${{x - drawX}}" y2="${{y - drawY}}"></line>
             <circle r="10"></circle>
             <rect class="label-bg" x="${{labelDx}}" y="${{labelDy}}" width="${{labelWidth}}" height="24"></rect>
@@ -1477,6 +1690,8 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
           </div>
           <input data-name="${{escapeHtml(stop.alias)}}" value="${{escapeHtml(stop.name)}}">
+          <input data-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
+          <textarea data-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
           <div class="meta">${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}} · ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points</div>
         </div>
       `).join("");
@@ -1489,6 +1704,24 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
           if (stop) {{
             stop.name = input.value.trim() || originalNames.get(stop.alias);
             draw();
+            updateCommands();
+          }}
+        }});
+      }});
+      stopList.querySelectorAll("[data-tags]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.tags);
+          if (stop) {{
+            stop.tags = parseTags(input.value);
+            updateCommands();
+          }}
+        }});
+      }});
+      stopList.querySelectorAll("[data-note]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.note);
+          if (stop) {{
+            stop.note = input.value.trim();
             updateCommands();
           }}
         }});
@@ -1521,11 +1754,21 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       const distance = stopTapStart ? Math.hypot(event.clientX - stopTapStart.x, event.clientY - stopTapStart.y) : 999;
       if (stopTapStart && stopTapStart.alias === node.dataset.alias && distance < 10) {{
         toggleStop(node.dataset.alias);
+        suppressStopClick = true;
+        setTimeout(() => suppressStopClick = false, 350);
       }}
       stopTapStart = null;
     }});
     stopsLayer.addEventListener("pointercancel", () => {{
       stopTapStart = null;
+    }});
+    stopsLayer.addEventListener("click", (event) => {{
+      const node = event.target.closest(".stop");
+      if (!node) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (suppressStopClick) return;
+      toggleStop(node.dataset.alias);
     }});
     document.getElementById("selectAll").addEventListener("click", () => {{
       data.stops.forEach((stop) => selected.add(stop.alias));
@@ -2499,6 +2742,7 @@ def render_leaflet_map_html(plan: dict) -> str:
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
             "namedPlaces": named_places,
+            "rideSegments": plan.get("ride_segments", []),
             "motionSummary": motion_summary,
         },
         ensure_ascii=False,
@@ -2599,6 +2843,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     button.secondary {{
       background: #e5e7eb;
       color: #111827;
+    }}
+    button.active {{
+      box-shadow: 0 0 0 2px #2563eb inset;
     }}
     .status {{
       color: #374151;
@@ -2757,6 +3004,39 @@ def render_leaflet_map_html(plan: dict) -> str:
       line-height: 1.35;
       margin-top: 6px;
     }}
+    .ride-segments {{
+      display: grid;
+      gap: 6px;
+      margin-top: 8px;
+      max-height: 24vh;
+      overflow: auto;
+    }}
+    .ride-segment {{
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 7px;
+      color: #111827;
+      cursor: pointer;
+      display: block;
+      padding: 7px;
+      text-align: left;
+      width: 100%;
+    }}
+    .ride-segment:hover {{
+      border-color: #2563eb;
+    }}
+    .ride-segment strong {{
+      display: block;
+      font-size: 12px;
+      line-height: 1.25;
+      margin-bottom: 4px;
+    }}
+    .ride-segment span {{
+      color: #475569;
+      display: block;
+      font-size: 11px;
+      line-height: 1.35;
+    }}
     .route-legend {{
       align-items: center;
       display: flex;
@@ -2784,6 +3064,23 @@ def render_leaflet_map_html(plan: dict) -> str:
       display: inline-block;
       height: 10px;
       width: 10px;
+    }}
+    .route-legend .legend-gradient {{
+      border: 1px solid rgb(15 23 42 / 0.16);
+      border-radius: 999px;
+      display: block;
+      flex-basis: 100%;
+      height: 12px;
+      min-width: 180px;
+    }}
+    .route-legend .legend-scale {{
+      color: #334155;
+      display: flex;
+      flex-basis: 100%;
+      font-size: 11px;
+      font-weight: 750;
+      justify-content: space-between;
+      min-width: 180px;
     }}
     .route-legend-map {{
       background: rgb(255 255 255 / 0.94);
@@ -2869,6 +3166,17 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-size: 12px;
       line-height: 1.4;
     }}
+    .segment-popup {{
+      min-width: 210px;
+    }}
+    .segment-popup strong {{
+      display: block;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }}
+    .segment-popup .popup-meta div {{
+      margin-top: 2px;
+    }}
     @media (max-width: 700px) {{
       .tools {{
         max-height: calc(100vh - 20px);
@@ -2930,6 +3238,10 @@ def render_leaflet_map_html(plan: dict) -> str:
       </div>
       <div class="motion-summary">{''.join(motion_chips) if motion_chips else '<span class="hint">Motion summary unavailable</span>'}</div>
       <div class="profile">
+        <div class="profile-title">Ride segments</div>
+        <div id="rideSegments" class="ride-segments"></div>
+      </div>
+      <div class="profile">
         <div class="profile-title">Elevation profile</div>
         <div class="row">
           <button id="profileDistance" type="button" class="secondary">Distance</button>
@@ -2937,6 +3249,9 @@ def render_leaflet_map_html(plan: dict) -> str:
         </div>
         <div class="row" style="margin-top: 8px">
           <button id="routeMotion" type="button" class="secondary">Motion colors</button>
+          <button id="routeSpeed" type="button" class="secondary">Speed colors</button>
+        </div>
+        <div class="row" style="margin-top: 8px">
           <button id="routeElevationBands" type="button" class="secondary">Elevation bands</button>
           <button id="routeElevationSlope" type="button" class="secondary">Ascent / descent</button>
         </div>
@@ -2954,11 +3269,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       <input id="bulkName" placeholder="Name selected stops">
       <div class="row">
         <button id="applyName" type="button">Apply</button>
-        <button id="copyCommands" type="button" class="secondary">Copy</button>
       </div>
       <div id="stopList" class="stop-list"></div>
       <label for="commands">Paste this in Telegram</label>
       <textarea id="commands" readonly></textarea>
+      <button id="copyCommands" type="button" class="secondary" style="margin-top: 8px; width: 100%">Copy</button>
       <div id="status" class="status">loading</div>
     </div>
   </div>
@@ -3000,7 +3315,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let arrowsVisible = true;
     let stopLabelsVisible = true;
     let placeLabelsVisible = true;
-    let routeColorMode = "motion";
+    let routeColorMode = "speed";
     let profileAxis = "distance";
     let routeAnimationFrame = null;
     let routeAnimationRunning = false;
@@ -3008,7 +3323,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let routeAnimationElapsedMs = 0;
     let routeAnimationStaticVisibility = null;
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
-    const routeColorModes = ["motion", "bands", "slope"];
+    const routeColorModes = ["motion", "speed", "bands", "slope"];
     const profileAxes = ["distance", "time"];
     const motionColors = {{
       stationary: "{MOTION_COLORS["stationary"]}",
@@ -3030,7 +3345,9 @@ def render_leaflet_map_html(plan: dict) -> str:
       ascent: "#fb923c",
       ascentStrong: "#dc2626",
     }};
+    const speedPalette = ["#6b7280", "#16a34a", "#2563eb", "#f59e0b", "#ef4444", "#7c2d12"];
     let elevationBandBounds = {{ min: elevationMin, max: elevationMax }};
+    let speedBounds = {{ min: 0, max: 1 }};
     const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
       "&": "&amp;",
       "<": "&lt;",
@@ -3075,6 +3392,60 @@ def render_leaflet_map_html(plan: dict) -> str:
       const lat2 = toRad(b.lat);
       const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
       return 2 * radius * Math.asin(Math.sqrt(h));
+    }};
+    const zoomAtLeast = (minimum) => {{
+      const zoom = map.getZoom();
+      return Number.isFinite(Number(zoom)) ? Math.max(Number(zoom), minimum) : minimum;
+    }};
+    const derivedSpeedKmh = (previous, current) => {{
+      if (!previous || !current) return null;
+      const previousTs = Number(previous.timestamp);
+      const currentTs = Number(current.timestamp);
+      if (!Number.isFinite(previousTs) || !Number.isFinite(currentTs) || currentTs <= previousTs) return null;
+      const meters = distanceMeters(previous, current);
+      const seconds = currentTs - previousTs;
+      const kmh = (meters / 1000) / (seconds / 3600);
+      return Number.isFinite(kmh) && kmh <= 160 ? kmh : null;
+    }};
+    const bestSpeedKmh = (reported, derived) => {{
+      const reportedSpeed = Number.isFinite(Number(reported)) ? Number(reported) : null;
+      const derivedSpeed = Number.isFinite(Number(derived)) ? Number(derived) : null;
+      if (derivedSpeed == null) return reportedSpeed;
+      if (reportedSpeed == null) return derivedSpeed;
+      if (reportedSpeed <= 1 && derivedSpeed > 3) return derivedSpeed;
+      if (reportedSpeed < derivedSpeed * 0.4 && derivedSpeed > 5) return derivedSpeed;
+      return reportedSpeed;
+    }};
+    const hexToRgb = (hex) => {{
+      const value = String(hex || "").replace("#", "");
+      const parsed = Number.parseInt(value.length === 3 ? value.split("").map((char) => char + char).join("") : value, 16);
+      if (!Number.isFinite(parsed)) return [100, 116, 139];
+      return [(parsed >> 16) & 255, (parsed >> 8) & 255, parsed & 255];
+    }};
+    const mixColor = (from, to, ratio) => {{
+      const a = hexToRgb(from);
+      const b = hexToRgb(to);
+      const r = Math.max(0, Math.min(1, ratio));
+      const mixed = a.map((value, index) => Math.round(value + (b[index] - value) * r));
+      return `rgb(${{mixed[0]}}, ${{mixed[1]}}, ${{mixed[2]}})`;
+    }};
+    const speedColor = (speed) => {{
+      const value = Number(speed);
+      if (!Number.isFinite(value)) return motionColors.unknown;
+      const span = Math.max(0.1, speedBounds.max - speedBounds.min);
+      const ratio = Math.max(0, Math.min(1, (value - speedBounds.min) / span));
+      const scaled = ratio * (speedPalette.length - 1);
+      const index = Math.min(speedPalette.length - 2, Math.floor(scaled));
+      return mixColor(speedPalette[index], speedPalette[index + 1], scaled - index);
+    }};
+    const interpolateNumber = (from, to, ratio) => from + ((to - from) * ratio);
+    const interpolateSpeed = (from, to, ratio) => {{
+      const start = Number(from);
+      const end = Number(to);
+      if (Number.isFinite(start) && Number.isFinite(end)) return interpolateNumber(start, end, ratio);
+      if (Number.isFinite(end)) return end;
+      if (Number.isFinite(start)) return start;
+      return null;
     }};
     const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
     const copyCommandsToClipboard = async (automatic = false) => {{
@@ -3122,7 +3493,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
     const rawTrackPoints = data.sampledTrack || [];
+    const rideSegments = data.rideSegments || [];
     const trackPoints = [];
+    const rideSegmentsEl = document.getElementById("rideSegments");
     const routeLegend = document.getElementById("routeLegend");
     const routeLegendControl = L.control({{ position: "topright" }});
     routeLegendControl.onAdd = () => {{
@@ -3144,16 +3517,22 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       const alt = Number(point.alt_m);
       const timestamp = toTimestamp(point.timestamp);
-      if (previousTrackPoint) cumulativeTrackDistanceKm += distanceMeters(previousTrackPoint, {{ lat, lon }}) / 1000;
+      const speedKmh = Number(point.speed_kmh);
+      const currentTrackPoint = {{ lat, lon, timestamp }};
+      const segmentSpeedKmh = derivedSpeedKmh(previousTrackPoint, currentTrackPoint);
+      if (previousTrackPoint) cumulativeTrackDistanceKm += distanceMeters(previousTrackPoint, currentTrackPoint) / 1000;
       trackPoints.push({{
         lat,
         lon,
         alt_m: Number.isFinite(alt) ? alt : null,
         motion_mode: point.motion_mode || "moving",
+        speed_kmh: bestSpeedKmh(speedKmh, segmentSpeedKmh),
+        reported_speed_kmh: Number.isFinite(speedKmh) ? speedKmh : null,
+        derived_speed_kmh: segmentSpeedKmh,
         timestamp,
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
-      previousTrackPoint = {{ lat, lon }};
+      previousTrackPoint = currentTrackPoint;
     }}
     const refreshElevationBandBounds = () => {{
       const samples = visibleTrackPoints().filter((point) => Number.isFinite(point.alt_m));
@@ -3166,6 +3545,16 @@ def render_leaflet_map_html(plan: dict) -> str:
         min: Math.min(...values),
         max: Math.max(...values),
       }};
+    }};
+    const refreshSpeedBounds = () => {{
+      const values = visibleTrackPoints().map((point) => Number(point.speed_kmh)).filter(Number.isFinite);
+      if (!values.length) {{
+        speedBounds = {{ min: 0, max: 1 }};
+        return;
+      }}
+      const minSpeed = Math.max(0, Math.min(...values));
+      const maxSpeed = Math.max(...values);
+      speedBounds = {{ min: minSpeed, max: Math.max(minSpeed + 1, maxSpeed) }};
     }};
     const routeColorFor = (point, prev = null) => {{
       if (routeColorMode === "bands") {{
@@ -3191,10 +3580,116 @@ def render_leaflet_map_html(plan: dict) -> str:
         if (delta <= -4) return slopeColors.descent;
         return slopeColors.flat;
       }}
+      if (routeColorMode === "speed") {{
+        const speed = Number.isFinite(Number(point.speed_kmh)) ? Number(point.speed_kmh) : (prev && Number.isFinite(Number(prev.speed_kmh)) ? Number(prev.speed_kmh) : null);
+        return speedColor(speed);
+      }}
       const mode = point.motion_mode || (prev && prev.motion_mode) || "moving";
       return motionColors[mode] || motionColors.moving;
     }};
+    const formatSpeed = (value) => Number.isFinite(Number(value)) ? `${{Number(value).toFixed(1)}} km/h` : "unknown";
+    const formatAltitude = (value) => Number.isFinite(Number(value)) ? `${{Number(value).toFixed(1)}} m` : "unknown";
+    const formatDeltaAltitude = (value) => {{
+      if (!Number.isFinite(Number(value))) return "unknown";
+      const delta = Number(value);
+      const sign = delta > 0 ? "+" : "";
+      return `${{sign}}${{delta.toFixed(1)}} m`;
+    }};
+    const formatMeters = (value) => {{
+      const meters = Number(value);
+      if (!Number.isFinite(meters)) return "unknown";
+      return meters >= 1000 ? `${{(meters / 1000).toFixed(2)}} km` : `${{Math.round(meters)}} m`;
+    }};
+    const formatDuration = (seconds) => {{
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value < 0) return "unknown";
+      if (value < 60) return `${{Math.round(value)}} sec`;
+      const minutes = Math.floor(value / 60);
+      const secs = Math.round(value % 60);
+      return secs ? `${{minutes}}m ${{secs}}s` : `${{minutes}} min`;
+    }};
+    const formatTime = (timestamp) => Number.isFinite(Number(timestamp))
+      ? new Date(Number(timestamp) * 1000).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }})
+      : "unknown";
+    const formatSpeedPlain = (value) => Number.isFinite(Number(value)) ? `${{Number(value).toFixed(1)}} km/h` : "unknown";
+    const speedSourceLabel = (point) => {{
+      const speed = Number(point.speed_kmh);
+      const reported = Number(point.reported_speed_kmh);
+      const derived = Number(point.derived_speed_kmh);
+      if (Number.isFinite(reported) && Math.abs(speed - reported) < 0.05) return "OwnTracks vel";
+      if (Number.isFinite(derived) && Math.abs(speed - derived) < 0.05) return "GPS distance/time";
+      return "best available";
+    }};
+    const routeColorModeLabel = () => ({{
+      motion: "Motion colors",
+      speed: "Speed colors",
+      bands: "Elevation bands",
+      slope: "Ascent / descent",
+    }}[routeColorMode] || "Route colors");
+    const slopeLabel = (delta) => {{
+      if (!Number.isFinite(Number(delta))) return "unknown";
+      if (delta >= 12) return "strong ascent";
+      if (delta >= 4) return "ascent";
+      if (delta <= -12) return "strong descent";
+      if (delta <= -4) return "descent";
+      return "flat";
+    }};
+    const segmentPopupHtml = (prev, current, meters) => {{
+      const seconds = Number(current.timestamp) - Number(prev.timestamp);
+      const currentAlt = Number(current.alt_m);
+      const previousAlt = Number(prev.alt_m);
+      const elevationDelta = Number.isFinite(currentAlt) && Number.isFinite(previousAlt) ? currentAlt - previousAlt : null;
+      const motionMode = current.motion_mode || prev.motion_mode || "moving";
+      return `
+        <div class="segment-popup">
+          <strong>${{escapeHtml(routeColorModeLabel())}}</strong>
+          <div class="popup-meta">
+            <div>Speed: ${{formatSpeed(current.speed_kmh)}} · Source: ${{escapeHtml(speedSourceLabel(current))}}</div>
+            <div>OwnTracks vel: ${{formatSpeed(current.reported_speed_kmh)}}</div>
+            <div>GPS-derived: ${{formatSpeed(current.derived_speed_kmh)}}</div>
+            <div>Altitude: ${{formatAltitude(current.alt_m)}} · Change: ${{formatDeltaAltitude(elevationDelta)}}</div>
+            <div>Slope band: ${{escapeHtml(slopeLabel(elevationDelta))}}</div>
+            <div>Distance: ${{formatMeters(meters)}} · Duration: ${{formatDuration(seconds)}}</div>
+            <div>${{formatTime(prev.timestamp)}} to ${{formatTime(current.timestamp)}}</div>
+            <div>Motion: ${{escapeHtml(motionMode)}}</div>
+          </div>
+        </div>
+      `;
+    }};
     const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const segmentPointsFor = (segment) => trackPoints.filter((point) => {{
+      const timestamp = Number(point.timestamp);
+      return Number.isFinite(timestamp) && timestamp >= Number(segment.start_timestamp) && timestamp <= Number(segment.end_timestamp);
+    }});
+    const fitRideSegment = (segment) => {{
+      const points = segmentPointsFor(segment);
+      if (points.length >= 2) {{
+        map.fitBounds(L.latLngBounds(points.map((point) => [point.lat, point.lon])).pad(0.18));
+      }} else if (Number.isFinite(Number(segment.start_lat)) && Number.isFinite(Number(segment.start_lon))) {{
+        map.setView([Number(segment.start_lat), Number(segment.start_lon)], zoomAtLeast(14), {{ animate: true }});
+      }}
+    }};
+    const renderRideSegments = () => {{
+      if (!rideSegmentsEl) return;
+      if (!rideSegments.length) {{
+        rideSegmentsEl.innerHTML = '<div class="profile-summary">No ride segments found for this day.</div>';
+        return;
+      }}
+      rideSegmentsEl.innerHTML = rideSegments.map((segment, index) => `
+        <button type="button" class="ride-segment" data-segment-index="${{index}}">
+          <strong>${{escapeHtml(segment.label || segment.id || "Ride segment")}}</strong>
+          <span>${{escapeHtml(segment.duration || "")}} elapsed · ${{escapeHtml(segment.moving_duration || "")}} moving · ${{Number(segment.distance_km || 0).toFixed(2)}} km</span>
+          <span>moving avg ${{formatSpeedPlain(segment.moving_average_speed_kmh)}} · gross avg ${{formatSpeedPlain(segment.average_speed_kmh)}} · max ${{formatSpeedPlain(segment.max_speed_kmh)}}</span>
+          <span>${{escapeHtml(segment.dominant_moving_motion || segment.dominant_motion || "unknown")}} · ${{escapeHtml(segment.start_time || "")}} to ${{escapeHtml(segment.end_time || "")}}</span>
+        </button>
+      `).join("");
+      rideSegmentsEl.querySelectorAll("[data-segment-index]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const segment = rideSegments[Number(button.dataset.segmentIndex)];
+          if (segment) fitRideSegment(segment);
+        }});
+      }});
+    }};
     const routePointRadius = () => {{
       const zoom = map.getZoom();
       if (zoom <= 12) return 1.8;
@@ -3207,6 +3702,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (zoom <= 15) return {{ size: 14, stroke: 1.4 }};
       return {{ size: 20, stroke: 2 }};
     }};
+    const routeEdgeWeight = () => {{
+      const zoom = map.getZoom();
+      if (zoom <= 8) return 0.8;
+      if (zoom <= 10) return 1.2;
+      if (zoom <= 12) return 1.8;
+      if (zoom <= 14) return 3.2;
+      if (zoom <= 15) return 4.5;
+      return 6.5;
+    }};
     const drawRoute = () => {{
       routeLayer.clearLayers();
       refreshElevationBandBounds();
@@ -3217,6 +3721,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       }}
       let previous = null;
       const pointRadius = routePointRadius();
+      refreshSpeedBounds();
       for (const point of points) {{
         L.circleMarker([point.lat, point.lon], {{
           radius: pointRadius,
@@ -3253,6 +3758,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const arrowStyle = routeArrowSize();
       const arrowSize = arrowStyle.size;
       const arrowAnchor = arrowSize / 2;
+      const edgeWeight = routeEdgeWeight();
       const stationaryArrowMinMeters = 500;
       let metersSinceArrow = arrowSpacing / 2;
       let stationaryRunHasArrow = false;
@@ -3267,21 +3773,46 @@ def render_leaflet_map_html(plan: dict) -> str:
         const mode = current.motion_mode || prev.motion_mode || "moving";
         if (activeMotionMode !== "all" && mode !== activeMotionMode) continue;
         const color = routeColorFor(current, prev);
+        const segmentMeters = distanceMeters({{ lat: prevLat, lon: prevLon }}, {{ lat: currentLat, lon: currentLon }});
         if (edgesVisible) {{
-          L.polyline(
-            [[prevLat, prevLon], [currentLat, currentLon]],
-            {{
-              renderer: routeRenderer,
-              color,
-              weight: 5,
-              opacity: 1,
-              noClip: true,
-              interactive: false,
+          if (routeColorMode === "speed") {{
+            const steps = Math.max(3, Math.min(18, Math.ceil((Number.isFinite(segmentMeters) ? segmentMeters : 0) / 120)));
+            for (let step = 0; step < steps; step += 1) {{
+              const startRatio = step / steps;
+              const endRatio = (step + 1) / steps;
+              const midRatio = (startRatio + endRatio) / 2;
+              const startLat = interpolateNumber(prevLat, currentLat, startRatio);
+              const startLon = interpolateNumber(prevLon, currentLon, startRatio);
+              const endLat = interpolateNumber(prevLat, currentLat, endRatio);
+              const endLon = interpolateNumber(prevLon, currentLon, endRatio);
+              const speed = interpolateSpeed(prev.speed_kmh, current.speed_kmh, midRatio);
+              L.polyline(
+                [[startLat, startLon], [endLat, endLon]],
+                {{
+                  renderer: routeRenderer,
+                  color: speedColor(speed),
+                  weight: edgeWeight,
+                  opacity: 1,
+                  noClip: true,
+                  interactive: true,
+                }}
+              ).bindPopup(segmentPopupHtml(prev, current, segmentMeters)).addTo(edgeLayer);
             }}
-          ).addTo(edgeLayer);
+          }} else {{
+            L.polyline(
+              [[prevLat, prevLon], [currentLat, currentLon]],
+              {{
+                renderer: routeRenderer,
+                color,
+                weight: edgeWeight,
+                opacity: 1,
+                noClip: true,
+                interactive: true,
+              }}
+            ).bindPopup(segmentPopupHtml(prev, current, segmentMeters)).addTo(edgeLayer);
+          }}
         }}
         if (!arrowsVisible) continue;
-        const segmentMeters = distanceMeters({{ lat: prevLat, lon: prevLon }}, {{ lat: currentLat, lon: currentLon }});
         if (!Number.isFinite(segmentMeters) || segmentMeters < 25) continue;
         if (mode === "stationary") {{
           if (stationaryRunHasArrow || segmentMeters < stationaryArrowMinMeters) continue;
@@ -3375,7 +3906,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         L.polyline([segment.start, segment.end], {{
           renderer: routeRenderer,
           color: segment.color,
-          weight: 7,
+          weight: routeEdgeWeight(),
           opacity: 1,
           noClip: true,
           interactive: false,
@@ -3457,6 +3988,18 @@ def render_leaflet_map_html(plan: dict) -> str:
           return {{ color, label: `${{Math.round(start)}}-${{Math.round(end)}}m` }};
         }});
         target.innerHTML = renderItems(swatches, "Elevation bands");
+        return;
+      }}
+      if (routeColorMode === "speed") {{
+        const gradient = `linear-gradient(90deg, ${{speedPalette.join(", ")}})`;
+        target.innerHTML = `
+          <span class="legend-title">Speed</span>
+          <span class="legend-gradient" style="background: ${{gradient}}"></span>
+          <span class="legend-scale">
+            <span>${{speedBounds.min.toFixed(1)}} km/h</span>
+            <span>${{speedBounds.max.toFixed(1)}} km/h</span>
+          </span>
+        `;
         return;
       }}
       target.innerHTML = renderItems([
@@ -3547,6 +4090,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const syncRouteColorButtons = () => {{
       document.getElementById("routeMotion")?.classList.toggle("active", routeColorMode === "motion");
+      document.getElementById("routeSpeed")?.classList.toggle("active", routeColorMode === "speed");
       document.getElementById("routeElevationBands")?.classList.toggle("active", routeColorMode === "bands");
       document.getElementById("routeElevationSlope")?.classList.toggle("active", routeColorMode === "slope");
     }};
@@ -3804,6 +4348,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     if (data.track.length) {{
       drawRoute();
+      renderRideSegments();
       data.track.forEach((point) => addFitPoint(point[0], point[1]));
     }}
     for (const place of data.namedPlaces) {{
@@ -3837,7 +4382,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     if (fitCount) {{
       if (fitCount === 1) {{
-        map.setView([fitMinLat, fitMinLon], Math.max(map.getZoom(), 14));
+        map.setView([fitMinLat, fitMinLon], zoomAtLeast(14));
       }} else {{
         map.fitBounds([[fitMinLat, fitMinLon], [fitMaxLat, fitMaxLon]], {{ padding: [70, 70] }});
       }}
@@ -3893,6 +4438,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     document.getElementById("routeMotion").addEventListener("click", () => {{
       setRouteColorMode("motion");
+    }});
+    document.getElementById("routeSpeed").addEventListener("click", () => {{
+      setRouteColorMode("speed");
     }});
     document.getElementById("routeElevationBands").addEventListener("click", () => {{
       setRouteColorMode("bands");
@@ -3957,7 +4505,9 @@ def render_leaflet_map_html(plan: dict) -> str:
       await copyCommandsToClipboard(false);
     }});
     document.getElementById("fitAll").addEventListener("click", () => {{
-      if (fitPoints.length) {{
+      if (fitPoints.length === 1) {{
+        map.setView(fitPoints[0], zoomAtLeast(14));
+      }} else if (fitPoints.length) {{
         map.fitBounds(L.latLngBounds(fitPoints).pad(0.18));
       }}
     }});
@@ -4025,6 +4575,7 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
     plan = apply_user_tags(plan, user_tags or {})
     for index, stop in enumerate(plan["candidate_stops"], start=1):
         stop["alias"] = f"s{index}"
+    plan["ride_segments"] = build_ride_segments(track_points, plan["candidate_stops"], places)
     return plan, track_points
 
 
@@ -4122,6 +4673,22 @@ def render_digest(plan: dict) -> str:
         if place.get("maps"):
             lines.append(f"  {place['maps']}")
 
+    lines.extend(["", "Ride segments"])
+    if not plan.get("ride_segments"):
+        lines.append("- None")
+    for segment in plan.get("ride_segments", []):
+        lines.append(f"- {segment['id']}: {segment['label']}")
+        lines.append(
+            "  "
+            f"{segment['distance_km']} km | elapsed {segment['duration']} | moving {segment['moving_duration']} | "
+            f"moving avg {segment.get('moving_average_speed_kmh')} km/h | max {segment.get('max_speed_kmh')} km/h"
+        )
+        lines.append(
+            "  "
+            f"Motion: {segment.get('dominant_moving_motion') or segment.get('dominant_motion')} | "
+            f"Points: {segment['point_count']} | {segment['start_time']} to {segment['end_time']}"
+        )
+
     reviewed_stops = [stop for stop in plan["candidate_stops"] if is_reviewed_stop(stop)]
     pending_stops = [stop for stop in plan["candidate_stops"] if not is_reviewed_stop(stop)]
     lines.extend(["", "Reviewed stops"])
@@ -4144,6 +4711,7 @@ def render_digest(plan: dict) -> str:
             "Commands:",
             "/otd [today|yesterday|DD|MM-DD|YYYY-MM-DD]",
             "/otm [today|yesterday|DD|MM-DD|YYYY-MM-DD]",
+            "/otme [today|yesterday|DD|MM-DD|YYYY-MM-DD]",
             "/otb DD|MM-DD|YYYY-MM-DD",
             "/ott s1 tag1 tag2",
             "/otn s1 place name",

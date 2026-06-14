@@ -57,6 +57,7 @@ COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
     ("memq", "ask saved memories"),
     ("otd", "show OwnTracks activity digest"),
     ("otm", "send interactive OwnTracks map"),
+    ("otme", "send embedded OwnTracks map"),
     ("otb", "bulk-save OwnTracks stop reviews"),
     ("ott", "tag an OwnTracks stop"),
     ("otn", "name an OwnTracks stop"),
@@ -1181,6 +1182,26 @@ def remembered_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT
     return context.bot_data.setdefault("owntracks_last_map_scope", {}).get(owntracks_session_key(update))
 
 
+async def send_owntracks_embedded_map(update: Update, context: ContextTypes.DEFAULT_TYPE, scope_text: str) -> None:
+    try:
+        summary, _html, map_path = await asyncio.to_thread(generate_owntracks_visualization, scope_text)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not generate OwnTracks embedded map: {exc}")
+        return
+    if not map_path.exists():
+        await update.effective_message.reply_text(f"OwnTracks embedded map was not written: {map_path}")
+        return
+    remember_owntracks_map_scope(update, context, summary["scope"]["value"])
+    caption_kind = "heatmap" if summary["scope"]["kind"] != "day" else "map"
+    caption = f"OwnTracks embedded {caption_kind} for {summary['scope']['value']}."
+    with map_path.open("rb") as handle:
+        await update.effective_message.reply_document(
+            document=handle,
+            filename=map_path.name,
+            caption=caption,
+        )
+
+
 async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
@@ -1215,23 +1236,21 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
     if config.owntracks_map_delivery not in {"file", "html", "attachment"}:
         await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY must be 'file' or 'hosted'.")
         return
-    try:
-        summary, _html, map_path = await asyncio.to_thread(generate_owntracks_visualization, scope_text)
-    except Exception as exc:
-        await update.effective_message.reply_text(f"Could not generate OwnTracks map: {exc}")
+    await send_owntracks_embedded_map(update, context, scope_text)
+
+
+async def owntracks_embedded_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not await owntracks_guarded(update, config):
         return
-    if not map_path.exists():
-        await update.effective_message.reply_text(f"OwnTracks map was not written: {map_path}")
-        return
-    remember_owntracks_map_scope(update, context, summary["scope"]["value"])
-    caption_kind = "heatmap" if summary["scope"]["kind"] != "day" else "map"
-    caption = f"OwnTracks {caption_kind} for {summary['scope']['value']}."
-    with map_path.open("rb") as handle:
-        await update.effective_message.reply_document(
-            document=handle,
-            filename=map_path.name,
-            caption=caption,
-        )
+    if context.args:
+        scope_text = context.args[0]
+        if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
+            await update.effective_message.reply_text(f"Usage: /otme [{OWNTRACKS_MAP_SCOPE_USAGE}]")
+            return
+    else:
+        scope_text = remembered_owntracks_map_scope(update, context) or "today"
+    await send_owntracks_embedded_map(update, context, scope_text)
 
 
 def owntracks_session_key(update: Update) -> str:
@@ -1478,6 +1497,7 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
         "OwnTracks commands:\n"
         f"/otd [{OWNTRACKS_DATE_USAGE}]\n"
         f"/otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]\n"
+        f"/otme [{OWNTRACKS_MAP_SCOPE_USAGE}]\n"
         f"/otb {OWNTRACKS_DATE_USAGE} then lines like: s1 Place | tags: tag1 tag2 | note: text\n"
         "/ott s1 tag1 tag2\n"
         "/otn s1 place name\n"
@@ -1532,6 +1552,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["oth", "owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
     application.add_handler(CommandHandler(["otd", "ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
     application.add_handler(CommandHandler(["otm", "ot_map", "owntracks_map"], owntracks_map_command))
+    application.add_handler(CommandHandler(["otme", "ot_map_embed", "owntracks_map_embed"], owntracks_embedded_map_command))
     application.add_handler(CommandHandler(["otb", "ot_names", "owntracks_names"], owntracks_names_command))
     application.add_handler(CommandHandler(["ott", "tag", "owntracks_tag", "ot_tag"], owntracks_tag_command))
     application.add_handler(CommandHandler(["otn", "name", "owntracks_name", "ot_name"], owntracks_name_command))
