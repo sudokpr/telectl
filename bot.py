@@ -29,6 +29,41 @@ from image_summary import processing_description
 from image_summary import split_message
 from http_intake import HttpIntakeConfig, build_http_config, start_http_intake
 from memory_processor import answer_memory_question, save_memory
+from metrics import (
+    FUEL_APPROVALS_TOTAL,
+    FUEL_CORRECTIONS_TOTAL,
+    FUEL_CSV_APPENDS_TOTAL,
+    FUEL_EXTRACTION_DURATION_SECONDS,
+    FUEL_EXTRACTIONS_TOTAL,
+    FUEL_IMAGES_TOTAL,
+    FUEL_PENDING_APPROVALS,
+    HANDLER_ERRORS_TOTAL,
+    IMAGE_JOB_DURATION_SECONDS,
+    IMAGE_JOBS_TOTAL,
+    IMAGE_REPLY_CHUNKS_TOTAL,
+    MEMORY_EXTRACTION_DURATION_SECONDS,
+    MEMORY_EXTRACTIONS_TOTAL,
+    MEMORY_QUERIES_TOTAL,
+    MEMORY_QUERY_CONTEXT_CHARS,
+    MEMORY_QUERY_DURATION_SECONDS,
+    OWNTRACKS_DIGEST_DURATION_SECONDS,
+    OWNTRACKS_DIGEST_TOTAL,
+    OWNTRACKS_MAP_DURATION_SECONDS,
+    OWNTRACKS_MAP_TOTAL,
+    OWNTRACKS_STOP_REVIEWS_TOTAL,
+    REPLIES_TOTAL,
+    MetricsConfig,
+    build_metrics_config,
+    error_type as metrics_error_type,
+    observe_download,
+    observe_handler,
+    observe_handler_error,
+    observe_plan,
+    observe_update,
+    set_config_enabled,
+    set_memory_files_gauge,
+    start_standalone_metrics_server,
+)
 from owntracks.env import load_env as load_owntracks_env
 
 
@@ -84,6 +119,7 @@ class Config:
     workdir: Path
     image_summary: ImageSummaryConfig
     http_intake: HttpIntakeConfig
+    metrics: MetricsConfig
     fuel: FuelConfig
     owntracks_topic_id: int
     owntracks_user_tags_path: Path
@@ -163,6 +199,7 @@ def load_config() -> Config:
         workdir=workdir,
         image_summary=build_image_summary_config(image_summary_env, int(chat_id or "0")),
         http_intake=build_http_config(image_summary_env),
+        metrics=build_metrics_config(image_summary_env),
         fuel=build_fuel_config(image_summary_env, int(chat_id or "0")),
         owntracks_topic_id=int(first_value(["OWNTRACKS_TOPIC_ID"], local_env) or "0"),
         owntracks_user_tags_path=owntracks_project_path(
@@ -493,6 +530,7 @@ def message_debug_line(update: Update) -> str:
 
 
 async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    observe_update(update)
     config: Config = context.application.bot_data["config"]
     if config.image_summary.debug_updates:
         await asyncio.to_thread(image_summary_log, config.image_summary, f"debug {message_debug_line(update)}")
@@ -542,17 +580,26 @@ def image_suffix(update: Update) -> str:
 
 
 async def download_image(update: Update, target: Path) -> None:
+    start = time.monotonic()
+    kind = "image"
     message = update.effective_message
-    if not message:
-        raise RuntimeError("No message to download")
-    if message.photo:
-        telegram_file = await message.photo[-1].get_file()
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
-        telegram_file = await message.document.get_file()
-    else:
-        raise RuntimeError("Message does not contain a supported image")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    await telegram_file.download_to_drive(custom_path=target)
+    try:
+        if not message:
+            raise RuntimeError("No message to download")
+        if message.photo:
+            kind = "photo"
+            telegram_file = await message.photo[-1].get_file()
+        elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+            kind = "document_image"
+            telegram_file = await message.document.get_file()
+        else:
+            raise RuntimeError("Message does not contain a supported image")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await telegram_file.download_to_drive(custom_path=target)
+        observe_download(kind, start, "success")
+    except Exception as exc:
+        observe_download(kind, start, "error", exc)
+        raise
 
 
 async def reply_chunked(update: Update, text: str, max_chars: int) -> None:
@@ -564,14 +611,18 @@ async def reply_chunked(update: Update, text: str, max_chars: int) -> None:
         if len(chunks) > 1:
             chunk = f"({index + 1}/{len(chunks)})\n{chunk}"
         await message.reply_text(chunk)
+        REPLIES_TOTAL.labels(kind="text").inc()
 
 
 async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     summary_config = config.image_summary
     message = update.effective_message
     if not message or not is_image_summary_target(update, config):
         return
+    handler_result = "success"
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     target = summary_config.work_dir / "images" / f"{stamp}-msg{message.message_id}{image_suffix(update)}"
@@ -588,8 +639,11 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"downloaded message_id={message.message_id} path={target} bytes={target.stat().st_size}",
         )
     except Exception as exc:
+        handler_result = "download_error"
         image_summary_log(summary_config, f"download_failed message_id={message.message_id} error={exc}")
         await message.reply_text(f"Failed to download image: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("image_summary", handler_start, handler_result)
         return
 
     stop_event = asyncio.Event()
@@ -602,27 +656,46 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             image_summary_log(summary_config, f"image_result_started message_id={message.message_id} label={label!r}")
             result = await asyncio.to_thread(job)
             results.append(result)
+            job_result = "success" if result["ok"] else "error"
+            IMAGE_JOBS_TOTAL.labels(mode=summary_config.summary_mode, label=label, result=job_result).inc()
+            IMAGE_JOB_DURATION_SECONDS.labels(mode=summary_config.summary_mode, label=label).observe(result["seconds"])
+            if not result["ok"]:
+                HANDLER_ERRORS_TOTAL.labels(handler="image_summary_job", error_type="job_error").inc()
             image_summary_log(
                 summary_config,
                 f"image_result_finished message_id={message.message_id} "
                 f"label={label!r} ok={result['ok']} seconds={result['seconds']:.1f}",
+            )
+            IMAGE_REPLY_CHUNKS_TOTAL.labels(mode=summary_config.summary_mode).inc(
+                len(split_message(build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars))
             )
             await reply_chunked(update, build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars)
 
         image_summary_log(summary_config, f"image_comparison_started message_id={message.message_id}")
         comparison = await asyncio.to_thread(compare_ollama_to_codex, results, summary_config)
         if comparison:
+            comparison_result = "success" if comparison["ok"] else "error"
+            IMAGE_JOBS_TOTAL.labels(mode="comparison", label=comparison["label"], result=comparison_result).inc()
+            IMAGE_JOB_DURATION_SECONDS.labels(mode="comparison", label=comparison["label"]).observe(comparison["seconds"])
             image_summary_log(
                 summary_config,
                 f"image_comparison_finished message_id={message.message_id} "
                 f"ok={comparison['ok']} seconds={comparison['seconds']:.1f}",
             )
+            IMAGE_REPLY_CHUNKS_TOTAL.labels(mode="comparison").inc(
+                len(split_message(build_result_reply(comparison, "comparison"), summary_config.max_reply_chars))
+            )
             await reply_chunked(update, build_result_reply(comparison, "comparison"), summary_config.max_reply_chars)
         else:
             image_summary_log(summary_config, f"image_comparison_skipped message_id={message.message_id}")
+    except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("image_summary", exc)
+        raise
     finally:
         stop_event.set()
         await typing_task
+        observe_handler("image_summary", handler_start, handler_result)
 
     image_summary_log(summary_config, f"replied message_id={message.message_id}")
 
@@ -705,38 +778,50 @@ async def process_fuel_pending(
     typing_task = asyncio.create_task(
         typing_loop(context, config.image_summary, config.fuel.chat_id, config.fuel.topic_id, stop_event)
     )
+    extraction_start = time.monotonic()
     try:
         extracted = await asyncio.to_thread(extract_fuel_fields, pending.image_paths, config.fuel)
         row = build_fuel_row(extracted, config.fuel, pending.image_paths, pending.message_ids)
         approval = make_approval(row, pending.image_paths, pending.message_ids)
         approvals: dict[str, FuelApproval] = context.application.bot_data["fuel_approvals"]
         approvals[approval.approval_id] = approval
+        FUEL_PENDING_APPROVALS.set(len(approvals))
         await context.bot.send_message(
             chat_id=config.fuel.chat_id,
             message_thread_id=config.fuel.topic_id,
             text=format_approval(row, config.fuel, approval.approval_id),
             reply_markup=fuel_approval_keyboard(approval.approval_id),
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
+        FUEL_EXTRACTIONS_TOTAL.labels(result="success").inc()
+        FUEL_EXTRACTION_DURATION_SECONDS.labels(result="success").observe(time.monotonic() - extraction_start)
         image_summary_log(config.image_summary, f"fuel_approval_sent id={approval.approval_id}")
     except Exception as exc:
+        FUEL_EXTRACTIONS_TOTAL.labels(result="error").inc()
+        FUEL_EXTRACTION_DURATION_SECONDS.labels(result="error").observe(time.monotonic() - extraction_start)
+        observe_handler_error("fuel_extraction", exc)
         image_summary_log(config.image_summary, f"fuel_processing_failed key={key} error={exc}")
         await context.bot.send_message(
             chat_id=config.fuel.chat_id,
             message_thread_id=config.fuel.topic_id,
             text=f"Fuel extraction failed: {exc}",
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
     finally:
         stop_event.set()
         await typing_task
 
 
 async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
     if not message or not is_fuel_target(update, config):
         return
     if not await fuel_guarded(update, config):
         return
+    handler_result = "success"
 
     key = fuel_group_key(message)
     pending_by_key: dict[str, FuelPending] = context.application.bot_data.setdefault("fuel_pending", {})
@@ -748,10 +833,18 @@ async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     target = config.fuel.work_dir / "images" / f"{stamp}-msg{message.message_id}{image_suffix(update)}"
-    await download_image(update, target)
+    try:
+        await download_image(update, target)
+    except Exception as exc:
+        handler_result = "download_error"
+        FUEL_IMAGES_TOTAL.labels(result="error").inc()
+        observe_handler_error("fuel_image", exc)
+        observe_handler("fuel_image", handler_start, handler_result)
+        raise
     pending.updated_at = now
     pending.message_ids.append(message.message_id)
     pending.image_paths.append(target)
+    FUEL_IMAGES_TOTAL.labels(result="success").inc()
     image_summary_log(
         config.image_summary,
         f"fuel_image_received key={key} message_id={message.message_id} path={target}",
@@ -764,9 +857,13 @@ async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(
         f"Received fuel image {len(pending.image_paths)}. Waiting briefly for the matching receipt/odometer image."
     )
+    REPLIES_TOTAL.labels(kind="text").inc()
+    observe_handler("fuel_image", handler_start, handler_result)
 
 
 async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     query = update.callback_query
     if not query or not query.data:
@@ -777,10 +874,13 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not await fuel_guarded(update, config):
         return
     action, approval_id = parts[1], parts[2]
+    handler_result = "success"
     approvals: dict[str, FuelApproval] = context.application.bot_data.setdefault("fuel_approvals", {})
     approval = approvals.get(approval_id)
     if not approval:
         await query.answer("Approval expired or unknown.", show_alert=True)
+        FUEL_APPROVALS_TOTAL.labels(action="unknown").inc()
+        observe_handler("fuel_callback", handler_start, "unknown_approval")
         return
 
     if action == "correction":
@@ -797,6 +897,7 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         expires_at = asyncio.get_running_loop().time() + config.fuel.correction_window_seconds
         pending_corrections[key] = (approval_id, expires_at)
         await query.answer("Send the correction values now.")
+        FUEL_APPROVALS_TOTAL.labels(action="correction").inc()
         await context.bot.send_message(
             chat_id=config.fuel.chat_id,
             message_thread_id=config.fuel.topic_id,
@@ -806,13 +907,24 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 "`odo=71234,vol=43,rate=112.0,amt=4533.20`"
             ),
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
         image_summary_log(config.image_summary, f"fuel_correction_started id={approval_id} user_id={user.id}")
+        observe_handler("fuel_callback", handler_start, handler_result)
         return
 
     if action in {"approve", "full", "partial"}:
         row = apply_fill_type(approval.row, is_full=action != "partial")
-        await asyncio.to_thread(append_fuel_row, row, config.fuel)
+        try:
+            await asyncio.to_thread(append_fuel_row, row, config.fuel)
+            FUEL_CSV_APPENDS_TOTAL.labels(result="success").inc()
+        except Exception as exc:
+            handler_result = "error"
+            FUEL_CSV_APPENDS_TOTAL.labels(result="error").inc()
+            observe_handler_error("fuel_callback", exc)
+            observe_handler("fuel_callback", handler_start, handler_result)
+            raise
         approvals.pop(approval_id, None)
+        FUEL_PENDING_APPROVALS.set(len(approvals))
         pending_corrections: dict[str, tuple[str, float]] = context.application.bot_data.setdefault(
             "fuel_correction_pending",
             {},
@@ -825,15 +937,19 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"Approved as {fill_label} and appended fuel entry to `{config.fuel.csv_path}`.\n\n"
             + format_approval(row, config.fuel, approval.approval_id)
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
         await query.answer(f"Fuel entry saved as {fill_label}.")
+        FUEL_APPROVALS_TOTAL.labels(action="partial" if action == "partial" else "full").inc()
         image_summary_log(
             config.image_summary,
             f"fuel_approved id={approval_id} fill={fill_label!r} csv={config.fuel.csv_path}",
         )
+        observe_handler("fuel_callback", handler_start, handler_result)
         return
 
     if action == "reject":
         approvals.pop(approval_id, None)
+        FUEL_PENDING_APPROVALS.set(len(approvals))
         pending_corrections: dict[str, tuple[str, float]] = context.application.bot_data.setdefault(
             "fuel_correction_pending",
             {},
@@ -842,11 +958,16 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             if value[0] == approval_id:
                 pending_corrections.pop(key, None)
         await query.edit_message_text(f"Rejected fuel entry `{approval_id}`. CSV was not updated.")
+        REPLIES_TOTAL.labels(kind="text").inc()
         await query.answer("Fuel entry rejected.")
+        FUEL_APPROVALS_TOTAL.labels(action="reject").inc()
         image_summary_log(config.image_summary, f"fuel_rejected id={approval_id}")
+        observe_handler("fuel_callback", handler_start, handler_result)
 
 
 async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
     if not message or not is_fuel_target(update, config):
@@ -872,6 +993,9 @@ async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_
     approval = approvals.get(approval_id)
     if not approval:
         await message.reply_text("That fuel approval is no longer pending.")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        FUEL_CORRECTIONS_TOTAL.labels(result="unknown_approval").inc()
+        observe_handler("fuel_correction", handler_start, "unknown_approval")
         return
 
     corrections = parse_corrections(raw_text)
@@ -880,8 +1004,12 @@ async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_
             await message.reply_text(
                 "Correction not recognized. Use `odo=71234,vol=43,rate=112.0,amt=4533.20`."
             )
+            REPLIES_TOTAL.labels(kind="text").inc()
+            FUEL_CORRECTIONS_TOTAL.labels(result="parse_error").inc()
+            observe_handler("fuel_correction", handler_start, "parse_error")
         return
 
+    handler_result = "success"
     updated_row = apply_corrections(approval.row, corrections, config.fuel)
     updated_approval = FuelApproval(
         approval_id=approval.approval_id,
@@ -898,10 +1026,15 @@ async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_
         + format_approval(updated_row, config.fuel, approval_id),
         reply_markup=fuel_approval_keyboard(approval_id),
     )
+    REPLIES_TOTAL.labels(kind="text").inc()
+    FUEL_CORRECTIONS_TOTAL.labels(result="success").inc()
+    observe_handler("fuel_correction", handler_start, handler_result)
     image_summary_log(config.image_summary, f"fuel_correction_applied id={approval_id} fields={list(corrections)}")
 
 
 async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     summary_config = config.image_summary
     message = update.effective_message
@@ -919,13 +1052,16 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not raw_text:
         return
 
+    handler_result = "success"
     image_summary_log(summary_config, f"memory_processing {message_debug_line(update)} chars={len(raw_text)}")
     await message.reply_text("Received text. Extracting key information and saving it as a memory.")
+    REPLIES_TOTAL.labels(kind="text").inc()
 
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(
         typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
     )
+    extraction_start = time.monotonic()
     try:
         saved = await asyncio.to_thread(
             save_memory,
@@ -938,15 +1074,26 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "telegram_date": message.date.isoformat() if message.date else None,
             },
         )
+        MEMORY_EXTRACTIONS_TOTAL.labels(result="success").inc()
+        MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="success").observe(time.monotonic() - extraction_start)
+    except Exception as exc:
+        handler_result = "error"
+        MEMORY_EXTRACTIONS_TOTAL.labels(result="error").inc()
+        MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="error").observe(time.monotonic() - extraction_start)
+        observe_handler_error("memory_extraction", exc)
+        raise
     finally:
         stop_event.set()
         await typing_task
+        observe_handler("memory_extraction", handler_start, handler_result)
 
     reply = f"Saved memory: `{saved.path}`\n\n{saved.content}"
     await reply_chunked(update, reply, summary_config.max_reply_chars)
 
 
 async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> None:
+    query_start = time.monotonic()
+    query_result = "success"
     config: Config = context.application.bot_data["config"]
     summary_config = config.image_summary
     message = update.effective_message
@@ -956,10 +1103,12 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     question = question.strip()
     if not question:
         await message.reply_text("Ask with `/memq your question` or `? your question`.")
+        REPLIES_TOTAL.labels(kind="text").inc()
         return
 
     image_summary_log(summary_config, f"memory_query question={question!r}")
     await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
+    REPLIES_TOTAL.labels(kind="text").inc()
 
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(
@@ -967,9 +1116,16 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     try:
         result = await asyncio.to_thread(answer_memory_question, question, summary_config)
+        MEMORY_QUERY_CONTEXT_CHARS.observe(sum(path.stat().st_size for path in result.context_paths if path.exists()))
+        if not result.context_paths:
+            query_result = "no_match"
     finally:
         stop_event.set()
         await typing_task
+    MEMORY_QUERIES_TOTAL.labels(result=query_result).inc()
+    MEMORY_QUERY_DURATION_SECONDS.labels(model=summary_config.memory_query_model, result=query_result).observe(
+        time.monotonic() - query_start
+    )
 
     sources = "\n".join(f"- {path.name}" for path in result.context_paths)
     reply = result.answer
@@ -979,6 +1135,8 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def memory_query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
     if not message or not is_image_summary_target(update, config):
@@ -987,10 +1145,24 @@ async def memory_query_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if not await allowed_user_guard(update, config):
         return
-    await answer_memory_query(update, context, " ".join(context.args or []))
+    handler_result = "success"
+    try:
+        await answer_memory_query(update, context, " ".join(context.args or []))
+    except Exception as exc:
+        handler_result = "error"
+        MEMORY_QUERIES_TOTAL.labels(result="error").inc()
+        MEMORY_QUERY_DURATION_SECONDS.labels(model=config.image_summary.memory_query_model, result="error").observe(
+            time.monotonic() - handler_start
+        )
+        observe_handler_error("memory_query", exc)
+        raise
+    finally:
+        observe_handler("memory_query", handler_start, handler_result)
 
 
 async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.application.bot_data["config"]
     message = update.effective_message
     if not message or not is_image_summary_target(update, config):
@@ -1004,7 +1176,19 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
     match = re.match(r"^(?:\?|q:|query:)\s*(.+)$", raw_text, re.IGNORECASE | re.DOTALL)
     if not match:
         return
-    await answer_memory_query(update, context, match.group(1))
+    handler_result = "success"
+    try:
+        await answer_memory_query(update, context, match.group(1))
+    except Exception as exc:
+        handler_result = "error"
+        MEMORY_QUERIES_TOTAL.labels(result="error").inc()
+        MEMORY_QUERY_DURATION_SECONDS.labels(model=config.image_summary.memory_query_model, result="error").observe(
+            time.monotonic() - handler_start
+        )
+        observe_handler_error("memory_query", exc)
+        raise
+    finally:
+        observe_handler("memory_query", handler_start, handler_result)
 
 
 async def command_shortcuts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1017,6 +1201,8 @@ async def command_shortcuts_command(update: Update, context: ContextTypes.DEFAUL
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config | None = context.application.bot_data.get("config")
+    if context.error:
+        HANDLER_ERRORS_TOTAL.labels(handler="telegram_error_handler", error_type=metrics_error_type(context.error)).inc()
     if config:
         await asyncio.to_thread(
             image_summary_log,
@@ -1142,18 +1328,37 @@ async def owntracks_guarded(update: Update, config: Config) -> bool:
 
 
 async def owntracks_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     date_text = context.args[0] if context.args else "today"
+    digest_start = time.monotonic()
     try:
         plan, digest, _path = await asyncio.to_thread(generate_owntracks_digest, date_text)
     except Exception as exc:
+        handler_result = "error"
+        OWNTRACKS_DIGEST_TOTAL.labels(scope=date_text, result="error").inc()
+        OWNTRACKS_DIGEST_DURATION_SECONDS.labels(scope=date_text, result="error").observe(
+            time.monotonic() - digest_start
+        )
+        observe_handler_error("owntracks_digest", exc)
         await update.effective_message.reply_text(f"Could not generate OwnTracks digest: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_digest", handler_start, handler_result)
         return
+    observe_plan(plan)
+    OWNTRACKS_DIGEST_TOTAL.labels(scope=plan["date"], result="success").inc()
+    OWNTRACKS_DIGEST_DURATION_SECONDS.labels(scope=plan["date"], result="success").observe(
+        time.monotonic() - digest_start
+    )
     remember_owntracks_date(update, context, plan["date"])
     for chunk in split_message(digest, 3600):
         await update.effective_message.reply_text(chunk, disable_web_page_preview=False)
+        REPLIES_TOTAL.labels(kind="text").inc()
+    observe_handler("owntracks_digest", handler_start, handler_result)
 
 
 def owntracks_map_url(config: Config, date_text: str, filter_text: str | None = None) -> str:
@@ -1183,14 +1388,29 @@ def remembered_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT
 
 
 async def send_owntracks_embedded_map(update: Update, context: ContextTypes.DEFAULT_TYPE, scope_text: str) -> None:
+    map_start = time.monotonic()
     try:
         summary, _html, map_path = await asyncio.to_thread(generate_owntracks_visualization, scope_text)
     except Exception as exc:
+        OWNTRACKS_MAP_TOTAL.labels(scope=scope_text, delivery="embedded", result="error").inc()
+        OWNTRACKS_MAP_DURATION_SECONDS.labels(scope=scope_text, delivery="embedded", result="error").observe(
+            time.monotonic() - map_start
+        )
+        observe_handler_error("owntracks_embedded_map", exc)
         await update.effective_message.reply_text(f"Could not generate OwnTracks embedded map: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
         return
     if not map_path.exists():
+        OWNTRACKS_MAP_TOTAL.labels(scope=summary["scope"]["value"], delivery="embedded", result="missing_file").inc()
+        OWNTRACKS_MAP_DURATION_SECONDS.labels(
+            scope=summary["scope"]["value"],
+            delivery="embedded",
+            result="missing_file",
+        ).observe(time.monotonic() - map_start)
         await update.effective_message.reply_text(f"OwnTracks embedded map was not written: {map_path}")
+        REPLIES_TOTAL.labels(kind="text").inc()
         return
+    observe_plan(summary)
     remember_owntracks_map_scope(update, context, summary["scope"]["value"])
     caption_kind = "heatmap" if summary["scope"]["kind"] != "day" else "map"
     caption = f"OwnTracks embedded {caption_kind} for {summary['scope']['value']}."
@@ -1200,16 +1420,28 @@ async def send_owntracks_embedded_map(update: Update, context: ContextTypes.DEFA
             filename=map_path.name,
             caption=caption,
         )
+    REPLIES_TOTAL.labels(kind="document").inc()
+    OWNTRACKS_MAP_TOTAL.labels(scope=summary["scope"]["value"], delivery="embedded", result="success").inc()
+    OWNTRACKS_MAP_DURATION_SECONDS.labels(
+        scope=summary["scope"]["value"],
+        delivery="embedded",
+        result="success",
+    ).observe(time.monotonic() - map_start)
 
 
 async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     if context.args:
         scope_text = context.args[0]
         if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
             await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            observe_handler("owntracks_map", handler_start, "bad_request")
             return
         filter_text = " ".join(context.args[1:]).strip()
     else:
@@ -1218,13 +1450,24 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
     if config.owntracks_map_delivery == "hosted":
         if not config.http_intake.enabled:
             await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY=hosted requires HTTP_INTAKE_ENABLED=true.")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            observe_handler("owntracks_map", handler_start, "bad_config")
             return
+        map_start = time.monotonic()
         try:
             owntracks_env = load_owntracks_env()
             owntracks_tz = ZoneInfo(owntracks_env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
             resolved_scope = owntracks_target_scope_from_text(scope_text, owntracks_tz)
         except Exception as exc:
+            handler_result = "error"
+            OWNTRACKS_MAP_TOTAL.labels(scope=scope_text, delivery="hosted", result="error").inc()
+            OWNTRACKS_MAP_DURATION_SECONDS.labels(scope=scope_text, delivery="hosted", result="error").observe(
+                time.monotonic() - map_start
+            )
+            observe_handler_error("owntracks_map", exc)
             await update.effective_message.reply_text(f"Could not resolve OwnTracks map scope: {exc}")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            observe_handler("owntracks_map", handler_start, handler_result)
             return
         remember_owntracks_map_scope(update, context, resolved_scope.value)
         url = owntracks_map_url(config, resolved_scope.value, filter_text or None)
@@ -1232,25 +1475,42 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
             f"OwnTracks {resolved_scope.kind} visualization for {resolved_scope.value}:\n{url}",
             disable_web_page_preview=True,
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_MAP_TOTAL.labels(scope=resolved_scope.value, delivery="hosted_link", result="success").inc()
+        OWNTRACKS_MAP_DURATION_SECONDS.labels(
+            scope=resolved_scope.value,
+            delivery="hosted_link",
+            result="success",
+        ).observe(time.monotonic() - map_start)
+        observe_handler("owntracks_map", handler_start, handler_result)
         return
     if config.owntracks_map_delivery not in {"file", "html", "attachment"}:
         await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY must be 'file' or 'hosted'.")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_map", handler_start, "bad_config")
         return
     await send_owntracks_embedded_map(update, context, scope_text)
+    observe_handler("owntracks_map", handler_start, handler_result)
 
 
 async def owntracks_embedded_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     if context.args:
         scope_text = context.args[0]
         if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
             await update.effective_message.reply_text(f"Usage: /otme [{OWNTRACKS_MAP_SCOPE_USAGE}]")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            observe_handler("owntracks_embedded_map", handler_start, "bad_request")
             return
     else:
         scope_text = remembered_owntracks_map_scope(update, context) or "today"
     await send_owntracks_embedded_map(update, context, scope_text)
+    observe_handler("owntracks_embedded_map", handler_start, handler_result)
 
 
 def owntracks_session_key(update: Update) -> str:
@@ -1323,9 +1583,12 @@ def parse_owntracks_review_line(line: str) -> tuple[str, dict]:
 
 
 async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     message = update.effective_message
     if not message or not message.text:
         return
@@ -1347,11 +1610,18 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
             f"Usage:\n/otb {OWNTRACKS_DATE_USAGE}\n"
             "s1 Place name | tags: tag1 tag2 | note: what happened"
         )
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_reviews", handler_start, "bad_request")
         return
     try:
         plan, _digest, _path = await asyncio.to_thread(generate_owntracks_digest, date_text)
     except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("owntracks_stop_reviews", exc)
         await message.reply_text(f"Could not load OwnTracks stops: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="bulk", result="error").inc()
+        observe_handler("owntracks_stop_reviews", handler_start, handler_result)
         return
     stops_by_ref = {
         ref: stop
@@ -1377,6 +1647,9 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
         updates.append((stop, review_update))
     if not updates:
         await message.reply_text("No reviews saved. " + "; ".join(errors[:5]))
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="bulk", result="validation_error").inc()
+        observe_handler("owntracks_stop_reviews", handler_start, "validation_error")
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
@@ -1397,25 +1670,40 @@ async def owntracks_names_command(update: Update, context: ContextTypes.DEFAULT_
     if errors:
         summary += f"\nSkipped: {'; '.join(errors[:5])}"
     await message.reply_text(summary)
+    REPLIES_TOTAL.labels(kind="text").inc()
+    OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="bulk", result="success").inc(len(updates))
+    observe_handler("owntracks_stop_reviews", handler_start, handler_result)
 
 
 async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     date_text, args, error = owntracks_date_and_args(update, context, min_tail=2)
     if error:
         await update.effective_message.reply_text(error)
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_tag", handler_start, "bad_request")
         return
     if len(args) < 2 or not date_text:
         await update.effective_message.reply_text(f"Usage: /ott s1 tag1 tag2 or /ott {OWNTRACKS_DATE_USAGE} s1 tag1 tag2")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_tag", handler_start, "bad_request")
         return
     stop_ref = args[0]
     tags = args[1:]
     try:
         stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("owntracks_stop_tag", exc)
         await update.effective_message.reply_text(str(exc))
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="tag", result="error").inc()
+        observe_handler("owntracks_stop_tag", handler_start, handler_result)
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
@@ -1429,25 +1717,40 @@ async def owntracks_tag_command(update: Update, context: ContextTypes.DEFAULT_TY
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, target_date)
     await update.effective_message.reply_text(f"Saved tags for {target_date} {stop_id}: {', '.join(existing)}")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="tag", result="success").inc()
+    observe_handler("owntracks_stop_tag", handler_start, handler_result)
 
 
 async def owntracks_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     date_text, args, error = owntracks_date_and_args(update, context, min_tail=2)
     if error:
         await update.effective_message.reply_text(error)
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_name", handler_start, "bad_request")
         return
     if len(args) < 2 or not date_text:
         await update.effective_message.reply_text(f"Usage: /otn s1 place name or /otn {OWNTRACKS_DATE_USAGE} s1 place name")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_name", handler_start, "bad_request")
         return
     stop_ref = args[0]
     name = " ".join(args[1:])
     try:
         stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("owntracks_stop_name", exc)
         await update.effective_message.reply_text(str(exc))
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="name", result="error").inc()
+        observe_handler("owntracks_stop_name", handler_start, handler_result)
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
@@ -1458,25 +1761,40 @@ async def owntracks_name_command(update: Update, context: ContextTypes.DEFAULT_T
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, target_date)
     await update.effective_message.reply_text(f"Saved name for {target_date} {stop_id}: {name}")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="name", result="success").inc()
+    observe_handler("owntracks_stop_name", handler_start, handler_result)
 
 
 async def owntracks_note_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
     config: Config = context.bot_data["config"]
     if not await owntracks_guarded(update, config):
         return
+    handler_result = "success"
     date_text, args, error = owntracks_date_and_args(update, context, min_tail=2)
     if error:
         await update.effective_message.reply_text(error)
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_note", handler_start, "bad_request")
         return
     if len(args) < 2 or not date_text:
         await update.effective_message.reply_text(f"Usage: /oto s1 what happened or /oto {OWNTRACKS_DATE_USAGE} s1 what happened")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("owntracks_stop_note", handler_start, "bad_request")
         return
     stop_ref = args[0]
     note = " ".join(args[1:])
     try:
         stop, target_date = await asyncio.to_thread(resolve_owntracks_stop, date_text, stop_ref)
     except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("owntracks_stop_note", exc)
         await update.effective_message.reply_text(str(exc))
+        REPLIES_TOTAL.labels(kind="text").inc()
+        OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="note", result="error").inc()
+        observe_handler("owntracks_stop_note", handler_start, handler_result)
         return
     tags_path = config.owntracks_user_tags_path
     data = load_owntracks_user_tags(tags_path)
@@ -1487,6 +1805,9 @@ async def owntracks_note_command(update: Update, context: ContextTypes.DEFAULT_T
     save_owntracks_user_tags(tags_path, data)
     remember_owntracks_date(update, context, target_date)
     await update.effective_message.reply_text(f"Saved note for {target_date} {stop_id}.")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    OWNTRACKS_STOP_REVIEWS_TOTAL.labels(action="note", result="success").inc()
+    observe_handler("owntracks_stop_note", handler_start, handler_result)
 
 
 async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1508,6 +1829,15 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
+    set_config_enabled(
+        image_summary=bool(config.image_summary.topic_id),
+        memory=bool(config.image_summary.memory_dir),
+        fuel=config.fuel.enabled,
+        http_intake=config.http_intake.enabled,
+        owntracks=bool(config.owntracks_topic_id),
+    )
+    set_memory_files_gauge(config.image_summary.memory_dir)
+    FUEL_PENDING_APPROVALS.set(len(application.bot_data.get("fuel_approvals", {})))
     commands = [BotCommand(name, description) for name, description in COMMAND_SHORTCUTS]
     await application.bot.set_my_commands(
         commands,
@@ -1517,9 +1847,16 @@ async def post_init(application: Application) -> None:
         application,
         config.image_summary,
         config.http_intake,
+        config.metrics,
         asyncio.get_running_loop(),
     )
     application.bot_data["http_intake_server"] = server
+    if config.metrics.enabled and not config.http_intake.enabled:
+        start_standalone_metrics_server(config.metrics)
+        image_summary_log(
+            config.image_summary,
+            f"prometheus_metrics_started host={config.metrics.host} port={config.metrics.port}",
+        )
 
 
 def main() -> None:

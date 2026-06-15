@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "openai-codex>=0.1.0b3",
+    "prometheus-client>=0.22.0",
     "python-telegram-bot==22.1",
     "requests>=2.31.0",
 ]

@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,14 @@ from telegram.ext import Application
 
 from image_summary import ImageSummaryConfig, log, split_message
 from memory_processor import save_memory
+from metrics import (
+    HTTP_MEMORY_POSTS_TOTAL,
+    MetricsConfig,
+    metrics_response,
+    observe_handler_error,
+    observe_http_auth_failure,
+    observe_http_request,
+)
 from owntracks.digest import generate_hosted_map, generate_sample_heatmap
 
 
@@ -96,113 +105,151 @@ def make_handler(
     application: Application,
     cfg: ImageSummaryConfig,
     http_cfg: HttpIntakeConfig,
+    metrics_cfg: MetricsConfig,
     loop: asyncio.AbstractEventLoop,
 ) -> type[BaseHTTPRequestHandler]:
     class IntakeHandler(BaseHTTPRequestHandler):
         server_version = "TelegramControlIntake/0.1"
 
+        def send_response(self, code: int, message: str | None = None) -> None:
+            self._metrics_status = code
+            super().send_response(code, message)
+
         def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/health":
-                write_json(self, HTTPStatus.OK, {"ok": True})
-                return
-            if parsed.path == "/fuel.csv":
-                path = Path(http_cfg.fuel_csv_path)
-                if not path.exists():
-                    self.send_response(HTTPStatus.NOT_FOUND.value)
+            start = time.monotonic()
+            try:
+                parsed = urlparse(self.path)
+                if parsed.path == "/metrics":
+                    if not metrics_cfg.enabled:
+                        write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                        return
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    status, content_type, body = metrics_response()
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
+                    self.wfile.write(body)
                     return
-                body = path.read_bytes()
-                self.send_response(HTTPStatus.OK.value)
-                self.send_header("Content-Type", "text/csv; charset=utf-8")
-                self.send_header("Content-Disposition", 'attachment; filename="fuel.csv"')
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if parsed.path in {"/owntracks/sample", "/owntracks/sample.html"}:
-                if not authorized(self, http_cfg.token):
-                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                if parsed.path == "/health":
+                    write_json(self, HTTPStatus.OK, {"ok": True})
                     return
-                try:
-                    _summary, html = generate_sample_heatmap()
-                except Exception as exc:
-                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                if parsed.path == "/fuel.csv":
+                    path = Path(http_cfg.fuel_csv_path)
+                    if not path.exists():
+                        self.send_response(HTTPStatus.NOT_FOUND.value)
+                        self.end_headers()
+                        return
+                    body = path.read_bytes()
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/csv; charset=utf-8")
+                    self.send_header("Content-Disposition", 'attachment; filename="fuel.csv"')
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
-                body = html.encode("utf-8")
-                self.send_response(HTTPStatus.OK.value)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            match = parsed.path.removeprefix("/owntracks/map/").removesuffix(".html")
-            if parsed.path.startswith("/owntracks/map/") and match:
-                if not authorized(self, http_cfg.token):
-                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                if parsed.path in {"/owntracks/sample", "/owntracks/sample.html"}:
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        _summary, html = generate_sample_heatmap()
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_sample", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                        return
+                    body = html.encode("utf-8")
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
-                if not re.fullmatch(r"\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?", match):
-                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid scope"})
+                match = parsed.path.removeprefix("/owntracks/map/").removesuffix(".html")
+                if parsed.path.startswith("/owntracks/map/") and match:
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    if not re.fullmatch(r"\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?", match):
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid scope"})
+                        return
+                    try:
+                        _plan, html = generate_hosted_map(match)
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_map", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                        return
+                    body = html.encode("utf-8")
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
-                try:
-                    _plan, html = generate_hosted_map(match)
-                except Exception as exc:
-                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
-                    return
-                body = html.encode("utf-8")
-                self.send_response(HTTPStatus.OK.value)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            finally:
+                observe_http_request("GET", self.path, getattr(self, "_metrics_status", 500), start)
 
         def do_POST(self) -> None:
-            if self.path != "/memory":
-                write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
-                return
-            if not authorized(self, http_cfg.token):
-                write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
-                return
-
+            start = time.monotonic()
             try:
-                data = read_json(self)
-                text = str(data.get("text") or "").strip()
-                if not text:
-                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing text"})
+                parsed = urlparse(self.path)
+                if parsed.path != "/memory":
+                    write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                    return
+                if not authorized(self, http_cfg.token):
+                    observe_http_auth_failure(self.path)
+                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
                     return
 
-                saved = save_memory(
-                    text,
-                    cfg,
-                    {
-                        "source": data.get("source", "http_intake"),
-                        "client": self.client_address[0],
-                        "title": data.get("title"),
-                    },
-                )
-                if http_cfg.notify_telegram:
-                    future = asyncio.run_coroutine_threadsafe(
-                        send_telegram_confirmation(application, cfg, str(saved.path), saved.content),
-                        loop,
-                    )
-                    future.result(timeout=30)
+                try:
+                    data = read_json(self)
+                    text = str(data.get("text") or "").strip()
+                    if not text:
+                        HTTP_MEMORY_POSTS_TOTAL.labels(result="bad_request").inc()
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing text"})
+                        return
 
-                write_json(
-                    self,
-                    HTTPStatus.OK,
-                    {
-                        "ok": True,
-                        "path": str(saved.path),
-                        "content": saved.content,
-                    },
-                )
-            except Exception as exc:
-                log(cfg, f"http_intake_failed error={exc}")
-                write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    saved = save_memory(
+                        text,
+                        cfg,
+                        {
+                            "source": data.get("source", "http_intake"),
+                            "client": self.client_address[0],
+                            "title": data.get("title"),
+                        },
+                    )
+                    if http_cfg.notify_telegram:
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_telegram_confirmation(application, cfg, str(saved.path), saved.content),
+                            loop,
+                        )
+                        future.result(timeout=30)
+
+                    HTTP_MEMORY_POSTS_TOTAL.labels(result="success").inc()
+                    write_json(
+                        self,
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "path": str(saved.path),
+                            "content": saved.content,
+                        },
+                    )
+                except Exception as exc:
+                    HTTP_MEMORY_POSTS_TOTAL.labels(result="error").inc()
+                    observe_handler_error("http_memory", exc)
+                    log(cfg, f"http_intake_failed error={exc}")
+                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            finally:
+                observe_http_request("POST", self.path, getattr(self, "_metrics_status", 500), start)
 
         def log_message(self, format: str, *args: Any) -> None:
             log(cfg, "http_intake " + format % args)
@@ -214,13 +261,14 @@ def start_http_intake(
     application: Application,
     cfg: ImageSummaryConfig,
     http_cfg: HttpIntakeConfig,
+    metrics_cfg: MetricsConfig,
     loop: asyncio.AbstractEventLoop,
 ) -> ThreadingHTTPServer | None:
     if not http_cfg.enabled:
         return None
     server = ThreadingHTTPServer(
         (http_cfg.host, http_cfg.port),
-        make_handler(application, cfg, http_cfg, loop),
+        make_handler(application, cfg, http_cfg, metrics_cfg, loop),
     )
     thread = threading.Thread(target=server.serve_forever, name="http-intake", daemon=True)
     thread.start()

@@ -14,6 +14,7 @@ from typing import Any, Callable
 import requests
 
 from codex_llm import CodexLlmConfig, ask_codex_image, ask_codex_text, build_codex_llm_config
+from metrics import OCR_CHARS_TOTAL, OLLAMA_REQUEST_DURATION_SECONDS, OLLAMA_REQUESTS_TOTAL, error_type
 
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -213,7 +214,9 @@ def run_ocr(image_path: Path, cfg: ImageSummaryConfig) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "OCR failed")
-    return result.stdout.strip()
+    text = result.stdout.strip()
+    OCR_CHARS_TOTAL.inc(len(text))
+    return text
 
 
 def ollama_chat(
@@ -221,18 +224,27 @@ def ollama_chat(
     model: str,
     prompt: str,
     images: list[Path] | None = None,
+    purpose: str = "general",
 ) -> str:
+    start = time.monotonic()
     message: dict[str, Any] = {"role": "user", "content": prompt}
     if images:
         message["images"] = [base64.b64encode(path.read_bytes()).decode("ascii") for path in images]
-    resp = requests.post(
-        f"{cfg.ollama_url}/api/chat",
-        json={"model": model, "messages": [message], "stream": False},
-        timeout=cfg.ollama_timeout_seconds,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Ollama {model} failed: HTTP {resp.status_code}: {resp.text[:500]}")
-    return resp.json().get("message", {}).get("content", "").strip()
+    try:
+        resp = requests.post(
+            f"{cfg.ollama_url}/api/chat",
+            json={"model": model, "messages": [message], "stream": False},
+            timeout=cfg.ollama_timeout_seconds,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Ollama {model} failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        OLLAMA_REQUESTS_TOTAL.labels(purpose=purpose, model=model, result="success").inc()
+        return resp.json().get("message", {}).get("content", "").strip()
+    except Exception as exc:
+        OLLAMA_REQUESTS_TOTAL.labels(purpose=purpose, model=model, result=error_type(exc)).inc()
+        raise
+    finally:
+        OLLAMA_REQUEST_DURATION_SECONDS.labels(purpose=purpose, model=model).observe(time.monotonic() - start)
 
 
 def codex_text_chat(cfg: ImageSummaryConfig, prompt: str) -> str:
@@ -249,7 +261,7 @@ def text_llm_chat(cfg: ImageSummaryConfig, ollama_model: str, prompt: str, purpo
             return codex_text_chat(cfg, prompt)
         except Exception as exc:
             log(cfg, f"codex_llm_failed purpose={purpose} model={cfg.codex_llm_model or 'default'} error={exc}")
-    return ollama_chat(cfg, ollama_model, prompt)
+    return ollama_chat(cfg, ollama_model, prompt, purpose=purpose)
 
 
 def summarize_ocr(image_path: Path, cfg: ImageSummaryConfig) -> tuple[str, str]:
@@ -270,7 +282,7 @@ OCR TEXT:
 
 
 def summarize_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
-    return ollama_chat(cfg, cfg.vision_llm_model, VISION_PROMPT, images=[image_path])
+    return ollama_chat(cfg, cfg.vision_llm_model, VISION_PROMPT, images=[image_path], purpose="vision_summary")
 
 
 def summarize_codex_vision(image_path: Path, cfg: ImageSummaryConfig) -> str:
@@ -370,7 +382,7 @@ def image_result_jobs(image_path: Path, cfg: ImageSummaryConfig) -> list[tuple[s
                     label,
                     lambda label=label, model=model: timed_call(
                         label,
-                        lambda: ollama_chat(cfg, model, VISION_PROMPT, images=[image_path]),
+                        lambda: ollama_chat(cfg, model, VISION_PROMPT, images=[image_path], purpose="vision_summary"),
                     ),
                 )
             )

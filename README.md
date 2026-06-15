@@ -63,6 +63,27 @@ If HTTP intake is enabled, verify it with:
 make health
 ```
 
+## Prometheus Metrics
+
+Prometheus metrics are opt-in:
+
+```text
+PROMETHEUS_METRICS_ENABLED=true
+PROMETHEUS_METRICS_HOST=127.0.0.1
+PROMETHEUS_METRICS_PORT=8788
+```
+
+When `HTTP_INTAKE_ENABLED=false`, the bot starts a local scrape endpoint at
+`http://PROMETHEUS_METRICS_HOST:PROMETHEUS_METRICS_PORT/metrics`. When HTTP
+intake is enabled, metrics are served by the intake server at `/metrics`; if
+`HTTP_INTAKE_TOKEN` is set, the same token is required for metrics requests.
+
+Metrics cover Telegram update volume, handler latency/errors, image summary
+jobs, Ollama latency, OCR output size, memory extraction/query outcomes, fuel
+approval flow, OwnTracks digest/map generation, HTTP intake requests, and
+process/config gauges. Codex remote-control commands are intentionally not
+instrumented.
+
 For iOS map viewing, `/otm` can send either an HTML attachment or a hosted
 local URL. Attachment mode is the default:
 

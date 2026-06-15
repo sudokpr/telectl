@@ -119,7 +119,7 @@ TEXT:
 {raw_text}
 """.strip()
     try:
-        response = ollama_chat(cfg, cfg.memory_llm_model, prompt)
+        response = ollama_chat(cfg, cfg.memory_llm_model, prompt, purpose="memory_extraction")
         data = parse_memory_json(response)
     except Exception as exc:
         log(cfg, f"memory_llm_failed error={exc}")
