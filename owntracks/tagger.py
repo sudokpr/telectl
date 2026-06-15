@@ -83,11 +83,38 @@ class OwnTracksScope:
     end_date: date
 
 
+@dataclass(frozen=True)
+class HomeFilterConfig:
+    enabled: bool
+    region_names: tuple[str, ...]
+    radius_m: float
+
+
 def as_float(value: object) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def env_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return default
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def build_home_filter_config(env: dict[str, str]) -> HomeFilterConfig:
+    return HomeFilterConfig(
+        enabled=env_bool(env.get("OWNTRACKS_HOME_FILTER_ENABLED"), False),
+        region_names=env_list(env.get("OWNTRACKS_HOME_REGION_NAMES"), ("Home",)),
+        radius_m=float(env.get("OWNTRACKS_HOME_FILTER_RADIUS_METERS") or 150),
+    )
 
 
 def parse_received_at(value: str, local_tz: ZoneInfo) -> datetime | None:
@@ -156,6 +183,69 @@ def slug(value: object) -> str:
 
 def maps_url(lat: float, lon: float) -> str:
     return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+
+
+def home_region_names(config: HomeFilterConfig | None) -> set[str]:
+    if not config:
+        return set()
+    return {name.strip().casefold() for name in config.region_names if name.strip()}
+
+
+def event_region_names(event: Event) -> set[str]:
+    names: set[str] = set()
+    for value in event.payload.get("inregions") or []:
+        if str(value).strip():
+            names.add(str(value).strip().casefold())
+    desc = str(event.payload.get("desc") or "").strip()
+    if desc:
+        names.add(desc.casefold())
+    return names
+
+
+def home_anchors(events: list[Event], config: HomeFilterConfig | None) -> list[tuple[float, float, str]]:
+    names = home_region_names(config)
+    if not config or not config.enabled or not names:
+        return []
+    anchors: list[tuple[float, float, str]] = []
+    seen: set[tuple[float, float, str]] = set()
+    for event in events:
+        if event.kind != "transition" or event.lat is None or event.lon is None:
+            continue
+        desc = str(event.payload.get("desc") or "").strip()
+        if desc.casefold() not in names:
+            continue
+        key = (round(event.lat, 6), round(event.lon, 6), desc.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append((event.lat, event.lon, desc or "home"))
+    return anchors
+
+
+def is_home_area_point(
+    event: Event,
+    config: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> bool:
+    if not config or not config.enabled or not event.is_location:
+        return False
+    names = home_region_names(config)
+    if names and event_region_names(event) & names:
+        return True
+    if event.lat is None or event.lon is None:
+        return False
+    return any(haversine_km(event.lat, event.lon, lat, lon) * 1000 <= config.radius_m for lat, lon, _name in anchors)
+
+
+def filter_home_area_points(
+    points: list[Event],
+    config: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> tuple[list[Event], int]:
+    if not config or not config.enabled:
+        return points, 0
+    filtered = [event for event in points if not is_home_area_point(event, config, anchors)]
+    return filtered, len(points) - len(filtered)
 
 
 def normalized_motion_modes(event: Event) -> set[str]:
@@ -1884,9 +1974,16 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
 </html>"""
 
 
-def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags: dict | None = None) -> dict:
+def build_heatmap_summary(
+    events: list[Event],
+    scope: OwnTracksScope,
+    user_tags: dict | None = None,
+    home_filter: HomeFilterConfig | None = None,
+) -> dict:
     scope_events = [event for event in events if (event_date(event) is not None and scope.start_date <= event_date(event) <= scope.end_date)]
-    location_points = [event for event in scope_events if event.is_location]
+    raw_location_points = [event for event in scope_events if event.is_location]
+    anchors = home_anchors(events, home_filter)
+    location_points, filtered_home_points = filter_home_area_points(raw_location_points, home_filter, anchors)
     day_points: dict[date, list[Event]] = {}
     buckets: Counter[tuple[float, float]] = Counter()
     bucket_minutes: Counter[tuple[float, float]] = Counter()
@@ -1977,6 +2074,8 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "stats": {
             "days_with_points": len(day_points),
             "location_points": len(location_points),
+            "raw_location_points": len(raw_location_points),
+            "filtered_home_points": filtered_home_points,
             "unique_locations": len(all_buckets),
             "max_visits": max(bucket_visits.values()) if bucket_visits else 0,
             "min_visits": min(bucket_visits.values()) if bucket_visits else 0,
@@ -1991,6 +2090,12 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "heat_points": heat_points,
         "most_visited": most_visited,
         "least_visited": least_visited,
+        "home_filter": {
+            "enabled": bool(home_filter and home_filter.enabled),
+            "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
+            "anchor_count": len(anchors),
+            "filtered_points": filtered_home_points,
+        },
     }
 
 
@@ -4534,7 +4639,12 @@ def render_leaflet_map_html(plan: dict) -> str:
 </html>"""
 
 
-def build_plan(events: list[Event], target_date: date, user_tags: dict | None = None) -> tuple[dict, list[Event]]:
+def build_plan(
+    events: list[Event],
+    target_date: date,
+    user_tags: dict | None = None,
+    home_filter: HomeFilterConfig | None = None,
+) -> tuple[dict, list[Event]]:
     day_events = [event for event in events if event_date(event) == target_date]
     day_events.sort(key=event_time)
     start, end, basis = infer_ride_window(day_events)
@@ -4544,6 +4654,8 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
         basis = "full day activity review"
     window_events = [event for event in day_events if in_window(event, start, end)]
     track_points = [event for event in window_events if event.is_location]
+    anchors = home_anchors(events, home_filter)
+    visual_track_points, filtered_home_points = filter_home_area_points(track_points, home_filter, anchors)
     ride_points = [event for event in track_points if is_moving_ride_point(event)]
     places = named_place_events(window_events)
     stops = candidate_stops(window_events)
@@ -4564,6 +4676,8 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
             "events_on_day": len(day_events),
             "events_in_window": len(window_events),
             "track_points": len(track_points),
+            "visual_track_points": len(visual_track_points),
+            "filtered_home_points": filtered_home_points,
             "ride_points": len(ride_points),
             "approx_distance_km": round(summarize_distance(track_points), 2),
             "max_speed_kmh": max(speeds) if speeds else None,
@@ -4575,7 +4689,13 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
-        "sampled_track": [point_dict(event) for event in track_points],
+        "sampled_track": [point_dict(event) for event in visual_track_points],
+        "home_filter": {
+            "enabled": bool(home_filter and home_filter.enabled),
+            "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
+            "anchor_count": len(anchors),
+            "filtered_points": filtered_home_points,
+        },
     }
     plan = apply_user_tags(plan, user_tags or {})
     for index, stop in enumerate(plan["candidate_stops"], start=1):
@@ -4671,6 +4791,12 @@ def render_digest(plan: dict) -> str:
         "",
         "Named places",
     ]
+    home_filter = plan.get("home_filter") or {}
+    if home_filter.get("enabled") and home_filter.get("filtered_points"):
+        lines.insert(
+            9,
+            f"Visualization filter: hid {home_filter['filtered_points']} home-area points within {home_filter.get('radius_m')} m",
+        )
     if not plan["named_places"]:
         lines.append("- None")
     for place in plan["named_places"]:
