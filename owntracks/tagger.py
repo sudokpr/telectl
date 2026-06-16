@@ -336,6 +336,9 @@ def filter_stop_jitter_points(
     preserve_lines = preserve_lines or set()
     jitter_flags = [is_stop_jitter_point(event, config, anchors) for event in points]
     keep_indices = {index for index, is_jitter in enumerate(jitter_flags) if not is_jitter}
+    if len(points) > 1:
+        keep_indices.add(0)
+        keep_indices.add(len(points) - 1)
 
     index = 0
     while index < len(points):

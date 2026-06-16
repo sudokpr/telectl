@@ -103,6 +103,20 @@ def test_stop_jitter_run_keeps_boundary_connector_to_visible_route() -> None:
     assert removed == 0
 
 
+def test_stop_jitter_keeps_day_endpoints_inside_stop_area() -> None:
+    home = StopJitterAnchor(12.9569, 77.5181, "Home", "geofence")
+    points = [
+        location(1, 0, 12.9569, 77.5181, motionactivities=["stationary"]),
+        location(2, 10, 12.9450, 77.5270, motionactivities=["walking"]),
+        location(3, 20, 12.95691, 77.51811, motionactivities=["stationary"]),
+    ]
+
+    filtered, removed = filter_stop_jitter_points(points, jitter_config(), [home])
+
+    assert [event.line_no for event in filtered] == [1, 2, 3]
+    assert removed == 0
+
+
 def test_candidate_stops_include_significant_mode_automotive_dwell() -> None:
     points = [
         location(1, 0, 12.9000, 77.5900, motionactivities=["automotive"]),
