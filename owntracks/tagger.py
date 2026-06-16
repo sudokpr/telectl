@@ -332,7 +332,27 @@ def filter_stop_jitter_points(
 ) -> tuple[list[Event], int]:
     if not config or not config.enabled:
         return points, 0
-    filtered = [event for event in points if not is_stop_jitter_point(event, config, anchors)]
+    jitter_flags = [is_stop_jitter_point(event, config, anchors) for event in points]
+    keep_indices = {index for index, is_jitter in enumerate(jitter_flags) if not is_jitter}
+
+    index = 0
+    while index < len(points):
+        if not jitter_flags[index]:
+            index += 1
+            continue
+        start = index
+        while index + 1 < len(points) and jitter_flags[index + 1]:
+            index += 1
+        end = index
+        has_previous_route = start > 0 and not jitter_flags[start - 1]
+        has_next_route = end + 1 < len(points) and not jitter_flags[end + 1]
+        if has_previous_route:
+            keep_indices.add(start)
+        if has_next_route:
+            keep_indices.add(end)
+        index += 1
+
+    filtered = [event for index, event in enumerate(points) if index in keep_indices]
     return filtered, len(points) - len(filtered)
 
 

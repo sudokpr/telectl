@@ -218,9 +218,11 @@ The filter infers anchors from OwnTracks geofence transition events and the
 bot's candidate stop clusters. It removes route points within the configured
 radius from daily map visualization, including points that no longer carry
 `inregions`, but it does not modify the raw MQTT log, saved stop review data,
-or stop detection. Month/year heatmaps keep stop points by default so they still
-show where time was spent. The older `OWNTRACKS_HOME_FILTER_*` settings remain
-available for home-only heatmap suppression.
+or stop detection. Each filtered jitter run keeps a boundary connector point
+when there is route data before or after the stop, so the route still visibly
+connects to stop markers. Month/year heatmaps keep stop points by default so
+they still show where time was spent. The older `OWNTRACKS_HOME_FILTER_*`
+settings remain available for home-only heatmap suppression.
 
 The sample OwnTracks systemd units in `systemd/` use `/path/to/telectl` as
 an install-time placeholder. Replace it with this checkout path before
