@@ -5,7 +5,7 @@ SERVICE_NAME ?= telegram-control
 SERVICE_UNIT ?= $(SERVICE_NAME).service
 HTTP_HEALTH_URL ?= http://127.0.0.1:8787/health
 
-.PHONY: help sync run compile check \
+.PHONY: help sync run compile test check \
 	start stop restart status logs logs-follow \
 	service-start service-stop service-restart service-status service-logs service-logs-follow \
 	logs-image health
@@ -15,7 +15,8 @@ help:
 	@printf '  %-22s %s\n' 'sync' 'Install/update dependencies with uv'
 	@printf '  %-22s %s\n' 'run' 'Run the bot in the foreground'
 	@printf '  %-22s %s\n' 'compile' 'Compile core Python modules'
-	@printf '  %-22s %s\n' 'check' 'Run sync and compile'
+	@printf '  %-22s %s\n' 'test' 'Run Python tests'
+	@printf '  %-22s %s\n' 'check' 'Run sync, compile, and tests'
 	@printf '  %-22s %s\n' 'start' 'Alias for service-start'
 	@printf '  %-22s %s\n' 'stop' 'Alias for service-stop'
 	@printf '  %-22s %s\n' 'restart' 'Alias for service-restart'
@@ -40,7 +41,10 @@ run:
 compile:
 	$(UV) --cache-dir $(UV_CACHE_DIR) run $(PYTHON) -m py_compile bot.py image_summary.py
 
-check: sync compile
+test:
+	$(UV) --cache-dir $(UV_CACHE_DIR) run pytest
+
+check: sync compile test
 
 start: service-start
 

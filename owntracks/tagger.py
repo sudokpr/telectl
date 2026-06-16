@@ -329,9 +329,11 @@ def filter_stop_jitter_points(
     points: list[Event],
     config: StopJitterFilterConfig | None,
     anchors: list[StopJitterAnchor],
+    preserve_lines: set[int] | None = None,
 ) -> tuple[list[Event], int]:
     if not config or not config.enabled:
         return points, 0
+    preserve_lines = preserve_lines or set()
     jitter_flags = [is_stop_jitter_point(event, config, anchors) for event in points]
     keep_indices = {index for index, is_jitter in enumerate(jitter_flags) if not is_jitter}
 
@@ -350,6 +352,10 @@ def filter_stop_jitter_points(
             keep_indices.add(start)
         if has_next_route:
             keep_indices.add(end)
+        for preserve_index in range(start, end + 1):
+            event = points[preserve_index]
+            if event.line_no in preserve_lines or event.payload.get("t") == "c":
+                keep_indices.add(preserve_index)
         index += 1
 
     filtered = [event for index, event in enumerate(points) if index in keep_indices]
@@ -747,6 +753,8 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
                 "name": name,
                 "start": fmt_dt(start),
                 "end": fmt_dt(end),
+                "start_line": cluster[0].line_no,
+                "end_line": cluster[-1].line_no,
                 "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
                 "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
                 "duration_minutes": duration_minutes,
@@ -4769,10 +4777,17 @@ def build_plan(
     home_anchor_points = home_anchors(events, home_filter)
     stop_jitter_anchor_points = stop_jitter_anchors(events, stops, stop_jitter_filter)
     if stop_jitter_filter and stop_jitter_filter.enabled:
+        preserve_lines = {
+            int(line)
+            for stop in stops
+            for line in (stop.get("start_line"), stop.get("end_line"))
+            if isinstance(line, int)
+        }
         visual_track_points, filtered_stop_jitter_points = filter_stop_jitter_points(
             track_points,
             stop_jitter_filter,
             stop_jitter_anchor_points,
+            preserve_lines,
         )
         filtered_home_points = 0
     else:
