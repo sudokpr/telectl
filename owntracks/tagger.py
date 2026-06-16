@@ -878,7 +878,33 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
     return override
 
 
-def apply_user_tags(plan: dict, user_tags: dict) -> dict:
+def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) -> dict:
+    stop_lat = as_float(stop.get("lat"))
+    stop_lon = as_float(stop.get("lon"))
+    if stop_lat is None or stop_lon is None:
+        return {}
+    best_key: tuple[int, float] | None = None
+    best_name: str | None = None
+    for event in events:
+        if event.kind != "waypoint" or event.lat is None or event.lon is None:
+            continue
+        name = str(event.payload.get("desc") or "").strip()
+        if not name:
+            continue
+        waypoint_radius = as_float(event.payload.get("rad")) or 0
+        match_radius = max(radius_m, waypoint_radius)
+        distance_m = haversine_km(stop_lat, stop_lon, event.lat, event.lon) * 1000
+        if distance_m > match_radius:
+            continue
+        timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else 0
+        candidate_key = (timestamp, -distance_m)
+        if best_key is None or candidate_key > best_key:
+            best_key = candidate_key
+            best_name = name
+    return {"name": best_name} if best_name else {}
+
+
+def apply_user_tags(plan: dict, user_tags: dict, events: list[Event] | None = None) -> dict:
     day_tags = user_tags.get(plan["date"], {})
     global_tags = day_tags.get("activity", day_tags.get("ride", {})).get("tags", [])
     plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + global_tags))
@@ -886,6 +912,7 @@ def apply_user_tags(plan: dict, user_tags: dict) -> dict:
     for stop in plan["candidate_stops"]:
         override = merge_stop_overrides(
             [
+                waypoint_override_for(stop, events or []),
                 location_override_for(stop, user_tags, plan["date"]),
                 stop_override_for(stop, stop_overrides),
             ]
@@ -4934,7 +4961,7 @@ def build_plan(
             ),
         },
     }
-    plan = apply_user_tags(plan, user_tags or {})
+    plan = apply_user_tags(plan, user_tags or {}, events)
     for index, stop in enumerate(plan["candidate_stops"], start=1):
         stop["alias"] = f"s{index}"
     plan["ride_segments"] = build_ride_segments(track_points, plan["candidate_stops"], places)
