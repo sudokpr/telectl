@@ -6,10 +6,11 @@ import re
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
@@ -110,6 +111,7 @@ OWNTRACKS_MAP_SCOPE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY"
 
 @dataclass(frozen=True)
 class Config:
+    telegram_bot_enabled: bool
     bot_token: str
     chat_id: int
     topic_id: int
@@ -158,6 +160,12 @@ def parse_user_ids(raw: str | None) -> frozenset[int]:
     return frozenset(int(part.strip()) for part in raw.split(",") if part.strip())
 
 
+def config_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_config() -> Config:
     local_env = load_dotenv(BASE_DIR / ".env")
     fallback_env: dict[str, str] = {}
@@ -168,6 +176,7 @@ def load_config() -> Config:
     bot_token = first_value(["BOT_TOKEN", "TELEGRAM_BOT_TOKEN"], local_env)
     chat_id = first_value(["TELEGRAM_CHAT_ID", "TELEGRAM__CHAT_ID"], local_env, fallback_env)
     topic_id = first_value(["TELEGRAM_TOPIC_ID", "TELEGRAM__TOPIC_ID"], local_env)
+    telegram_bot_enabled = config_bool(first_value(["TELEGRAM_BOT_ENABLED"], local_env), True)
     command = first_value(["CODEX_REMOTE_COMMAND"], local_env) or "codex remote-control"
     workdir = Path(
         first_value(["CODEX_REMOTE_WORKDIR"], local_env)
@@ -183,12 +192,13 @@ def load_config() -> Config:
         }.items()
         if not value
     ]
-    if missing:
+    if telegram_bot_enabled and missing:
         raise RuntimeError(f"Missing required config: {', '.join(missing)}")
 
     image_summary_env = {**local_env, **dict(os.environ)}
 
     return Config(
+        telegram_bot_enabled=telegram_bot_enabled,
         bot_token=bot_token or "",
         chat_id=int(chat_id or "0"),
         topic_id=int(topic_id or "0"),
@@ -1863,16 +1873,66 @@ async def post_init(application: Application) -> None:
         )
 
 
+def run_without_telegram(config: Config) -> None:
+    if config.http_intake.notify_telegram:
+        config = replace(config, http_intake=replace(config.http_intake, notify_telegram=False))
+        image_summary_log(config.image_summary, "telegram_disabled_http_notifications_disabled")
+    set_config_enabled(
+        image_summary=False,
+        memory=bool(config.image_summary.memory_dir),
+        fuel=False,
+        http_intake=config.http_intake.enabled,
+        owntracks=bool(config.owntracks_topic_id),
+    )
+    set_memory_files_gauge(config.image_summary.memory_dir)
+    FUEL_PENDING_APPROVALS.set(0)
+    loop = asyncio.new_event_loop()
+    application = SimpleNamespace(
+        bot=None,
+        bot_data={
+            "config": config,
+            "fuel_pending": {},
+            "fuel_approvals": {},
+        },
+    )
+    server = start_http_intake(
+        application,
+        config.image_summary,
+        config.http_intake,
+        config.metrics,
+        loop,
+    )
+    if config.metrics.enabled and not config.http_intake.enabled:
+        start_standalone_metrics_server(config.metrics)
+        image_summary_log(
+            config.image_summary,
+            f"prometheus_metrics_started host={config.metrics.host} port={config.metrics.port}",
+        )
+    if not server and not config.metrics.enabled:
+        raise RuntimeError("TELEGRAM_BOT_ENABLED=false requires HTTP_INTAKE_ENABLED=true or PROMETHEUS_METRICS_ENABLED=true")
+    image_summary_log(config.image_summary, "telegram_disabled_runtime_started")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        if server is not None:
+            server.shutdown()
+
+
 def main() -> None:
     config = load_config()
     image_summary_log(
         config.image_summary,
         "startup "
+        f"telegram_bot_enabled={config.telegram_bot_enabled} "
         f"chat_id={config.chat_id} codex_topic={config.topic_id} "
         f"image_topic={config.image_summary.topic_id} "
         f"memory_dir={config.image_summary.memory_dir} "
         f"ollama_url={config.image_summary.ollama_url}",
     )
+    if not config.telegram_bot_enabled:
+        run_without_telegram(config)
+        return
     application = (
         Application.builder()
         .token(config.bot_token)

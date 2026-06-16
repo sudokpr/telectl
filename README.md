@@ -18,6 +18,18 @@ Edit `.env` and set:
 - `IMAGE_SUMMARY_TOPIC_ID`
 - `IMAGE_SUMMARY_OLLAMA_URL`, if Ollama is not running on `localhost`
 
+If Telegram is temporarily unavailable but hosted OwnTracks maps, HTTP intake,
+or metrics should keep running, set:
+
+```text
+TELEGRAM_BOT_ENABLED=false
+HTTP_INTAKE_ENABLED=true
+HTTP_INTAKE_NOTIFY_TELEGRAM=false
+```
+
+In this mode the process does not poll Telegram and does not require Telegram
+credentials, but it still serves configured local HTTP endpoints.
+
 ## Run
 
 ```bash
