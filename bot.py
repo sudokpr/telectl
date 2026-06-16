@@ -1839,10 +1839,14 @@ async def post_init(application: Application) -> None:
     set_memory_files_gauge(config.image_summary.memory_dir)
     FUEL_PENDING_APPROVALS.set(len(application.bot_data.get("fuel_approvals", {})))
     commands = [BotCommand(name, description) for name, description in COMMAND_SHORTCUTS]
-    await application.bot.set_my_commands(
-        commands,
-        scope=BotCommandScopeChat(chat_id=config.chat_id),
-    )
+    try:
+        await application.bot.set_my_commands(
+            commands,
+            scope=BotCommandScopeChat(chat_id=config.chat_id),
+        )
+    except Exception as exc:
+        HANDLER_ERRORS_TOTAL.labels(handler="telegram_command_registration", error_type=metrics_error_type(exc)).inc()
+        image_summary_log(config.image_summary, f"telegram_command_registration_failed error={exc}")
     server = start_http_intake(
         application,
         config.image_summary,
