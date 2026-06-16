@@ -11,6 +11,7 @@ from owntracks.tagger import (
     build_plan,
     candidate_stops,
     filter_stop_jitter_points,
+    point_dicts,
 )
 
 
@@ -37,6 +38,19 @@ def transition(line_no: int, minutes: int, lat: float, lon: float, desc: str, ev
         "lon": lon,
         "desc": desc,
         "event": event,
+        "tst": int((base + timedelta(minutes=minutes)).timestamp()),
+    }
+    return Event(line_no=line_no, received_at=None, topic="owntracks/test/device", payload=body, local_tz=TZ)
+
+
+def waypoint(line_no: int, minutes: int, lat: float, lon: float, desc: str, radius: int = 20) -> Event:
+    base = datetime(2026, 6, 12, 12, 0, tzinfo=TZ)
+    body = {
+        "_type": "waypoint",
+        "lat": lat,
+        "lon": lon,
+        "desc": desc,
+        "rad": radius,
         "tst": int((base + timedelta(minutes=minutes)).timestamp()),
     }
     return Event(line_no=line_no, received_at=None, topic="owntracks/test/device", payload=body, local_tz=TZ)
@@ -155,6 +169,29 @@ def test_candidate_stops_bridge_sparse_same_place_significant_mode_gap() -> None
     assert stops[0]["start_line"] == 1
     assert stops[0]["end_line"] == 3
     assert stops[0]["duration_minutes"] == 100
+
+
+def test_candidate_stops_include_same_place_dwell_with_bad_speed_sample() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
+        location(2, 12, 12.90001, 77.59001, vel=7),
+    ]
+
+    stops = candidate_stops(points)
+
+    assert len(stops) == 1
+    assert stops[0]["start_line"] == 1
+    assert stops[0]["end_line"] == 2
+    assert stops[0]["duration_minutes"] == 12
+
+
+def test_point_dicts_include_waypoint_labels() -> None:
+    points = [location(1, 0, 12.9569, 77.5181, motionactivities=["stationary"])]
+    events = [waypoint(2, -10, 12.95691, 77.51811, "Home"), *points]
+
+    rendered = point_dicts(points, events)
+
+    assert rendered[0]["place_name"] == "Home"
 
 
 def test_build_plan_keeps_raw_track_for_filtered_point_overlay() -> None:

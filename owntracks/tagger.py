@@ -430,6 +430,17 @@ def point_dict(event: Event) -> dict:
     }
 
 
+def point_dicts(events: list[Event], all_events: list[Event]) -> list[dict]:
+    points = []
+    for event in events:
+        point = point_dict(event)
+        label = waypoint_name_for(event.lat, event.lon, all_events)
+        if label:
+            point["place_name"] = label
+        points.append(point)
+    return points
+
+
 def is_moving_ride_point(event: Event) -> bool:
     if not event.is_location:
         return False
@@ -715,6 +726,70 @@ def is_stop_candidate_event(event: Event) -> bool:
     return speed is not None and speed <= 3
 
 
+def stop_from_cluster(cluster: list[Event], index: int) -> dict | None:
+    if not cluster:
+        return None
+    start = event_time(cluster[0])
+    end = event_time(cluster[-1])
+    duration_minutes = max(0, round((end - start).total_seconds() / 60))
+    lat = sum(item.lat or 0 for item in cluster) / len(cluster)
+    lon = sum(item.lon or 0 for item in cluster) / len(cluster)
+    motions = Counter(motion for item in cluster for motion in item.motion)
+    regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
+    motion_modes = Counter(motion_mode(item) for item in cluster)
+    dominant_motion = motion_modes.most_common(1)[0][0] if motion_modes else "unknown"
+    name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
+    stop_id = f"{slug(name)}-{cluster[0].line_no}"
+    return {
+        "id": stop_id,
+        "name": name,
+        "start": fmt_dt(start),
+        "end": fmt_dt(end),
+        "start_line": cluster[0].line_no,
+        "end_line": cluster[-1].line_no,
+        "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+        "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
+        "duration_minutes": duration_minutes,
+        "duration": fmt_duration(duration_minutes),
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "points": len(cluster),
+        "motion": ", ".join(f"{name}:{count}" for name, count in motions.most_common()) or "unknown",
+        "motion_mode": dominant_motion,
+        "motion_modes": ", ".join(f"{name}:{count}" for name, count in motion_modes.most_common()) or "unknown",
+        "tags": [f"stop:{stop_id}", "candidate:stop"],
+        "maps": maps_url(lat, lon),
+    }
+
+
+def same_place_dwell_clusters(events: list[Event], min_minutes: int, radius_m: int) -> list[list[Event]]:
+    tight_radius_m = min(80, radius_m)
+    points = [event for event in events if event.is_location]
+    clusters: list[list[Event]] = []
+    current: list[Event] = []
+    for event in points:
+        if not current:
+            current = [event]
+            continue
+        center_lat = sum(item.lat or 0 for item in current) / len(current)
+        center_lon = sum(item.lon or 0 for item in current) / len(current)
+        dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
+        dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
+        if dist_m <= tight_radius_m and dt_gap <= 45 * 60:
+            current.append(event)
+        else:
+            clusters.append(current)
+            current = [event]
+    if current:
+        clusters.append(current)
+    return [
+        cluster
+        for cluster in clusters
+        if len(cluster) >= 2
+        and (event_time(cluster[-1]) - event_time(cluster[0])).total_seconds() >= min_minutes * 60
+    ]
+
+
 def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 180) -> list[dict]:
     sparse_same_place_radius_m = min(50, radius_m)
     low_motion = [
@@ -742,42 +817,30 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
 
     stops = []
     for index, cluster in enumerate(clusters, start=1):
-        start = event_time(cluster[0])
-        end = event_time(cluster[-1])
-        duration_minutes = max(0, round((end - start).total_seconds() / 60))
+        duration_minutes = max(0, round((event_time(cluster[-1]) - event_time(cluster[0])).total_seconds() / 60))
         if duration_minutes < min_minutes and len(cluster) < 3:
             continue
-        lat = sum(item.lat or 0 for item in cluster) / len(cluster)
-        lon = sum(item.lon or 0 for item in cluster) / len(cluster)
-        motions = Counter(motion for item in cluster for motion in item.motion)
-        regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
-        motion_modes = Counter(motion_mode(item) for item in cluster)
-        dominant_motion = motion_modes.most_common(1)[0][0] if motion_modes else "unknown"
-        name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
-        stop_id = f"{slug(name)}-{cluster[0].line_no}"
-        stops.append(
-            {
-                "id": stop_id,
-                "name": name,
-                "start": fmt_dt(start),
-                "end": fmt_dt(end),
-                "start_line": cluster[0].line_no,
-                "end_line": cluster[-1].line_no,
-                "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
-                "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
-                "duration_minutes": duration_minutes,
-                "duration": fmt_duration(duration_minutes),
-                "lat": round(lat, 6),
-                "lon": round(lon, 6),
-                "points": len(cluster),
-                "motion": ", ".join(f"{name}:{count}" for name, count in motions.most_common()) or "unknown",
-                "motion_mode": dominant_motion,
-                "motion_modes": ", ".join(f"{name}:{count}" for name, count in motion_modes.most_common()) or "unknown",
-                "tags": [f"stop:{stop_id}", "candidate:stop"],
-                "maps": maps_url(lat, lon),
-            }
-        )
-    return stops
+        stop = stop_from_cluster(cluster, index)
+        if stop is not None:
+            stops.append(stop)
+
+    covered_lines = {
+        line
+        for stop in stops
+        for line in range(int(stop["start_line"]), int(stop["end_line"]) + 1)
+    }
+    next_index = len(stops) + 1
+    for cluster in same_place_dwell_clusters(events, min_minutes, radius_m):
+        cluster_lines = {event.line_no for event in cluster}
+        if cluster_lines & covered_lines:
+            continue
+        stop = stop_from_cluster(cluster, next_index)
+        if stop is None:
+            continue
+        stops.append(stop)
+        covered_lines.update(range(int(stop["start_line"]), int(stop["end_line"]) + 1))
+        next_index += 1
+    return sorted(stops, key=lambda stop: (int(stop["start_line"]), int(stop["end_line"])))
 
 
 def heatmap_visit_clusters(events: list[Event], min_minutes: int = 10, radius_m: int = 180, max_gap_minutes: int = 45) -> list[dict]:
@@ -874,11 +937,9 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
     return override
 
 
-def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) -> dict:
-    stop_lat = as_float(stop.get("lat"))
-    stop_lon = as_float(stop.get("lon"))
-    if stop_lat is None or stop_lon is None:
-        return {}
+def waypoint_name_for(lat: float | None, lon: float | None, events: list[Event], radius_m: int = 150) -> str | None:
+    if lat is None or lon is None:
+        return None
     best_key: tuple[int, float] | None = None
     best_name: str | None = None
     for event in events:
@@ -889,7 +950,7 @@ def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) 
             continue
         waypoint_radius = as_float(event.payload.get("rad")) or 0
         match_radius = max(radius_m, waypoint_radius)
-        distance_m = haversine_km(stop_lat, stop_lon, event.lat, event.lon) * 1000
+        distance_m = haversine_km(lat, lon, event.lat, event.lon) * 1000
         if distance_m > match_radius:
             continue
         timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else 0
@@ -897,6 +958,13 @@ def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) 
         if best_key is None or candidate_key > best_key:
             best_key = candidate_key
             best_name = name
+    return best_name
+
+
+def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) -> dict:
+    stop_lat = as_float(stop.get("lat"))
+    stop_lon = as_float(stop.get("lon"))
+    best_name = waypoint_name_for(stop_lat, stop_lon, events, radius_m)
     return {"name": best_name} if best_name else {}
 
 
@@ -3809,6 +3877,8 @@ def render_leaflet_map_html(plan: dict) -> str:
         speed_kmh: bestSpeedKmh(speedKmh, segmentSpeedKmh),
         reported_speed_kmh: Number.isFinite(speedKmh) ? speedKmh : null,
         derived_speed_kmh: segmentSpeedKmh,
+        place_name: point.place_name || null,
+        line: point.line || null,
         timestamp,
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
@@ -4018,13 +4088,22 @@ def render_leaflet_map_html(plan: dict) -> str:
       const pointRadius = routePointRadius();
       refreshSpeedBounds();
       for (const point of points) {{
-        L.circleMarker([point.lat, point.lon], {{
+        const marker = L.circleMarker([point.lat, point.lon], {{
           radius: pointRadius,
           color: routeColorFor(point, previous),
           fillColor: routeColorFor(point, previous),
           fillOpacity: 0.9,
           weight: 0,
-        }}).addTo(routeLayer);
+        }});
+        if (point.place_name) {{
+          marker.bindTooltip(escapeHtml(point.place_name), {{
+            permanent: placeLabelsVisible && placeLabelsAllowedByZoom(),
+            direction: "right",
+            className: "place-label",
+          }});
+          marker.bindPopup(`<strong>${{escapeHtml(point.place_name)}}</strong><br>Line ${{escapeHtml(point.line || "")}}<br>${{formatTime(point.timestamp)}}`);
+        }}
+        marker.addTo(routeLayer);
         previous = point;
       }}
       drawEdges();
@@ -4411,6 +4490,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const setPlaceLabelsVisible = (visible) => {{
       placeLabelsVisible = visible;
+      drawRoute();
       applyLabelVisibility();
     }};
     const refreshZoomSensitiveMarkers = () => {{
@@ -4937,8 +5017,8 @@ def build_plan(
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
-        "raw_sampled_track": [point_dict(event) for event in track_points],
-        "sampled_track": [point_dict(event) for event in visual_track_points],
+        "raw_sampled_track": point_dicts(track_points, events),
+        "sampled_track": point_dicts(visual_track_points, events),
         "home_filter": {
             "enabled": bool(home_filter and home_filter.enabled),
             "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
