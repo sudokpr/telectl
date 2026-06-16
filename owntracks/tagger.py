@@ -705,14 +705,25 @@ def named_place_events(events: list[Event]) -> list[dict]:
     return places
 
 
+def is_stop_candidate_event(event: Event) -> bool:
+    if not event.is_location:
+        return False
+    if "Home" in (event.payload.get("inregions") or []):
+        return False
+    speed = event.speed_kmh
+    if speed is not None and speed > 3:
+        return False
+    mode = motion_mode(event)
+    if mode in {"stationary", "automotive", "moving"}:
+        return True
+    return speed is not None and speed <= 3
+
+
 def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 180) -> list[dict]:
     low_motion = [
         event
         for event in events
-        if event.is_location
-        and "Home" not in (event.payload.get("inregions") or [])
-        and motion_mode(event) != "automotive"
-        and (event.speed_kmh is None or event.speed_kmh <= 3)
+        if is_stop_candidate_event(event)
     ]
     clusters: list[list[Event]] = []
     current: list[Event] = []
@@ -3655,6 +3666,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       const mixed = a.map((value, index) => Math.round(value + (b[index] - value) * r));
       return `rgb(${{mixed[0]}}, ${{mixed[1]}}, ${{mixed[2]}})`;
     }};
+    const percentile = (values, ratio) => {{
+      if (!values.length) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const index = Math.max(0, Math.min(sorted.length - 1, (sorted.length - 1) * ratio));
+      const lower = Math.floor(index);
+      const upper = Math.ceil(index);
+      if (lower === upper) return sorted[lower];
+      return interpolateNumber(sorted[lower], sorted[upper], index - lower);
+    }};
     const speedColor = (speed) => {{
       const value = Number(speed);
       if (!Number.isFinite(value)) return motionColors.unknown;
@@ -3779,8 +3799,10 @@ def render_leaflet_map_html(plan: dict) -> str:
         return;
       }}
       const minSpeed = Math.max(0, Math.min(...values));
-      const maxSpeed = Math.max(...values);
-      speedBounds = {{ min: minSpeed, max: Math.max(minSpeed + 1, maxSpeed) }};
+      const p75Speed = percentile(values, 0.75) ?? minSpeed;
+      const p95Speed = percentile(values, 0.95) ?? p75Speed;
+      const robustMaxSpeed = Math.max(p95Speed, p75Speed * 1.5, 30);
+      speedBounds = {{ min: minSpeed, max: Math.max(minSpeed + 1, robustMaxSpeed) }};
     }};
     const routeColorFor = (point, prev = null) => {{
       if (routeColorMode === "bands") {{

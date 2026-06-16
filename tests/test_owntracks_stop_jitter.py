@@ -7,6 +7,7 @@ from owntracks.tagger import (
     Event,
     StopJitterAnchor,
     StopJitterFilterConfig,
+    candidate_stops,
     filter_stop_jitter_points,
 )
 
@@ -85,3 +86,28 @@ def test_stop_jitter_run_keeps_boundary_connector_to_visible_route() -> None:
 
     assert [event.line_no for event in filtered] == [1, 2, 3, 4]
     assert removed == 0
+
+
+def test_candidate_stops_include_significant_mode_automotive_dwell() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["automotive"]),
+        location(2, 45, 12.9001, 77.5901, vel=2, motionactivities=["automotive"]),
+    ]
+
+    stops = candidate_stops(points)
+
+    assert len(stops) == 1
+    assert stops[0]["start_line"] == 1
+    assert stops[0]["end_line"] == 2
+    assert stops[0]["duration_minutes"] == 45
+    assert stops[0]["motion_mode"] == "automotive"
+
+
+def test_candidate_stops_do_not_turn_highway_samples_into_stops() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["automotive"]),
+        location(2, 15, 12.9800, 77.6700, motionactivities=["automotive"]),
+        location(3, 30, 13.0600, 77.7500, motionactivities=["automotive"]),
+    ]
+
+    assert candidate_stops(points) == []
