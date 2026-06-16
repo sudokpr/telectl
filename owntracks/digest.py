@@ -13,6 +13,7 @@ from .tagger import (
     build_heatmap_summary,
     build_plan,
     build_sample_heatmap_summary,
+    build_stop_jitter_filter_config,
     load_user_tags,
     parse_log,
     render_digest,
@@ -42,6 +43,7 @@ def generate_digest(date_text: str | None = None) -> tuple[dict, str, Path]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
     target_date = target_date_from_text(date_text, local_tz)
     log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
     derived_dir = project_path(env.get("OWNTRACKS_DERIVED_DIR"), "./data/owntracks/derived")
@@ -49,7 +51,7 @@ def generate_digest(date_text: str | None = None) -> tuple[dict, str, Path]:
 
     events = parse_log(log_path, local_tz)
     user_tags = load_user_tags(tags_path)
-    plan, track_points = build_plan(events, target_date, user_tags, home_filter)
+    plan, track_points = build_plan(events, target_date, user_tags, home_filter, stop_jitter_filter)
 
     derived_dir.mkdir(parents=True, exist_ok=True)
     plan_path = derived_dir / f"activity-tag-plan-{target_date.isoformat()}.json"
@@ -70,19 +72,21 @@ def build_plan_for_date(date_text: str | None = None) -> tuple[dict, list]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
     target_date = target_date_from_text(date_text, local_tz)
     log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
     tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
 
     events = parse_log(log_path, local_tz)
     user_tags = load_user_tags(tags_path)
-    return build_plan(events, target_date, user_tags, home_filter)
+    return build_plan(events, target_date, user_tags, home_filter, stop_jitter_filter)
 
 
 def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
     scope = target_scope_from_text(date_text, local_tz)
     log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
     tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
@@ -90,7 +94,7 @@ def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
     events = parse_log(log_path, local_tz)
     user_tags = load_user_tags(tags_path)
     if scope.kind == "day":
-        plan, _track_points = build_plan(events, scope.start_date, user_tags, home_filter)
+        plan, _track_points = build_plan(events, scope.start_date, user_tags, home_filter, stop_jitter_filter)
         return plan, render_leaflet_map_html(plan)
     summary = build_heatmap_summary(events, scope, user_tags, home_filter)
     return summary, render_heatmap_html(summary)
@@ -105,6 +109,7 @@ def generate_owntracks_visualization(scope_text: str | None = None) -> tuple[dic
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
     scope = target_scope_from_text(scope_text, local_tz)
     log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
     derived_dir = project_path(env.get("OWNTRACKS_DERIVED_DIR"), "./data/owntracks/derived")

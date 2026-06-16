@@ -90,6 +90,23 @@ class HomeFilterConfig:
     radius_m: float
 
 
+@dataclass(frozen=True)
+class StopJitterFilterConfig:
+    enabled: bool
+    radius_m: float
+    min_dwell_minutes: int
+    include_geofences: bool
+    include_candidate_stops: bool
+
+
+@dataclass(frozen=True)
+class StopJitterAnchor:
+    lat: float
+    lon: float
+    label: str
+    kind: str
+
+
 def as_float(value: object) -> float | None:
     try:
         return float(value)
@@ -114,6 +131,16 @@ def build_home_filter_config(env: dict[str, str]) -> HomeFilterConfig:
         enabled=env_bool(env.get("OWNTRACKS_HOME_FILTER_ENABLED"), False),
         region_names=env_list(env.get("OWNTRACKS_HOME_REGION_NAMES"), ("Home",)),
         radius_m=float(env.get("OWNTRACKS_HOME_FILTER_RADIUS_METERS") or 150),
+    )
+
+
+def build_stop_jitter_filter_config(env: dict[str, str]) -> StopJitterFilterConfig:
+    return StopJitterFilterConfig(
+        enabled=env_bool(env.get("OWNTRACKS_STOP_JITTER_FILTER_ENABLED"), False),
+        radius_m=float(env.get("OWNTRACKS_STOP_JITTER_RADIUS_METERS") or 150),
+        min_dwell_minutes=int(env.get("OWNTRACKS_STOP_JITTER_MIN_DWELL_MINUTES") or 10),
+        include_geofences=env_bool(env.get("OWNTRACKS_STOP_JITTER_INCLUDE_GEOFENCES"), True),
+        include_candidate_stops=env_bool(env.get("OWNTRACKS_STOP_JITTER_INCLUDE_CANDIDATE_STOPS"), True),
     )
 
 
@@ -245,6 +272,67 @@ def filter_home_area_points(
     if not config or not config.enabled:
         return points, 0
     filtered = [event for event in points if not is_home_area_point(event, config, anchors)]
+    return filtered, len(points) - len(filtered)
+
+
+def stop_jitter_anchors(
+    events: list[Event],
+    candidate_stops: list[dict],
+    config: StopJitterFilterConfig | None,
+) -> list[StopJitterAnchor]:
+    if not config or not config.enabled:
+        return []
+    anchors: list[StopJitterAnchor] = []
+    seen: set[tuple[float, float, str]] = set()
+
+    def add_anchor(lat: object, lon: object, label: object, kind: str) -> None:
+        anchor_lat = as_float(lat)
+        anchor_lon = as_float(lon)
+        if anchor_lat is None or anchor_lon is None:
+            return
+        text = str(label or kind).strip() or kind
+        key = (round(anchor_lat, 5), round(anchor_lon, 5), text.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        anchors.append(StopJitterAnchor(anchor_lat, anchor_lon, text, kind))
+
+    if config.include_geofences:
+        for event in events:
+            if event.kind != "transition":
+                continue
+            add_anchor(event.lat, event.lon, event.payload.get("desc"), "geofence")
+
+    if config.include_candidate_stops:
+        for stop in candidate_stops:
+            if int(stop.get("duration_minutes") or 0) < config.min_dwell_minutes:
+                continue
+            label = stop.get("reviewed_name") or stop.get("name") or stop.get("alias") or stop.get("id")
+            add_anchor(stop.get("lat"), stop.get("lon"), label, "candidate_stop")
+    return anchors
+
+
+def is_stop_jitter_point(
+    event: Event,
+    config: StopJitterFilterConfig | None,
+    anchors: list[StopJitterAnchor],
+) -> bool:
+    if not config or not config.enabled or not event.is_location or event.lat is None or event.lon is None:
+        return False
+    return any(
+        haversine_km(event.lat, event.lon, anchor.lat, anchor.lon) * 1000 <= config.radius_m
+        for anchor in anchors
+    )
+
+
+def filter_stop_jitter_points(
+    points: list[Event],
+    config: StopJitterFilterConfig | None,
+    anchors: list[StopJitterAnchor],
+) -> tuple[list[Event], int]:
+    if not config or not config.enabled:
+        return points, 0
+    filtered = [event for event in points if not is_stop_jitter_point(event, config, anchors)]
     return filtered, len(points) - len(filtered)
 
 
@@ -4644,6 +4732,7 @@ def build_plan(
     target_date: date,
     user_tags: dict | None = None,
     home_filter: HomeFilterConfig | None = None,
+    stop_jitter_filter: StopJitterFilterConfig | None = None,
 ) -> tuple[dict, list[Event]]:
     day_events = [event for event in events if event_date(event) == target_date]
     day_events.sort(key=event_time)
@@ -4654,11 +4743,21 @@ def build_plan(
         basis = "full day activity review"
     window_events = [event for event in day_events if in_window(event, start, end)]
     track_points = [event for event in window_events if event.is_location]
-    anchors = home_anchors(events, home_filter)
-    visual_track_points, filtered_home_points = filter_home_area_points(track_points, home_filter, anchors)
     ride_points = [event for event in track_points if is_moving_ride_point(event)]
     places = named_place_events(window_events)
     stops = candidate_stops(window_events)
+    home_anchor_points = home_anchors(events, home_filter)
+    stop_jitter_anchor_points = stop_jitter_anchors(events, stops, stop_jitter_filter)
+    if stop_jitter_filter and stop_jitter_filter.enabled:
+        visual_track_points, filtered_stop_jitter_points = filter_stop_jitter_points(
+            track_points,
+            stop_jitter_filter,
+            stop_jitter_anchor_points,
+        )
+        filtered_home_points = 0
+    else:
+        visual_track_points, filtered_home_points = filter_home_area_points(track_points, home_filter, home_anchor_points)
+        filtered_stop_jitter_points = 0
     speeds = [event.speed_kmh for event in track_points if event.speed_kmh is not None]
     batteries = [event.payload.get("batt") for event in track_points if event.payload.get("batt") is not None]
     motion = motion_summary(track_points)
@@ -4678,6 +4777,7 @@ def build_plan(
             "track_points": len(track_points),
             "visual_track_points": len(visual_track_points),
             "filtered_home_points": filtered_home_points,
+            "filtered_stop_jitter_points": filtered_stop_jitter_points,
             "ride_points": len(ride_points),
             "approx_distance_km": round(summarize_distance(track_points), 2),
             "max_speed_kmh": max(speeds) if speeds else None,
@@ -4693,8 +4793,19 @@ def build_plan(
         "home_filter": {
             "enabled": bool(home_filter and home_filter.enabled),
             "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
-            "anchor_count": len(anchors),
+            "anchor_count": len(home_anchor_points),
             "filtered_points": filtered_home_points,
+        },
+        "stop_jitter_filter": {
+            "enabled": bool(stop_jitter_filter and stop_jitter_filter.enabled),
+            "radius_m": stop_jitter_filter.radius_m if stop_jitter_filter and stop_jitter_filter.enabled else None,
+            "anchor_count": len(stop_jitter_anchor_points),
+            "filtered_points": filtered_stop_jitter_points,
+            "min_dwell_minutes": (
+                stop_jitter_filter.min_dwell_minutes
+                if stop_jitter_filter and stop_jitter_filter.enabled
+                else None
+            ),
         },
     }
     plan = apply_user_tags(plan, user_tags or {})
@@ -4791,8 +4902,16 @@ def render_digest(plan: dict) -> str:
         "",
         "Named places",
     ]
+    stop_jitter_filter = plan.get("stop_jitter_filter") or {}
     home_filter = plan.get("home_filter") or {}
-    if home_filter.get("enabled") and home_filter.get("filtered_points"):
+    if stop_jitter_filter.get("enabled") and stop_jitter_filter.get("filtered_points"):
+        lines.insert(
+            9,
+            "Visualization filter: "
+            f"hid {stop_jitter_filter['filtered_points']} stop-jitter points near "
+            f"{stop_jitter_filter.get('anchor_count')} anchors within {stop_jitter_filter.get('radius_m')} m",
+        )
+    elif home_filter.get("enabled") and home_filter.get("filtered_points"):
         lines.insert(
             9,
             f"Visualization filter: hid {home_filter['filtered_points']} home-area points within {home_filter.get('radius_m')} m",

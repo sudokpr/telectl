@@ -203,19 +203,24 @@ Saved review data is stored in `OWNTRACKS_USER_TAGS_PATH`, defaulting to
 coordinates let future visits within about 150 meters reuse names and tags
 automatically. Notes stay tied to the specific visit/date.
 
-To hide dense significant-change samples around home from generated maps and
-heatmaps, enable the visualization filter:
+To hide dense significant-change jitter around stops from daily route maps,
+enable the visualization filter:
 
 ```env
-OWNTRACKS_HOME_FILTER_ENABLED=true
-OWNTRACKS_HOME_REGION_NAMES=Home
-OWNTRACKS_HOME_FILTER_RADIUS_METERS=150
+OWNTRACKS_STOP_JITTER_FILTER_ENABLED=true
+OWNTRACKS_STOP_JITTER_RADIUS_METERS=150
+OWNTRACKS_STOP_JITTER_MIN_DWELL_MINUTES=10
+OWNTRACKS_STOP_JITTER_INCLUDE_GEOFENCES=true
+OWNTRACKS_STOP_JITTER_INCLUDE_CANDIDATE_STOPS=true
 ```
 
-The filter infers home anchors from OwnTracks transition events whose `desc`
-matches `OWNTRACKS_HOME_REGION_NAMES`. It removes visualization points within
-the configured radius, including points that no longer carry `inregions`, but
-it does not modify the raw MQTT log or saved stop review data.
+The filter infers anchors from OwnTracks geofence transition events and the
+bot's candidate stop clusters. It removes route points within the configured
+radius from daily map visualization, including points that no longer carry
+`inregions`, but it does not modify the raw MQTT log, saved stop review data,
+or stop detection. Month/year heatmaps keep stop points by default so they still
+show where time was spent. The older `OWNTRACKS_HOME_FILTER_*` settings remain
+available for home-only heatmap suppression.
 
 The sample OwnTracks systemd units in `systemd/` use `/path/to/telectl` as
 an install-time placeholder. Replace it with this checkout path before
