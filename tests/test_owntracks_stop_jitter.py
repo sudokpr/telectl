@@ -5,8 +5,10 @@ from zoneinfo import ZoneInfo
 
 from owntracks.tagger import (
     Event,
+    HomeFilterConfig,
     StopJitterAnchor,
     StopJitterFilterConfig,
+    build_plan,
     candidate_stops,
     filter_stop_jitter_points,
 )
@@ -111,3 +113,20 @@ def test_candidate_stops_do_not_turn_highway_samples_into_stops() -> None:
     ]
 
     assert candidate_stops(points) == []
+
+
+def test_build_plan_keeps_raw_track_for_filtered_point_overlay() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["walking"]),
+        location(2, 5, 12.9001, 77.5901, inregions=["Home"], motionactivities=["stationary"]),
+        location(3, 10, 12.9010, 77.5910, motionactivities=["walking"]),
+    ]
+
+    plan, _ = build_plan(
+        points,
+        datetime(2026, 6, 12, tzinfo=TZ).date(),
+        home_filter=HomeFilterConfig(enabled=True, region_names=("Home",), radius_m=150),
+    )
+
+    assert [point["line"] for point in plan["raw_sampled_track"]] == [1, 2, 3]
+    assert [point["line"] for point in plan["sampled_track"]] == [1, 3]

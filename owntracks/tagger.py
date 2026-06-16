@@ -2976,6 +2976,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         {
             "date": plan["date"],
             "track": track,
+            "rawSampledTrack": plan.get("raw_sampled_track", plan.get("sampled_track", [])),
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
             "namedPlaces": named_places,
@@ -3457,6 +3458,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="toggleStopLabels" type="button" class="secondary">Hide stop labels</button>
         <button id="togglePlaceLabels" type="button" class="secondary">Hide point labels</button>
       </div>
+      <button id="toggleFilteredPoints" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show filtered points</button>
       <div class="profile">
         <div class="profile-title">Route animation</div>
         <div class="row">
@@ -3546,12 +3548,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     const edgeLayer = L.layerGroup().addTo(map);
     const arrowLayer = L.layerGroup().addTo(map);
     const routeLayer = L.layerGroup().addTo(map);
+    const filteredPointLayer = L.layerGroup();
     const animationLayer = L.layerGroup().addTo(map);
     let activeMotionMode = "all";
     let edgesVisible = true;
     let arrowsVisible = true;
     let stopLabelsVisible = true;
     let placeLabelsVisible = true;
+    let filteredPointsVisible = false;
     let routeColorMode = "speed";
     let profileAxis = "distance";
     let routeAnimationFrame = null;
@@ -3739,8 +3743,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
     const rawTrackPoints = data.sampledTrack || [];
+    const rawUnfilteredTrackPoints = data.rawSampledTrack || rawTrackPoints;
     const rideSegments = data.rideSegments || [];
     const trackPoints = [];
+    const visibleTrackLineNumbers = new Set(rawTrackPoints.map((point) => Number(point.line)).filter(Number.isFinite));
+    const filteredTrackPoints = rawUnfilteredTrackPoints.filter((point) => {{
+      const line = Number(point.line);
+      return Number.isFinite(line) && !visibleTrackLineNumbers.has(line);
+    }});
     const rideSegmentsEl = document.getElementById("rideSegments");
     const routeLegend = document.getElementById("routeLegend");
     const routeLegendControl = L.control({{ position: "topright" }});
@@ -3905,6 +3915,19 @@ def render_leaflet_map_html(plan: dict) -> str:
       `;
     }};
     const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const filteredTrackPointsForMode = () => filteredTrackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const filteredPointPopupHtml = (point) => `
+      <div class="segment-popup">
+        <strong>Filtered point</strong>
+        <div class="popup-meta">
+          <div>${{escapeHtml(point.time || "unknown")}}</div>
+          <div>Line: ${{escapeHtml(point.line || "")}}</div>
+          <div>Motion: ${{escapeHtml(point.motion_mode || "unknown")}}</div>
+          <div>Speed: ${{formatSpeed(point.speed_kmh)}} · Accuracy: ${{Number.isFinite(Number(point.accuracy_m)) ? Number(point.accuracy_m).toFixed(0) + " m" : "unknown"}}</div>
+          ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
+        </div>
+      </div>
+    `;
     const segmentPointsFor = (segment) => trackPoints.filter((point) => {{
       const timestamp = Number(point.timestamp);
       return Number.isFinite(timestamp) && timestamp >= Number(segment.start_timestamp) && timestamp <= Number(segment.end_timestamp);
@@ -4265,6 +4288,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         button.classList.toggle("active", button.dataset.motionMode === activeMotionMode);
       }});
       drawRoute();
+      renderFilteredPoints();
     }};
     const syncEdgeButton = () => {{
       const button = document.getElementById("toggleEdges");
@@ -4303,6 +4327,43 @@ def render_leaflet_map_html(plan: dict) -> str:
         placeButton.textContent = placeLabelsVisible ? "Hide point labels" : "Show point labels";
         placeButton.classList.toggle("active", placeLabelsVisible);
       }}
+    }};
+    const syncFilteredPointsButton = () => {{
+      const button = document.getElementById("toggleFilteredPoints");
+      if (!button) return;
+      const count = filteredTrackPointsForMode().length;
+      button.textContent = filteredPointsVisible ? `Hide filtered points (${{count}})` : `Show filtered points (${{count}})`;
+      button.classList.toggle("active", filteredPointsVisible);
+      button.disabled = count === 0;
+    }};
+    const renderFilteredPoints = () => {{
+      filteredPointLayer.clearLayers();
+      const points = filteredTrackPointsForMode();
+      if (!filteredPointsVisible || !points.length) {{
+        filteredPointLayer.remove();
+        syncFilteredPointsButton();
+        return;
+      }}
+      for (const point of points) {{
+        const lat = Number(point.lat);
+        const lon = Number(point.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        L.circleMarker([lat, lon], {{
+          radius: Math.max(3, routePointRadius() + 1),
+          color: "#111827",
+          fillColor: "#f8fafc",
+          fillOpacity: 0.7,
+          opacity: 0.85,
+          weight: 1.5,
+          dashArray: "3 3",
+        }}).bindPopup(filteredPointPopupHtml(point)).addTo(filteredPointLayer);
+      }}
+      filteredPointLayer.addTo(map);
+      syncFilteredPointsButton();
+    }};
+    const setFilteredPointsVisible = (visible) => {{
+      filteredPointsVisible = visible;
+      renderFilteredPoints();
     }};
     const applyLabelVisibility = () => {{
       for (const stop of data.stops) {{
@@ -4674,6 +4735,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("togglePlaceLabels").addEventListener("click", () => {{
       setPlaceLabelsVisible(!placeLabelsVisible);
     }});
+    document.getElementById("toggleFilteredPoints").addEventListener("click", () => {{
+      setFilteredPointsVisible(!filteredPointsVisible);
+    }});
     document.getElementById("routeAnimPlay").addEventListener("click", () => {{
       playRouteAnimation();
     }});
@@ -4713,6 +4777,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     map.on("zoomend", () => {{
       drawRoute();
+      renderFilteredPoints();
       refreshZoomSensitiveMarkers();
       if (!routeAnimationRunning && routeAnimationElapsedMs > 0) renderRouteAnimation(routeAnimationElapsedMs);
     }});
@@ -4720,6 +4785,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     syncArrowButton();
     syncDayNavigationButtons();
     syncLabelButtons();
+    syncFilteredPointsButton();
     applyLabelVisibility();
     syncRouteColorButtons();
     syncProfileAxisButtons();
@@ -4729,6 +4795,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     setActiveMotionMode("all");
     setEdgesVisible(true);
     setArrowsVisible(true);
+    setFilteredPointsVisible(false);
     renderElevationProfile();
     document.getElementById("selectNearby").addEventListener("click", () => {{
       const picked = selectedStops()[0] || data.stops[0];
@@ -4846,6 +4913,7 @@ def build_plan(
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
+        "raw_sampled_track": [point_dict(event) for event in track_points],
         "sampled_track": [point_dict(event) for event in visual_track_points],
         "home_filter": {
             "enabled": bool(home_filter and home_filter.enabled),
