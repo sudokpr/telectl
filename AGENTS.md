@@ -68,5 +68,9 @@ For fuel changes, preserve the approval-before-append flow. Do not append to the
   - `make logs` and `make logs-follow` read the user journal.
   - `make check` runs dependency sync, Python compilation, and pytest.
   - Explicit `make service-*` targets are also available for service operations.
+- In Codex sandboxed runs, avoid retry churn for commands known to require host access:
+  - Use escalation directly for git commands that write `.git` or contact remotes, such as `git add`, `git commit`, and `git push`; `.git` may be mounted read-only in the sandbox.
+  - Use escalation directly for user-systemd operations, such as `make start`, `make stop`, `make restart`, `make status`, `make logs`, and `make logs-follow`; the sandbox may not have access to the user systemd bus or journal.
+  - Normal read-only inspection commands, source edits, `uv --cache-dir .uv-cache run pytest`, and `make check` should run without escalation unless they fail for an environment-specific reason.
 - Restart `telegram-control.service` after changing bot command registration or handlers so Telegram picks up the new behavior.
 - Leave unrelated user edits intact. Do not delete runtime files unless the user asks.
