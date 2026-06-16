@@ -115,6 +115,21 @@ def test_candidate_stops_do_not_turn_highway_samples_into_stops() -> None:
     assert candidate_stops(points) == []
 
 
+def test_candidate_stops_bridge_sparse_same_place_significant_mode_gap() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
+        location(2, 5, 12.90002, 77.59002),
+        location(3, 100, 12.90003, 77.59001, motionactivities=["stationary", "automotive"]),
+    ]
+
+    stops = candidate_stops(points)
+
+    assert len(stops) == 1
+    assert stops[0]["start_line"] == 1
+    assert stops[0]["end_line"] == 3
+    assert stops[0]["duration_minutes"] == 100
+
+
 def test_build_plan_keeps_raw_track_for_filtered_point_overlay() -> None:
     points = [
         location(1, 0, 12.9000, 77.5900, motionactivities=["walking"]),

@@ -720,6 +720,7 @@ def is_stop_candidate_event(event: Event) -> bool:
 
 
 def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 180) -> list[dict]:
+    sparse_same_place_radius_m = min(50, radius_m)
     low_motion = [
         event
         for event in events
@@ -735,7 +736,7 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         center_lon = sum(item.lon or 0 for item in current) / len(current)
         dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
         dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
-        if dist_m <= radius_m and dt_gap <= 45 * 60:
+        if dist_m <= radius_m and (dt_gap <= 45 * 60 or dist_m <= sparse_same_place_radius_m):
             current.append(event)
         else:
             clusters.append(current)
