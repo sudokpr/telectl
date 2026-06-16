@@ -29,6 +29,19 @@ def location(line_no: int, minutes: int, lat: float, lon: float, **payload: obje
     return Event(line_no=line_no, received_at=None, topic="owntracks/test/device", payload=body, local_tz=TZ)
 
 
+def transition(line_no: int, minutes: int, lat: float, lon: float, desc: str, event: str) -> Event:
+    base = datetime(2026, 6, 12, 12, 0, tzinfo=TZ)
+    body = {
+        "_type": "transition",
+        "lat": lat,
+        "lon": lon,
+        "desc": desc,
+        "event": event,
+        "tst": int((base + timedelta(minutes=minutes)).timestamp()),
+    }
+    return Event(line_no=line_no, received_at=None, topic="owntracks/test/device", payload=body, local_tz=TZ)
+
+
 def jitter_config(radius_m: float = 150) -> StopJitterFilterConfig:
     return StopJitterFilterConfig(
         enabled=True,
@@ -145,3 +158,33 @@ def test_build_plan_keeps_raw_track_for_filtered_point_overlay() -> None:
 
     assert [point["line"] for point in plan["raw_sampled_track"]] == [1, 2, 3]
     assert [point["line"] for point in plan["sampled_track"]] == [1, 3]
+
+
+def test_build_plan_keeps_full_day_when_ride_points_are_not_home_bracketed() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
+        location(2, 20, 12.9100, 77.6000, motionactivities=["cycling"]),
+        location(3, 40, 12.9200, 77.6100, motionactivities=["cycling"]),
+        location(4, 80, 12.9300, 77.6200, motionactivities=["stationary"]),
+    ]
+
+    plan, _ = build_plan(points, datetime(2026, 6, 12, tzinfo=TZ).date())
+
+    assert plan["activity_window"]["basis"] == "full day activity review"
+    assert [point["line"] for point in plan["sampled_track"]] == [1, 2, 3, 4]
+
+
+def test_build_plan_uses_home_bracketed_ride_window_when_available() -> None:
+    events = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
+        transition(2, 10, 12.9000, 77.5900, "Home", "leave"),
+        location(3, 20, 12.9100, 77.6000, motionactivities=["cycling"]),
+        location(4, 40, 12.9200, 77.6100, motionactivities=["cycling"]),
+        transition(5, 50, 12.9300, 77.6200, "Home", "enter"),
+        location(6, 80, 12.9300, 77.6200, motionactivities=["stationary"]),
+    ]
+
+    plan, _ = build_plan(events, datetime(2026, 6, 12, tzinfo=TZ).date())
+
+    assert plan["activity_window"]["basis"] == "Home leave to Home enter around ride points"
+    assert [point["line"] for point in plan["sampled_track"]] == [3, 4]

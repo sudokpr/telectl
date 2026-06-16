@@ -448,20 +448,13 @@ def infer_ride_window(events: list[Event]) -> tuple[datetime | None, datetime | 
     first_ride = event_time(ride_points[0])
     last_ride = event_time(ride_points[-1])
     home_events = [event for event in events if event.kind == "transition" and event.payload.get("desc") == "Home"]
-    start = first_ride
-    end = last_ride
-    reason = "first/last inferred ride point"
     leaves = [event_time(event) for event in home_events if event.payload.get("event") == "leave"]
     enters = [event_time(event) for event in home_events if event.payload.get("event") == "enter"]
     prior_leaves = [dt for dt in leaves if dt <= first_ride]
     later_enters = [dt for dt in enters if dt >= last_ride]
-    if prior_leaves:
-        start = max(prior_leaves)
-        reason = "Home leave to Home enter around ride points"
-    if later_enters:
-        end = min(later_enters)
-        reason = "Home leave to Home enter around ride points"
-    return start, end, reason
+    if prior_leaves and later_enters:
+        return max(prior_leaves), min(later_enters), "Home leave to Home enter around ride points"
+    return None, None, "full day activity review; ride points not bracketed by Home transitions"
 
 
 def in_window(event: Event, start: datetime | None, end: datetime | None) -> bool:
