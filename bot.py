@@ -1213,7 +1213,7 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
             return
         filter_text = " ".join(context.args[1:]).strip()
     else:
-        scope_text = remembered_owntracks_map_scope(update, context) or "today"
+        scope_text = remembered_owntracks_map_scope(update, context) or remembered_owntracks_date(update, context) or "today"
         filter_text = ""
     if config.owntracks_map_delivery == "hosted":
         if not config.http_intake.enabled:
@@ -1249,7 +1249,7 @@ async def owntracks_embedded_map_command(update: Update, context: ContextTypes.D
             await update.effective_message.reply_text(f"Usage: /otme [{OWNTRACKS_MAP_SCOPE_USAGE}]")
             return
     else:
-        scope_text = remembered_owntracks_map_scope(update, context) or "today"
+        scope_text = remembered_owntracks_map_scope(update, context) or remembered_owntracks_date(update, context) or "today"
     await send_owntracks_embedded_map(update, context, scope_text)
 
 
