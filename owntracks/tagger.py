@@ -764,7 +764,11 @@ def stop_from_cluster(cluster: list[Event], index: int) -> dict | None:
 
 def same_place_dwell_clusters(events: list[Event], min_minutes: int, radius_m: int) -> list[list[Event]]:
     tight_radius_m = min(80, radius_m)
-    points = [event for event in events if event.is_location]
+    points = [
+        event
+        for event in events
+        if event.is_location and "Home" not in (event.payload.get("inregions") or [])
+    ]
     clusters: list[list[Event]] = []
     current: list[Event] = []
     for event in points:
@@ -792,6 +796,8 @@ def same_place_dwell_clusters(events: list[Event], min_minutes: int, radius_m: i
 
 def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 180) -> list[dict]:
     sparse_same_place_radius_m = min(50, radius_m)
+    location_points = [event for event in events if event.is_location]
+    location_indexes = {id(event): index for index, event in enumerate(location_points)}
     low_motion = [
         event
         for event in events
@@ -807,7 +813,14 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         center_lon = sum(item.lon or 0 for item in current) / len(current)
         dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
         dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
-        if dist_m <= radius_m and (dt_gap <= 45 * 60 or dist_m <= sparse_same_place_radius_m):
+        previous_index = location_indexes[id(current[-1])]
+        event_index = location_indexes[id(event)]
+        stayed_nearby = all(
+            haversine_km(center_lat, center_lon, item.lat or 0, item.lon or 0) * 1000 <= radius_m
+            for item in location_points[previous_index + 1:event_index]
+        )
+        bridge_sparse_gap = dist_m <= sparse_same_place_radius_m and stayed_nearby
+        if dist_m <= radius_m and (dt_gap <= 45 * 60 or bridge_sparse_gap):
             current.append(event)
         else:
             clusters.append(current)

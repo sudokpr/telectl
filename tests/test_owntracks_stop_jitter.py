@@ -171,6 +171,16 @@ def test_candidate_stops_bridge_sparse_same_place_significant_mode_gap() -> None
     assert stops[0]["duration_minutes"] == 100
 
 
+def test_candidate_stops_do_not_bridge_sparse_same_place_gap_across_trip() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
+        location(2, 50, 12.9500, 77.6400, motionactivities=["walking"]),
+        location(3, 100, 12.90003, 77.59001, motionactivities=["stationary"]),
+    ]
+
+    assert candidate_stops(points) == []
+
+
 def test_candidate_stops_include_same_place_dwell_with_bad_speed_sample() -> None:
     points = [
         location(1, 0, 12.9000, 77.5900, motionactivities=["stationary"]),
@@ -183,6 +193,15 @@ def test_candidate_stops_include_same_place_dwell_with_bad_speed_sample() -> Non
     assert stops[0]["start_line"] == 1
     assert stops[0]["end_line"] == 2
     assert stops[0]["duration_minutes"] == 12
+
+
+def test_candidate_stops_same_place_fallback_excludes_home() -> None:
+    points = [
+        location(1, 0, 12.9000, 77.5900, inregions=["Home"], motionactivities=["stationary"]),
+        location(2, 12, 12.90001, 77.59001, inregions=["Home"], vel=7),
+    ]
+
+    assert candidate_stops(points) == []
 
 
 def test_point_dicts_include_waypoint_labels() -> None:
