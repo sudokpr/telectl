@@ -180,7 +180,8 @@ def make_handler(
                         write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid scope"})
                         return
                     try:
-                        _plan, html = generate_hosted_map(match)
+                        filter_text = (parse_qs(parsed.query).get("filter") or [""])[0].strip()
+                        _plan, html = generate_hosted_map(match, filter_text=filter_text or None)
                     except Exception as exc:
                         observe_handler_error("http_owntracks_map", exc)
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
