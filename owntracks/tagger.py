@@ -2498,8 +2498,120 @@ def build_sample_heatmap_summary() -> dict:
     }
 
 
-def render_heatmap_html(summary: dict) -> str:
+def render_static_heatmap_html(summary: dict, *, initial_filter: str | None = None) -> str:
+    title = escape(summary["title"])
+    scope = summary["scope"]
+    stats = summary["stats"]
+    filter_text = (initial_filter or "").strip().lower()
+
+    def matches_filter(spot: dict) -> bool:
+        if not filter_text:
+            return True
+        haystack = " ".join(
+            str(part)
+            for part in [spot.get("label"), spot.get("mode"), *(spot.get("tags") or [])]
+            if part is not None
+        ).lower()
+        return filter_text in haystack
+
+    points = [spot for spot in summary.get("heat_points", []) if matches_filter(spot)]
+    finite_points = [
+        (float(spot["lat"]), float(spot["lon"]), spot)
+        for spot in points
+        if spot.get("lat") is not None and spot.get("lon") is not None
+    ]
+    width = 1200
+    height = 760
+    padding = 70
+    if finite_points:
+        min_lat = min(point[0] for point in finite_points)
+        max_lat = max(point[0] for point in finite_points)
+        min_lon = min(point[1] for point in finite_points)
+        max_lon = max(point[1] for point in finite_points)
+    else:
+        min_lat = max_lat = min_lon = max_lon = 0.0
+    lat_span = max(max_lat - min_lat, 0.00001)
+    lon_span = max(max_lon - min_lon, 0.00001)
+    scale = min((width - padding * 2) / lon_span, (height - padding * 2) / lat_span)
+    x_offset = (width - lon_span * scale) / 2
+    y_offset = (height - lat_span * scale) / 2
+    max_minutes = max((float(spot.get("duration_minutes") or 0) for _lat, _lon, spot in finite_points), default=1.0)
+
+    circles = []
+    for lat, lon, spot in finite_points:
+        x = x_offset + ((lon - min_lon) * scale)
+        y = height - y_offset - ((lat - min_lat) * scale)
+        minutes = float(spot.get("duration_minutes") or 0)
+        visits = int(spot.get("visit_count") or 0)
+        radius = max(8, min(34, 8 + math.sqrt(max(minutes, visits, 1)) * 1.8))
+        opacity = max(0.35, min(0.85, 0.35 + (minutes / max_minutes) * 0.5))
+        label = escape(str(spot.get("label") or f"{lat}, {lon}"))
+        circles.append(
+            f'<g><circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="#d32f2f" '
+            f'fill-opacity="{opacity:.2f}" stroke="#7f1d1d" stroke-width="2"><title>{label} · '
+            f'{round(minutes)} min · {visits} visits</title></circle>'
+            f'<text x="{x + radius + 5:.1f}" y="{y + 4:.1f}">{label}</text></g>'
+        )
+
+    ranked = sorted(points, key=lambda spot: float(spot.get("duration_minutes") or 0), reverse=True)[:20]
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{escape(str(spot.get('label') or 'unnamed'))}</td>"
+        f"<td>{escape(str(spot.get('mode') or 'moving'))}</td>"
+        f"<td>{int(spot.get('visit_count') or 0)}</td>"
+        f"<td>{round(float(spot.get('duration_minutes') or 0))}</td>"
+        f"<td>{escape(', '.join(str(tag) for tag in spot.get('tags') or []))}</td>"
+        "</tr>"
+        for spot in ranked
+    )
+    filter_note = f"<p>Filter: <strong>{escape(initial_filter or '')}</strong></p>" if initial_filter else ""
+    empty = "" if points else '<div class="empty">No heatmap points matched this scope/filter.</div>'
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #0f172a; }}
+    header {{ padding: 16px 20px; background: white; border-bottom: 1px solid #cbd5e1; }}
+    h1 {{ font-size: 20px; margin: 0 0 6px; }}
+    .subtle {{ color: #475569; font-size: 13px; }}
+    .wrap {{ display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); padding: 16px; }}
+    svg {{ background: #e2e8f0; border: 1px solid #cbd5e1; border-radius: 10px; height: auto; max-width: 100%; }}
+    text {{ fill: #0f172a; font-size: 12px; font-weight: 700; paint-order: stroke; stroke: white; stroke-width: 3px; }}
+    table {{ border-collapse: collapse; width: 100%; background: white; }}
+    th, td {{ border: 1px solid #e2e8f0; padding: 7px 9px; text-align: left; font-size: 13px; }}
+    th {{ background: #f1f5f9; }}
+    .empty {{ background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{title}</h1>
+    <div class="subtle">{scope["start"]} to {scope["end"]} · {stats["location_points"]} points · {stats["unique_locations"]} locations</div>
+    {filter_note}
+  </header>
+  <main class="wrap">
+    {empty}
+    <svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">
+      <rect x="0" y="0" width="{width}" height="{height}" fill="#e2e8f0"></rect>
+      {''.join(circles)}
+    </svg>
+    <section>
+      <h2>Top locations</h2>
+      <table><thead><tr><th>Location</th><th>Mode</th><th>Visits</th><th>Minutes</th><th>Tags</th></tr></thead><tbody>{rows}</tbody></table>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, self_contained: bool = False) -> str:
+    if self_contained:
+        return render_static_heatmap_html(summary, initial_filter=initial_filter)
     payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
+    initial_filter_payload = json.dumps(initial_filter or "", ensure_ascii=False).replace("</", "<\\/")
     title = escape(summary["title"])
     scope = summary["scope"]
     stats = summary["stats"]
@@ -2793,6 +2905,7 @@ def render_heatmap_html(summary: dict) -> str:
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
   <script>
     const data = {payload};
+    const initialFilterText = {initial_filter_payload};
     const allSpots = data.heat_points.map((item) => ({{
       lat: item.lat,
       lon: item.lon,
@@ -2888,7 +3001,7 @@ def render_heatmap_html(summary: dict) -> str:
         fillOpacity: 0.78,
       }});
       marker.bindTooltip(`${{spot.label}} · ${{metricLabel(spot)}}`, {{ permanent: false, direction: "right", className: "place-label" }});
-      marker.bindPopup(`<strong>${{spot.label}}</strong><br>${{metricConfig().title}}: ${{metricLabel(spot)}}<br>Visits: ${{spot.visitCount || 0}}<br>Raw points: ${{spot.rawCount || 0}}`);
+      marker.bindPopup(`<strong>${{escapeHtml(spot.label)}}</strong><br>${{metricConfig().title}}: ${{escapeHtml(metricLabel(spot))}}<br>Visits: ${{spot.visitCount || 0}}<br>Raw points: ${{spot.rawCount || 0}}`);
       marker.on("click", () => {{
         centerAndZoom(spot);
         marker.openPopup();
@@ -2921,6 +3034,10 @@ def render_heatmap_html(summary: dict) -> str:
       const high = document.getElementById("heatLegendHigh");
       if (high) high.textContent = metricConfig().highLabel;
     }};
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"]/g, (char) => char === "&" ? "&amp;" : char === "<" ? "&lt;" : char === ">" ? "&gt;" : "&quot;");
+    const normalizeFilterText = (value) => String(value || "").trim().toLowerCase();
+    const params = new URLSearchParams(window.location.search || "");
+    const requestedFilter = normalizeFilterText(initialFilterText || params.get("filter") || "");
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
     const motionSummary = data.motion_summary || {{}};
     const modeCounts = motionSummary.counts || {{}};
@@ -2946,6 +3063,7 @@ def render_heatmap_html(summary: dict) -> str:
         : `Dominant motion: ${{dominant}}`;
     }};
     const modeMatches = (spot) => activeMode === "all" || (spot.mode || "moving") === activeMode;
+    const textMatches = (spot) => !requestedFilter || [spot.label, spot.mode, ...(spot.tags || [])].some((part) => normalizeFilterText(part).includes(requestedFilter));
     const setPointsVisible = (visible) => {{
       pointsVisible = visible;
       if (pointsVisible) {{
@@ -2956,7 +3074,7 @@ def render_heatmap_html(summary: dict) -> str:
       syncPointsButton();
     }};
     const applyFilter = (fit = false) => {{
-      filteredSpots = allSpots.filter((spot) => modeMatches(spot));
+      filteredSpots = allSpots.filter((spot) => modeMatches(spot) && textMatches(spot));
       const weightedSpots = filteredSpots
         .map((spot) => [spot.lat, spot.lon, metricValue(spot)])
         .filter((spot) => spot[2] > 0);
@@ -2994,8 +3112,8 @@ def render_heatmap_html(summary: dict) -> str:
       }}
       root.innerHTML = items.map((spot) => `
         <div class="spot" data-lat="${{spot.lat}}" data-lon="${{spot.lon}}">
-          <div class="name">${{spot.label}}</div>
-          <div class="count">${{metricLabel(spot)}}</div>
+          <div class="name">${{escapeHtml(spot.label)}}</div>
+          <div class="count">${{escapeHtml(metricLabel(spot))}}</div>
         </div>
       `).join("");
       root.querySelectorAll(".spot").forEach((row) => {{

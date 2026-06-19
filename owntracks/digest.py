@@ -82,7 +82,7 @@ def build_plan_for_date(date_text: str | None = None) -> tuple[dict, list]:
     return build_plan(events, target_date, user_tags, home_filter, stop_jitter_filter)
 
 
-def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
+def generate_hosted_map(date_text: str | None = None, *, filter_text: str | None = None) -> tuple[dict, str]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
@@ -97,7 +97,7 @@ def generate_hosted_map(date_text: str | None = None) -> tuple[dict, str]:
         plan, _track_points = build_plan(events, scope.start_date, user_tags, home_filter, stop_jitter_filter)
         return plan, render_leaflet_map_html(plan)
     summary = build_heatmap_summary(events, scope, user_tags, home_filter)
-    return summary, render_heatmap_html(summary)
+    return summary, render_heatmap_html(summary, initial_filter=filter_text)
 
 
 def generate_sample_heatmap() -> tuple[dict, str]:
@@ -136,7 +136,7 @@ def generate_owntracks_visualization(scope_text: str | None = None) -> tuple[dic
         return summary, render_leaflet_map_html(plan), map_path
 
     summary = build_heatmap_summary(events, scope, user_tags, home_filter)
-    html = render_heatmap_html(summary)
+    html = render_heatmap_html(summary, self_contained=True)
     map_path = derived_dir / f"activity-map-{scope.value}.html"
     map_path.write_text(html, encoding="utf-8")
     summary_path = derived_dir / f"activity-heatmap-{scope.value}.json"
