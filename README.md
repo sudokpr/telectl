@@ -85,6 +85,10 @@ In hosted mode, `/otm` replies with a link like
 `/owntracks/map/YYYY-MM-DD?token=...` instead of attaching the HTML file. The
 hosted route renders the map dynamically from the OwnTracks log on each
 request, so there is no per-day HTML file to regenerate for map UI changes.
+Use `/otme` to force a self-contained embedded HTML attachment even when hosted
+delivery is configured. Embedded attachments download OpenStreetMap tiles during
+generation and store them as data URLs, so Telegram does not need to fetch map
+tiles when the file is opened.
 
 The bot starts `codex remote-control` by default. If the bot runs under a
 service manager with a minimal `PATH`, set `CODEX_REMOTE_COMMAND` to an
@@ -109,6 +113,7 @@ The bot registers these Telegram menu commands:
 - `/memq` - ask saved memories
 - `/otd` - show an OwnTracks daily activity digest
 - `/otm` - send an interactive labeled OwnTracks stop map
+- `/otme` - send an embedded OwnTracks stop map attachment
 - `/otb` - bulk-save stop names, tags, and notes exported by the map
 - `/ott` - tag a stop from the latest OwnTracks digest
 - `/otn` - name a stop from the latest OwnTracks digest
@@ -133,17 +138,23 @@ The digest lists named geofence events and candidate stops with Google Maps
 links, motion, duration, and point count. File delivery writes a self-contained
 HTML map attachment. Hosted delivery serves a dynamic Leaflet map from
 `/owntracks/map/YYYY-MM-DD`, which gives normal browser tile loading and zoom.
-Background map tiles are loaded from OpenStreetMap when the hosted map is
-opened. For Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map,
-you can select stops, click a stop for a popup editor, rename stops locally,
-add tags/notes, and copy a generated `/otb` command back into Telegram to save
+Month and year scopes such as `/owntracks/map/YYYY-MM` and
+`/owntracks/map/YYYY` render heatmaps instead of the daily stop map. Background
+map tiles are loaded from OpenStreetMap when the hosted map is opened. The
+heatmap panel can filter locations by motion mode. `/owntracks/sample` serves a
+synthetic heatmap with points across countries, cities, and city areas for
+visual testing without OwnTracks logs. For
+Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
+select stops, click a stop for a popup editor, rename stops locally, add
+tags/notes, and copy a generated `/otb` command back into Telegram to save
 those reviews. Each stop gets a short alias such as `s1`, `s2`, etc.
 
 Short commands in the OwnTracks topic:
 
 ```text
 /otd [today|yesterday|DD|MM-DD|YYYY-MM-DD]
-/otm [today|yesterday|DD|MM-DD|YYYY-MM-DD]
+/otm [today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY]
+/otme [today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY]
 /otb 2026-06-06
 s1 Local saloon | tags: haircut saloon | note: paid by UPI
 s2 Local saloon
@@ -159,7 +170,10 @@ means June 16 of the current year:
 
 ```text
 /otm 16
+/otme 16
 /otm 06-16
+/otm 2026-06
+/otm 2026
 /ott 2026-06-06 s1 property-tax govt-office
 ```
 

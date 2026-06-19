@@ -15,7 +15,7 @@ from telegram.ext import Application
 
 from image_summary import ImageSummaryConfig, log, split_message
 from memory_processor import save_memory
-from owntracks.digest import generate_hosted_map
+from owntracks.digest import generate_hosted_map, generate_sample_heatmap
 
 
 @dataclass(frozen=True)
@@ -120,16 +120,34 @@ def make_handler(
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if parsed.path in {"/owntracks/sample", "/owntracks/sample.html"}:
+                if not authorized(self, http_cfg.token):
+                    write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                    return
+                try:
+                    _summary, html = generate_sample_heatmap()
+                except Exception as exc:
+                    write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                body = html.encode("utf-8")
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             match = parsed.path.removeprefix("/owntracks/map/").removesuffix(".html")
             if parsed.path.startswith("/owntracks/map/") and match:
                 if not authorized(self, http_cfg.token):
                     write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
                     return
-                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", match):
-                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid date"})
+                if not re.fullmatch(r"\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?", match):
+                    write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid scope"})
                     return
                 try:
-                    _plan, html = generate_hosted_map(match)
+                    filter_text = (parse_qs(parsed.query).get("filter") or [""])[0].strip()
+                    _plan, html = generate_hosted_map(match, filter_text=filter_text or None)
                 except Exception as exc:
                     write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                     return

@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,15 +34,20 @@ from owntracks.env import load_env as load_owntracks_env
 
 BASE_DIR = Path(__file__).resolve().parent
 from owntracks.digest import generate_digest as generate_owntracks_digest
+from owntracks.digest import generate_owntracks_visualization
 from owntracks.env import project_path as owntracks_project_path
 from owntracks.tagger import load_user_tags as load_owntracks_user_tags
 from owntracks.tagger import save_user_tags as save_owntracks_user_tags
-from owntracks.tagger import target_date_from_text as owntracks_target_date_from_text
+from owntracks.tagger import target_scope_from_text as owntracks_target_scope_from_text
 
 RUN_DIR = BASE_DIR / "run"
 LOG_DIR = BASE_DIR / "logs"
 PID_FILE = RUN_DIR / "codex-remote-control.pid"
 LOG_FILE = LOG_DIR / "codex-remote-control.log"
+CODEX_APP_SERVER_DAEMON_DIR = Path.home() / ".codex" / "app-server-daemon"
+CODEX_REMOTE_STOP_TIMEOUT_SECONDS = 12
+CODEX_REMOTE_START_TIMEOUT_SECONDS = 60
+CODEX_REMOTE_STATUS_TIMEOUT_SECONDS = 20
 
 COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
     ("cmd", "list bot command shortcuts"),
@@ -51,6 +57,7 @@ COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
     ("memq", "ask saved memories"),
     ("otd", "show OwnTracks activity digest"),
     ("otm", "send interactive OwnTracks map"),
+    ("otme", "send embedded OwnTracks map"),
     ("otb", "bulk-save OwnTracks stop reviews"),
     ("ott", "tag an OwnTracks stop"),
     ("otn", "name an OwnTracks stop"),
@@ -60,6 +67,10 @@ COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
 
 OWNTRACKS_DATE_RE = re.compile(r"(?:today|yesterday|\d{1,2}|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})")
 OWNTRACKS_DATE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD"
+OWNTRACKS_MAP_SCOPE_RE = re.compile(
+    r"(?:today|yesterday|\d{1,2}|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2}|\d{4}-\d{1,2}|\d{4})"
+)
+OWNTRACKS_MAP_SCOPE_USAGE = "today|yesterday|DD|MM-DD|YYYY-MM-DD|YYYY-MM|YYYY"
 
 
 @dataclass(frozen=True)
@@ -193,16 +204,46 @@ def append_log(command: str, result: subprocess.CompletedProcess[str]) -> None:
         log.write(f"[exit {result.returncode}]\n")
 
 
+def append_log_note(title: str, body: str) -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as log:
+        log.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {title}\n")
+        log.write(body.rstrip() or "(no output)")
+        log.write("\n")
+
+
 def run_shell_command(command: str, workdir: Path, timeout: int = 45) -> subprocess.CompletedProcess[str]:
     workdir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["/bin/bash", "-lc", command],
-        cwd=workdir,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-lc", command],
+            cwd=workdir,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        stderr = "\n".join(
+            part
+            for part in [
+                str(stderr).rstrip(),
+                f"Command timed out after {timeout} seconds.",
+            ]
+            if part
+        )
+        result = subprocess.CompletedProcess(
+            args=exc.cmd,
+            returncode=124,
+            stdout=str(stdout),
+            stderr=stderr,
+        )
     append_log(command, result)
     return result
 
@@ -235,21 +276,99 @@ def daemon_version_command(config: Config) -> str:
     return f"{shlex.quote(parts[0])} app-server daemon version"
 
 
+def read_codex_daemon_pid(path: Path) -> int | None:
+    try:
+        match = re.search(r'"pid"\s*:\s*(\d+)', path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def process_command(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return None
+
+
+def process_state(pid: int) -> str | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("State:"):
+                return line
+    except OSError:
+        return None
+    return None
+
+
+def cleanup_stale_codex_daemon_state() -> str:
+    notes: list[str] = []
+    for pid_file in [
+        CODEX_APP_SERVER_DAEMON_DIR / "app-server.pid",
+        CODEX_APP_SERVER_DAEMON_DIR / "app-server-updater.pid",
+    ]:
+        pid = read_codex_daemon_pid(pid_file)
+        if not pid:
+            continue
+        command = process_command(pid)
+        state = process_state(pid) or ""
+        if not command:
+            notes.append(f"{pid_file.name}: pid {pid} not running")
+            continue
+        if "codex" not in command or "app-server" not in command:
+            notes.append(f"{pid_file.name}: pid {pid} is not a Codex app-server process")
+            continue
+        if "State:\tZ" in state:
+            notes.append(f"{pid_file.name}: pid {pid} is defunct")
+            continue
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            notes.append(f"{pid_file.name}: pid {pid} already exited")
+        except PermissionError as exc:
+            notes.append(f"{pid_file.name}: could not terminate pid {pid}: {exc}")
+        else:
+            for _ in range(10):
+                time.sleep(0.1)
+                if not process_command(pid):
+                    break
+            notes.append(f"{pid_file.name}: terminated stale pid {pid}")
+    return "\n".join(notes) if notes else "No stale Codex app-server PIDs found."
+
+
 def start_process(config: Config) -> subprocess.CompletedProcess[str]:
     RUN_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     if config.codex_remote_detached:
-        return run_shell_command(detached_remote_start_command(config), config.workdir)
-    return run_shell_command(remote_command(config, "start"), config.workdir)
+        return run_shell_command(
+            detached_remote_start_command(config),
+            config.workdir,
+            timeout=CODEX_REMOTE_START_TIMEOUT_SECONDS,
+        )
+    return run_shell_command(
+        remote_command(config, "start"),
+        config.workdir,
+        timeout=CODEX_REMOTE_START_TIMEOUT_SECONDS,
+    )
 
 
 def stop_remote_control(config: Config) -> subprocess.CompletedProcess[str]:
     PID_FILE.unlink(missing_ok=True)
-    return run_shell_command(remote_command(config, "stop"), config.workdir)
+    return run_shell_command(
+        remote_command(config, "stop"),
+        config.workdir,
+        timeout=CODEX_REMOTE_STOP_TIMEOUT_SECONDS,
+    )
 
 
 def check_daemon(config: Config) -> subprocess.CompletedProcess[str]:
-    return run_shell_command(daemon_version_command(config), config.workdir)
+    return run_shell_command(
+        daemon_version_command(config),
+        config.workdir,
+        timeout=CODEX_REMOTE_STATUS_TIMEOUT_SECONDS,
+    )
 
 
 def command_summary(result: subprocess.CompletedProcess[str]) -> str:
@@ -913,8 +1032,21 @@ async def codex_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         stop_result = await asyncio.to_thread(stop_remote_control, config)
+        recovery_notes = ""
+        recovered = False
+        if stop_result.returncode == 124:
+            recovery_notes = await asyncio.to_thread(cleanup_stale_codex_daemon_state)
+            await asyncio.to_thread(append_log_note, "Codex stale daemon cleanup after stop timeout", recovery_notes)
+            recovered = True
         start_result = await asyncio.to_thread(start_process, config)
         status_result = await asyncio.to_thread(check_daemon, config)
+        if start_result.returncode != 0 or status_result.returncode != 0:
+            retry_notes = await asyncio.to_thread(cleanup_stale_codex_daemon_state)
+            await asyncio.to_thread(append_log_note, "Codex stale daemon cleanup before restart retry", retry_notes)
+            start_result = await asyncio.to_thread(start_process, config)
+            status_result = await asyncio.to_thread(check_daemon, config)
+            recovery_notes = "\n".join(part for part in [recovery_notes, retry_notes] if part)
+            recovered = True
     except Exception as exc:
         await update.effective_message.reply_text(
             f"Failed to start codex remote-control: {exc}\nLog: {LOG_FILE}"
@@ -927,6 +1059,7 @@ async def codex_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Restarted codex remote-control daemon.\n"
             f"Mode: {start_mode}\n"
             f"Command: {remote_command(config, 'start')}\n"
+            f"Recovery: {'stale daemon cleanup + retry' if recovered else 'not needed'}\n"
             f"Status: {command_summary(status_result)}\n"
             f"Log: {LOG_FILE}"
         )
@@ -938,6 +1071,7 @@ async def codex_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Start exit: {start_result.returncode}\n"
         f"Status exit: {status_result.returncode}\n"
         f"Command: {remote_command(config, 'start')}\n"
+        f"Recovery output: {recovery_notes or '(not run)'}\n"
         f"Output: {command_summary(status_result)}\n"
         f"Log: {LOG_FILE}"
     )
@@ -1022,7 +1156,7 @@ async def owntracks_digest_command(update: Update, context: ContextTypes.DEFAULT
         await update.effective_message.reply_text(chunk, disable_web_page_preview=False)
 
 
-def owntracks_map_url(config: Config, date_text: str) -> str:
+def owntracks_map_url(config: Config, date_text: str, filter_text: str | None = None) -> str:
     base_url = config.owntracks_map_base_url
     if not base_url:
         host = config.http_intake.host
@@ -1030,9 +1164,42 @@ def owntracks_map_url(config: Config, date_text: str) -> str:
             host = "127.0.0.1"
         base_url = f"http://{host}:{config.http_intake.port}"
     url = f"{base_url.rstrip('/')}/owntracks/map/{quote(date_text)}"
+    query: dict[str, str] = {}
     if config.http_intake.token:
-        url += "?" + urlencode({"token": config.http_intake.token})
+        query["token"] = config.http_intake.token
+    if filter_text:
+        query["filter"] = filter_text
+    if query:
+        url += "?" + urlencode(query)
     return url
+
+
+def remember_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT_TYPE, scope_text: str) -> None:
+    context.bot_data.setdefault("owntracks_last_map_scope", {})[owntracks_session_key(update)] = scope_text
+
+
+def remembered_owntracks_map_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    return context.bot_data.setdefault("owntracks_last_map_scope", {}).get(owntracks_session_key(update))
+
+
+async def send_owntracks_embedded_map(update: Update, context: ContextTypes.DEFAULT_TYPE, scope_text: str) -> None:
+    try:
+        summary, _html, map_path = await asyncio.to_thread(generate_owntracks_visualization, scope_text)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not generate OwnTracks embedded map: {exc}")
+        return
+    if not map_path.exists():
+        await update.effective_message.reply_text(f"OwnTracks embedded map was not written: {map_path}")
+        return
+    remember_owntracks_map_scope(update, context, summary["scope"]["value"])
+    caption_kind = "heatmap" if summary["scope"]["kind"] != "day" else "map"
+    caption = f"OwnTracks embedded {caption_kind} for {summary['scope']['value']}."
+    with map_path.open("rb") as handle:
+        await update.effective_message.reply_document(
+            document=handle,
+            filename=map_path.name,
+            caption=caption,
+        )
 
 
 async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1040,12 +1207,14 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not await owntracks_guarded(update, config):
         return
     if context.args:
-        date_text = context.args[0]
-        if not OWNTRACKS_DATE_RE.fullmatch(date_text):
-            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_DATE_USAGE}]")
+        scope_text = context.args[0]
+        if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
+            await update.effective_message.reply_text(f"Usage: /otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]")
             return
+        filter_text = " ".join(context.args[1:]).strip()
     else:
-        date_text = remembered_owntracks_date(update, context) or "today"
+        scope_text = remembered_owntracks_map_scope(update, context) or remembered_owntracks_date(update, context) or "today"
+        filter_text = ""
     if config.owntracks_map_delivery == "hosted":
         if not config.http_intake.enabled:
             await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY=hosted requires HTTP_INTAKE_ENABLED=true.")
@@ -1053,37 +1222,35 @@ async def owntracks_map_command(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             owntracks_env = load_owntracks_env()
             owntracks_tz = ZoneInfo(owntracks_env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
-            resolved_date = owntracks_target_date_from_text(date_text, owntracks_tz).isoformat()
+            resolved_scope = owntracks_target_scope_from_text(scope_text, owntracks_tz)
         except Exception as exc:
-            await update.effective_message.reply_text(f"Could not resolve OwnTracks map date: {exc}")
+            await update.effective_message.reply_text(f"Could not resolve OwnTracks map scope: {exc}")
             return
-        remember_owntracks_date(update, context, resolved_date)
-        url = owntracks_map_url(config, resolved_date)
+        remember_owntracks_map_scope(update, context, resolved_scope.value)
+        url = owntracks_map_url(config, resolved_scope.value, filter_text or None)
         await update.effective_message.reply_text(
-            f"OwnTracks map for {resolved_date}:\n{url}",
+            f"OwnTracks {resolved_scope.kind} visualization for {resolved_scope.value}:\n{url}",
             disable_web_page_preview=True,
         )
         return
     if config.owntracks_map_delivery not in {"file", "html", "attachment"}:
         await update.effective_message.reply_text("OWNTRACKS_MAP_DELIVERY must be 'file' or 'hosted'.")
         return
-    try:
-        plan, _digest, digest_path = await asyncio.to_thread(generate_owntracks_digest, date_text)
-    except Exception as exc:
-        await update.effective_message.reply_text(f"Could not generate OwnTracks map: {exc}")
+    await send_owntracks_embedded_map(update, context, scope_text)
+
+
+async def owntracks_embedded_map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not await owntracks_guarded(update, config):
         return
-    remember_owntracks_date(update, context, plan["date"])
-    map_path = digest_path.with_name(f"activity-map-{plan['date']}.html")
-    if not map_path.exists():
-        await update.effective_message.reply_text(f"OwnTracks map was not written: {map_path}")
-        return
-    caption = f"OwnTracks map for {plan['date']} with labeled stops."
-    with map_path.open("rb") as handle:
-        await update.effective_message.reply_document(
-            document=handle,
-            filename=map_path.name,
-            caption=caption,
-        )
+    if context.args:
+        scope_text = context.args[0]
+        if not OWNTRACKS_MAP_SCOPE_RE.fullmatch(scope_text):
+            await update.effective_message.reply_text(f"Usage: /otme [{OWNTRACKS_MAP_SCOPE_USAGE}]")
+            return
+    else:
+        scope_text = remembered_owntracks_map_scope(update, context) or remembered_owntracks_date(update, context) or "today"
+    await send_owntracks_embedded_map(update, context, scope_text)
 
 
 def owntracks_session_key(update: Update) -> str:
@@ -1329,7 +1496,8 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.effective_message.reply_text(
         "OwnTracks commands:\n"
         f"/otd [{OWNTRACKS_DATE_USAGE}]\n"
-        f"/otm [{OWNTRACKS_DATE_USAGE}]\n"
+        f"/otm [{OWNTRACKS_MAP_SCOPE_USAGE}] [filter words]\n"
+        f"/otme [{OWNTRACKS_MAP_SCOPE_USAGE}]\n"
         f"/otb {OWNTRACKS_DATE_USAGE} then lines like: s1 Place | tags: tag1 tag2 | note: text\n"
         "/ott s1 tag1 tag2\n"
         "/otn s1 place name\n"
@@ -1384,6 +1552,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["oth", "owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
     application.add_handler(CommandHandler(["otd", "ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
     application.add_handler(CommandHandler(["otm", "ot_map", "owntracks_map"], owntracks_map_command))
+    application.add_handler(CommandHandler(["otme", "ot_map_embed", "owntracks_map_embed"], owntracks_embedded_map_command))
     application.add_handler(CommandHandler(["otb", "ot_names", "owntracks_names"], owntracks_names_command))
     application.add_handler(CommandHandler(["ott", "tag", "owntracks_tag", "ot_tag"], owntracks_tag_command))
     application.add_handler(CommandHandler(["otn", "name", "owntracks_name", "ot_name"], owntracks_name_command))
