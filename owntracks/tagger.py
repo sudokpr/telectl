@@ -14,6 +14,8 @@ import re
 import urllib.error
 import urllib.request
 
+from metrics import OWNTRACKS_MAP_TILE_FETCHES_TOTAL
+
 
 LINE_RE = re.compile(r"^(\S+)\s+(\S+)\s+(\{.*\})$")
 
@@ -788,6 +790,7 @@ def fetch_tile_data_uri(zoom: int, x: int, y: int, cache_dir: Path | None) -> st
     try:
         if cache_path.exists():
             data = cache_path.read_bytes()
+            OWNTRACKS_MAP_TILE_FETCHES_TOTAL.labels(result="cache_hit").inc()
         else:
             url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
             request = urllib.request.Request(
@@ -798,7 +801,9 @@ def fetch_tile_data_uri(zoom: int, x: int, y: int, cache_dir: Path | None) -> st
                 data = response.read()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_bytes(data)
+            OWNTRACKS_MAP_TILE_FETCHES_TOTAL.labels(result="downloaded").inc()
     except (OSError, urllib.error.URLError, TimeoutError):
+        OWNTRACKS_MAP_TILE_FETCHES_TOTAL.labels(result="error").inc()
         return None
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
