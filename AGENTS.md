@@ -57,6 +57,8 @@ For fuel changes, preserve the approval-before-append flow. Do not append to the
 - OwnTracks map delivery is controlled by `OWNTRACKS_MAP_DELIVERY=file|hosted`. Preserve both modes: file mode sends the self-contained HTML attachment, hosted mode sends a local HTTP URL served from `/owntracks/map/YYYY-MM-DD` and renders the Leaflet map dynamically from the OwnTracks log without relying on a saved per-day HTML file.
 - OwnTracks map scope supports `today`, `yesterday`, `DD`, `MM-DD`, `YYYY-MM-DD`, `YYYY-MM`, and `YYYY`. Day scopes render the labeled stop map; month/year scopes render an aggregated heatmap at `/owntracks/map/YYYY-MM` or `/owntracks/map/YYYY`.
 - OwnTracks heatmaps support client-side filtering by motion mode. Keep the `all`, `stationary`, `walking`, `cycling`, `automotive`, and `moving` modes in sync between the panel, heat layer, and any motion summaries. `/owntracks/sample` serves a synthetic heatmap for visual testing without real OwnTracks logs.
+- OwnTracks stop-jitter and home filtering are visualization-only. Preserve raw MQTT logs, saved stop review data, digest stop detection, and heatmap stop semantics when changing `OWNTRACKS_STOP_JITTER_FILTER_ENABLED`, `OWNTRACKS_STOP_JITTER_RADIUS_METERS`, `OWNTRACKS_STOP_JITTER_MIN_DWELL_MINUTES`, `OWNTRACKS_HOME_FILTER_ENABLED`, `OWNTRACKS_HOME_REGION_NAMES`, or `OWNTRACKS_HOME_FILTER_RADIUS_METERS`.
+- OwnTracks stop-jitter filtering must preserve route connector points for stop boundaries and OwnTracks transition points (`t="c"`), so repeated trips such as office -> lunch -> office -> snacks -> office do not collapse into a single edge. Keep `tests/test_owntracks_stop_jitter.py` aligned with this behavior.
 - Preserve compatibility with legacy OwnTracks saved stop IDs such as `unnamed-stop-17` when current generated stop IDs include line ranges such as `unnamed-stop-17-547-551`.
 - OwnTracks saved stop reviews include coordinates when available. Future stops within about 150 meters may inherit saved names and tags by proximity, but notes are visit/date-specific and should not be inherited automatically.
 - OwnTracks date arguments for `/otd` still support `today`, `yesterday`, `DD`, `MM-DD`, and `YYYY-MM-DD`. `DD` uses the current month and year; `MM-DD` uses the current year. Keep bot validation and help text aligned with `target_date_from_text`.
@@ -64,7 +66,11 @@ For fuel changes, preserve the approval-before-append flow. Do not append to the
   - `make start` creates/starts the transient user systemd service with `systemd-run`.
   - `make stop`, `make restart`, and `make status` manage `telegram-control.service`.
   - `make logs` and `make logs-follow` read the user journal.
-  - `make check` runs dependency sync and Python compilation.
+  - `make check` runs dependency sync, Python compilation, and pytest.
   - Explicit `make service-*` targets are also available for service operations.
+- In Codex sandboxed runs, avoid retry churn for commands known to require host access:
+  - Use escalation directly for git commands that write `.git` or contact remotes, such as `git add`, `git commit`, and `git push`; `.git` may be mounted read-only in the sandbox.
+  - Use escalation directly for user-systemd operations, such as `make start`, `make stop`, `make restart`, `make status`, `make logs`, and `make logs-follow`; the sandbox may not have access to the user systemd bus or journal.
+  - Normal read-only inspection commands, source edits, `uv --cache-dir .uv-cache run pytest`, and `make check` should run without escalation unless they fail for an environment-specific reason.
 - Restart `telegram-control.service` after changing bot command registration or handlers so Telegram picks up the new behavior.
 - Leave unrelated user edits intact. Do not delete runtime files unless the user asks.

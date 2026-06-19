@@ -83,11 +83,65 @@ class OwnTracksScope:
     end_date: date
 
 
+@dataclass(frozen=True)
+class HomeFilterConfig:
+    enabled: bool
+    region_names: tuple[str, ...]
+    radius_m: float
+
+
+@dataclass(frozen=True)
+class StopJitterFilterConfig:
+    enabled: bool
+    radius_m: float
+    min_dwell_minutes: int
+    include_geofences: bool
+    include_candidate_stops: bool
+
+
+@dataclass(frozen=True)
+class StopJitterAnchor:
+    lat: float
+    lon: float
+    label: str
+    kind: str
+
+
 def as_float(value: object) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def env_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return default
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def build_home_filter_config(env: dict[str, str]) -> HomeFilterConfig:
+    return HomeFilterConfig(
+        enabled=env_bool(env.get("OWNTRACKS_HOME_FILTER_ENABLED"), False),
+        region_names=env_list(env.get("OWNTRACKS_HOME_REGION_NAMES"), ("Home",)),
+        radius_m=float(env.get("OWNTRACKS_HOME_FILTER_RADIUS_METERS") or 150),
+    )
+
+
+def build_stop_jitter_filter_config(env: dict[str, str]) -> StopJitterFilterConfig:
+    return StopJitterFilterConfig(
+        enabled=env_bool(env.get("OWNTRACKS_STOP_JITTER_FILTER_ENABLED"), False),
+        radius_m=float(env.get("OWNTRACKS_STOP_JITTER_RADIUS_METERS") or 150),
+        min_dwell_minutes=int(env.get("OWNTRACKS_STOP_JITTER_MIN_DWELL_MINUTES") or 10),
+        include_geofences=env_bool(env.get("OWNTRACKS_STOP_JITTER_INCLUDE_GEOFENCES"), True),
+        include_candidate_stops=env_bool(env.get("OWNTRACKS_STOP_JITTER_INCLUDE_CANDIDATE_STOPS"), True),
+    )
 
 
 def parse_received_at(value: str, local_tz: ZoneInfo) -> datetime | None:
@@ -158,6 +212,159 @@ def maps_url(lat: float, lon: float) -> str:
     return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
 
 
+def home_region_names(config: HomeFilterConfig | None) -> set[str]:
+    if not config:
+        return set()
+    return {name.strip().casefold() for name in config.region_names if name.strip()}
+
+
+def event_region_names(event: Event) -> set[str]:
+    names: set[str] = set()
+    for value in event.payload.get("inregions") or []:
+        if str(value).strip():
+            names.add(str(value).strip().casefold())
+    desc = str(event.payload.get("desc") or "").strip()
+    if desc:
+        names.add(desc.casefold())
+    return names
+
+
+def home_anchors(events: list[Event], config: HomeFilterConfig | None) -> list[tuple[float, float, str]]:
+    names = home_region_names(config)
+    if not config or not config.enabled or not names:
+        return []
+    anchors: list[tuple[float, float, str]] = []
+    seen: set[tuple[float, float, str]] = set()
+    for event in events:
+        if event.kind != "transition" or event.lat is None or event.lon is None:
+            continue
+        desc = str(event.payload.get("desc") or "").strip()
+        if desc.casefold() not in names:
+            continue
+        key = (round(event.lat, 6), round(event.lon, 6), desc.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append((event.lat, event.lon, desc or "home"))
+    return anchors
+
+
+def is_home_area_point(
+    event: Event,
+    config: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> bool:
+    if not config or not config.enabled or not event.is_location:
+        return False
+    names = home_region_names(config)
+    if names and event_region_names(event) & names:
+        return True
+    if event.lat is None or event.lon is None:
+        return False
+    return any(haversine_km(event.lat, event.lon, lat, lon) * 1000 <= config.radius_m for lat, lon, _name in anchors)
+
+
+def filter_home_area_points(
+    points: list[Event],
+    config: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> tuple[list[Event], int]:
+    if not config or not config.enabled:
+        return points, 0
+    filtered = [event for event in points if not is_home_area_point(event, config, anchors)]
+    return filtered, len(points) - len(filtered)
+
+
+def stop_jitter_anchors(
+    events: list[Event],
+    candidate_stops: list[dict],
+    config: StopJitterFilterConfig | None,
+) -> list[StopJitterAnchor]:
+    if not config or not config.enabled:
+        return []
+    anchors: list[StopJitterAnchor] = []
+    seen: set[tuple[float, float, str]] = set()
+
+    def add_anchor(lat: object, lon: object, label: object, kind: str) -> None:
+        anchor_lat = as_float(lat)
+        anchor_lon = as_float(lon)
+        if anchor_lat is None or anchor_lon is None:
+            return
+        text = str(label or kind).strip() or kind
+        key = (round(anchor_lat, 5), round(anchor_lon, 5), text.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        anchors.append(StopJitterAnchor(anchor_lat, anchor_lon, text, kind))
+
+    if config.include_geofences:
+        for event in events:
+            if event.kind != "transition":
+                continue
+            add_anchor(event.lat, event.lon, event.payload.get("desc"), "geofence")
+
+    if config.include_candidate_stops:
+        for stop in candidate_stops:
+            if int(stop.get("duration_minutes") or 0) < config.min_dwell_minutes:
+                continue
+            label = stop.get("reviewed_name") or stop.get("name") or stop.get("alias") or stop.get("id")
+            add_anchor(stop.get("lat"), stop.get("lon"), label, "candidate_stop")
+    return anchors
+
+
+def is_stop_jitter_point(
+    event: Event,
+    config: StopJitterFilterConfig | None,
+    anchors: list[StopJitterAnchor],
+) -> bool:
+    if not config or not config.enabled or not event.is_location or event.lat is None or event.lon is None:
+        return False
+    return any(
+        haversine_km(event.lat, event.lon, anchor.lat, anchor.lon) * 1000 <= config.radius_m
+        for anchor in anchors
+    )
+
+
+def filter_stop_jitter_points(
+    points: list[Event],
+    config: StopJitterFilterConfig | None,
+    anchors: list[StopJitterAnchor],
+    preserve_lines: set[int] | None = None,
+) -> tuple[list[Event], int]:
+    if not config or not config.enabled:
+        return points, 0
+    preserve_lines = preserve_lines or set()
+    jitter_flags = [is_stop_jitter_point(event, config, anchors) for event in points]
+    keep_indices = {index for index, is_jitter in enumerate(jitter_flags) if not is_jitter}
+    if len(points) > 1:
+        keep_indices.add(0)
+        keep_indices.add(len(points) - 1)
+
+    index = 0
+    while index < len(points):
+        if not jitter_flags[index]:
+            index += 1
+            continue
+        start = index
+        while index + 1 < len(points) and jitter_flags[index + 1]:
+            index += 1
+        end = index
+        has_previous_route = start > 0 and not jitter_flags[start - 1]
+        has_next_route = end + 1 < len(points) and not jitter_flags[end + 1]
+        if has_previous_route:
+            keep_indices.add(start)
+        if has_next_route:
+            keep_indices.add(end)
+        for preserve_index in range(start, end + 1):
+            event = points[preserve_index]
+            if event.line_no in preserve_lines or event.payload.get("t") == "c":
+                keep_indices.add(preserve_index)
+        index += 1
+
+    filtered = [event for index, event in enumerate(points) if index in keep_indices]
+    return filtered, len(points) - len(filtered)
+
+
 def normalized_motion_modes(event: Event) -> set[str]:
     return {str(item).strip().lower() for item in event.motion if str(item).strip()}
 
@@ -223,6 +430,17 @@ def point_dict(event: Event) -> dict:
     }
 
 
+def point_dicts(events: list[Event], all_events: list[Event]) -> list[dict]:
+    points = []
+    for event in events:
+        point = point_dict(event)
+        label = waypoint_name_for(event.lat, event.lon, all_events)
+        if label:
+            point["place_name"] = label
+        points.append(point)
+    return points
+
+
 def is_moving_ride_point(event: Event) -> bool:
     if not event.is_location:
         return False
@@ -244,20 +462,13 @@ def infer_ride_window(events: list[Event]) -> tuple[datetime | None, datetime | 
     first_ride = event_time(ride_points[0])
     last_ride = event_time(ride_points[-1])
     home_events = [event for event in events if event.kind == "transition" and event.payload.get("desc") == "Home"]
-    start = first_ride
-    end = last_ride
-    reason = "first/last inferred ride point"
     leaves = [event_time(event) for event in home_events if event.payload.get("event") == "leave"]
     enters = [event_time(event) for event in home_events if event.payload.get("event") == "enter"]
     prior_leaves = [dt for dt in leaves if dt <= first_ride]
     later_enters = [dt for dt in enters if dt >= last_ride]
-    if prior_leaves:
-        start = max(prior_leaves)
-        reason = "Home leave to Home enter around ride points"
-    if later_enters:
-        end = min(later_enters)
-        reason = "Home leave to Home enter around ride points"
-    return start, end, reason
+    if prior_leaves and later_enters:
+        return max(prior_leaves), min(later_enters), "Home leave to Home enter around ride points"
+    return None, None, "full day activity review; ride points not bracketed by Home transitions"
 
 
 def in_window(event: Event, start: datetime | None, end: datetime | None) -> bool:
@@ -501,14 +712,96 @@ def named_place_events(events: list[Event]) -> list[dict]:
     return places
 
 
+def is_stop_candidate_event(event: Event) -> bool:
+    if not event.is_location:
+        return False
+    if "Home" in (event.payload.get("inregions") or []):
+        return False
+    speed = event.speed_kmh
+    if speed is not None and speed > 3:
+        return False
+    mode = motion_mode(event)
+    if mode in {"stationary", "automotive", "moving"}:
+        return True
+    return speed is not None and speed <= 3
+
+
+def stop_from_cluster(cluster: list[Event], index: int) -> dict | None:
+    if not cluster:
+        return None
+    start = event_time(cluster[0])
+    end = event_time(cluster[-1])
+    duration_minutes = max(0, round((end - start).total_seconds() / 60))
+    lat = sum(item.lat or 0 for item in cluster) / len(cluster)
+    lon = sum(item.lon or 0 for item in cluster) / len(cluster)
+    motions = Counter(motion for item in cluster for motion in item.motion)
+    regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
+    motion_modes = Counter(motion_mode(item) for item in cluster)
+    dominant_motion = motion_modes.most_common(1)[0][0] if motion_modes else "unknown"
+    name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
+    stop_id = f"{slug(name)}-{cluster[0].line_no}"
+    return {
+        "id": stop_id,
+        "name": name,
+        "start": fmt_dt(start),
+        "end": fmt_dt(end),
+        "start_line": cluster[0].line_no,
+        "end_line": cluster[-1].line_no,
+        "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+        "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
+        "duration_minutes": duration_minutes,
+        "duration": fmt_duration(duration_minutes),
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "points": len(cluster),
+        "motion": ", ".join(f"{name}:{count}" for name, count in motions.most_common()) or "unknown",
+        "motion_mode": dominant_motion,
+        "motion_modes": ", ".join(f"{name}:{count}" for name, count in motion_modes.most_common()) or "unknown",
+        "tags": [f"stop:{stop_id}", "candidate:stop"],
+        "maps": maps_url(lat, lon),
+    }
+
+
+def same_place_dwell_clusters(events: list[Event], min_minutes: int, radius_m: int) -> list[list[Event]]:
+    tight_radius_m = min(80, radius_m)
+    points = [
+        event
+        for event in events
+        if event.is_location and "Home" not in (event.payload.get("inregions") or [])
+    ]
+    clusters: list[list[Event]] = []
+    current: list[Event] = []
+    for event in points:
+        if not current:
+            current = [event]
+            continue
+        center_lat = sum(item.lat or 0 for item in current) / len(current)
+        center_lon = sum(item.lon or 0 for item in current) / len(current)
+        dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
+        dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
+        if dist_m <= tight_radius_m and dt_gap <= 45 * 60:
+            current.append(event)
+        else:
+            clusters.append(current)
+            current = [event]
+    if current:
+        clusters.append(current)
+    return [
+        cluster
+        for cluster in clusters
+        if len(cluster) >= 2
+        and (event_time(cluster[-1]) - event_time(cluster[0])).total_seconds() >= min_minutes * 60
+    ]
+
+
 def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 180) -> list[dict]:
+    sparse_same_place_radius_m = min(50, radius_m)
+    location_points = [event for event in events if event.is_location]
+    location_indexes = {id(event): index for index, event in enumerate(location_points)}
     low_motion = [
         event
         for event in events
-        if event.is_location
-        and "Home" not in (event.payload.get("inregions") or [])
-        and motion_mode(event) != "automotive"
-        and (event.speed_kmh is None or event.speed_kmh <= 3)
+        if is_stop_candidate_event(event)
     ]
     clusters: list[list[Event]] = []
     current: list[Event] = []
@@ -520,7 +813,14 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
         center_lon = sum(item.lon or 0 for item in current) / len(current)
         dt_gap = (event_time(event) - event_time(current[-1])).total_seconds()
         dist_m = haversine_km(center_lat, center_lon, event.lat or 0, event.lon or 0) * 1000
-        if dist_m <= radius_m and dt_gap <= 45 * 60:
+        previous_index = location_indexes[id(current[-1])]
+        event_index = location_indexes[id(event)]
+        stayed_nearby = all(
+            haversine_km(center_lat, center_lon, item.lat or 0, item.lon or 0) * 1000 <= radius_m
+            for item in location_points[previous_index + 1:event_index]
+        )
+        bridge_sparse_gap = dist_m <= sparse_same_place_radius_m and stayed_nearby
+        if dist_m <= radius_m and (dt_gap <= 45 * 60 or bridge_sparse_gap):
             current.append(event)
         else:
             clusters.append(current)
@@ -530,40 +830,30 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
 
     stops = []
     for index, cluster in enumerate(clusters, start=1):
-        start = event_time(cluster[0])
-        end = event_time(cluster[-1])
-        duration_minutes = max(0, round((end - start).total_seconds() / 60))
+        duration_minutes = max(0, round((event_time(cluster[-1]) - event_time(cluster[0])).total_seconds() / 60))
         if duration_minutes < min_minutes and len(cluster) < 3:
             continue
-        lat = sum(item.lat or 0 for item in cluster) / len(cluster)
-        lon = sum(item.lon or 0 for item in cluster) / len(cluster)
-        motions = Counter(motion for item in cluster for motion in item.motion)
-        regions = Counter(region for item in cluster for region in (item.payload.get("inregions") or []))
-        motion_modes = Counter(motion_mode(item) for item in cluster)
-        dominant_motion = motion_modes.most_common(1)[0][0] if motion_modes else "unknown"
-        name = regions.most_common(1)[0][0] if regions else f"unnamed-stop-{index}"
-        stop_id = f"{slug(name)}-{cluster[0].line_no}"
-        stops.append(
-            {
-                "id": stop_id,
-                "name": name,
-                "start": fmt_dt(start),
-                "end": fmt_dt(end),
-                "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
-                "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
-                "duration_minutes": duration_minutes,
-                "duration": fmt_duration(duration_minutes),
-                "lat": round(lat, 6),
-                "lon": round(lon, 6),
-                "points": len(cluster),
-                "motion": ", ".join(f"{name}:{count}" for name, count in motions.most_common()) or "unknown",
-                "motion_mode": dominant_motion,
-                "motion_modes": ", ".join(f"{name}:{count}" for name, count in motion_modes.most_common()) or "unknown",
-                "tags": [f"stop:{stop_id}", "candidate:stop"],
-                "maps": maps_url(lat, lon),
-            }
-        )
-    return stops
+        stop = stop_from_cluster(cluster, index)
+        if stop is not None:
+            stops.append(stop)
+
+    covered_lines = {
+        line
+        for stop in stops
+        for line in range(int(stop["start_line"]), int(stop["end_line"]) + 1)
+    }
+    next_index = len(stops) + 1
+    for cluster in same_place_dwell_clusters(events, min_minutes, radius_m):
+        cluster_lines = {event.line_no for event in cluster}
+        if cluster_lines & covered_lines:
+            continue
+        stop = stop_from_cluster(cluster, next_index)
+        if stop is None:
+            continue
+        stops.append(stop)
+        covered_lines.update(range(int(stop["start_line"]), int(stop["end_line"]) + 1))
+        next_index += 1
+    return sorted(stops, key=lambda stop: (int(stop["start_line"]), int(stop["end_line"])))
 
 
 def heatmap_visit_clusters(events: list[Event], min_minutes: int = 10, radius_m: int = 180, max_gap_minutes: int = 45) -> list[dict]:
@@ -660,7 +950,38 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
     return override
 
 
-def apply_user_tags(plan: dict, user_tags: dict) -> dict:
+def waypoint_name_for(lat: float | None, lon: float | None, events: list[Event], radius_m: int = 150) -> str | None:
+    if lat is None or lon is None:
+        return None
+    best_key: tuple[int, float] | None = None
+    best_name: str | None = None
+    for event in events:
+        if event.kind != "waypoint" or event.lat is None or event.lon is None:
+            continue
+        name = str(event.payload.get("desc") or "").strip()
+        if not name:
+            continue
+        waypoint_radius = as_float(event.payload.get("rad")) or 0
+        match_radius = max(radius_m, waypoint_radius)
+        distance_m = haversine_km(lat, lon, event.lat, event.lon) * 1000
+        if distance_m > match_radius:
+            continue
+        timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else 0
+        candidate_key = (timestamp, -distance_m)
+        if best_key is None or candidate_key > best_key:
+            best_key = candidate_key
+            best_name = name
+    return best_name
+
+
+def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) -> dict:
+    stop_lat = as_float(stop.get("lat"))
+    stop_lon = as_float(stop.get("lon"))
+    best_name = waypoint_name_for(stop_lat, stop_lon, events, radius_m)
+    return {"name": best_name} if best_name else {}
+
+
+def apply_user_tags(plan: dict, user_tags: dict, events: list[Event] | None = None) -> dict:
     day_tags = user_tags.get(plan["date"], {})
     global_tags = day_tags.get("activity", day_tags.get("ride", {})).get("tags", [])
     plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + global_tags))
@@ -668,6 +989,7 @@ def apply_user_tags(plan: dict, user_tags: dict) -> dict:
     for stop in plan["candidate_stops"]:
         override = merge_stop_overrides(
             [
+                waypoint_override_for(stop, events or []),
                 location_override_for(stop, user_tags, plan["date"]),
                 stop_override_for(stop, stop_overrides),
             ]
@@ -1884,9 +2206,16 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
 </html>"""
 
 
-def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags: dict | None = None) -> dict:
+def build_heatmap_summary(
+    events: list[Event],
+    scope: OwnTracksScope,
+    user_tags: dict | None = None,
+    home_filter: HomeFilterConfig | None = None,
+) -> dict:
     scope_events = [event for event in events if (event_date(event) is not None and scope.start_date <= event_date(event) <= scope.end_date)]
-    location_points = [event for event in scope_events if event.is_location]
+    raw_location_points = [event for event in scope_events if event.is_location]
+    anchors = home_anchors(events, home_filter)
+    location_points, filtered_home_points = filter_home_area_points(raw_location_points, home_filter, anchors)
     day_points: dict[date, list[Event]] = {}
     buckets: Counter[tuple[float, float]] = Counter()
     bucket_minutes: Counter[tuple[float, float]] = Counter()
@@ -1977,6 +2306,8 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "stats": {
             "days_with_points": len(day_points),
             "location_points": len(location_points),
+            "raw_location_points": len(raw_location_points),
+            "filtered_home_points": filtered_home_points,
             "unique_locations": len(all_buckets),
             "max_visits": max(bucket_visits.values()) if bucket_visits else 0,
             "min_visits": min(bucket_visits.values()) if bucket_visits else 0,
@@ -1991,6 +2322,12 @@ def build_heatmap_summary(events: list[Event], scope: OwnTracksScope, user_tags:
         "heat_points": heat_points,
         "most_visited": most_visited,
         "least_visited": least_visited,
+        "home_filter": {
+            "enabled": bool(home_filter and home_filter.enabled),
+            "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
+            "anchor_count": len(anchors),
+            "filtered_points": filtered_home_points,
+        },
     }
 
 
@@ -2862,6 +3199,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         {
             "date": plan["date"],
             "track": track,
+            "rawSampledTrack": plan.get("raw_sampled_track", plan.get("sampled_track", [])),
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
             "namedPlaces": named_places,
@@ -3343,6 +3681,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="toggleStopLabels" type="button" class="secondary">Hide stop labels</button>
         <button id="togglePlaceLabels" type="button" class="secondary">Hide point labels</button>
       </div>
+      <button id="toggleFilteredPoints" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show filtered points</button>
       <div class="profile">
         <div class="profile-title">Route animation</div>
         <div class="row">
@@ -3432,12 +3771,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     const edgeLayer = L.layerGroup().addTo(map);
     const arrowLayer = L.layerGroup().addTo(map);
     const routeLayer = L.layerGroup().addTo(map);
+    const filteredPointLayer = L.layerGroup();
     const animationLayer = L.layerGroup().addTo(map);
     let activeMotionMode = "all";
     let edgesVisible = true;
     let arrowsVisible = true;
     let stopLabelsVisible = true;
     let placeLabelsVisible = true;
+    let filteredPointsVisible = false;
     let routeColorMode = "speed";
     let profileAxis = "distance";
     let routeAnimationFrame = null;
@@ -3552,6 +3893,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       const mixed = a.map((value, index) => Math.round(value + (b[index] - value) * r));
       return `rgb(${{mixed[0]}}, ${{mixed[1]}}, ${{mixed[2]}})`;
     }};
+    const percentile = (values, ratio) => {{
+      if (!values.length) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const index = Math.max(0, Math.min(sorted.length - 1, (sorted.length - 1) * ratio));
+      const lower = Math.floor(index);
+      const upper = Math.ceil(index);
+      if (lower === upper) return sorted[lower];
+      return interpolateNumber(sorted[lower], sorted[upper], index - lower);
+    }};
     const speedColor = (speed) => {{
       const value = Number(speed);
       if (!Number.isFinite(value)) return motionColors.unknown;
@@ -3616,8 +3966,14 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
     const rawTrackPoints = data.sampledTrack || [];
+    const rawUnfilteredTrackPoints = data.rawSampledTrack || rawTrackPoints;
     const rideSegments = data.rideSegments || [];
     const trackPoints = [];
+    const visibleTrackLineNumbers = new Set(rawTrackPoints.map((point) => Number(point.line)).filter(Number.isFinite));
+    const filteredTrackPoints = rawUnfilteredTrackPoints.filter((point) => {{
+      const line = Number(point.line);
+      return Number.isFinite(line) && !visibleTrackLineNumbers.has(line);
+    }});
     const rideSegmentsEl = document.getElementById("rideSegments");
     const routeLegend = document.getElementById("routeLegend");
     const routeLegendControl = L.control({{ position: "topright" }});
@@ -3652,6 +4008,8 @@ def render_leaflet_map_html(plan: dict) -> str:
         speed_kmh: bestSpeedKmh(speedKmh, segmentSpeedKmh),
         reported_speed_kmh: Number.isFinite(speedKmh) ? speedKmh : null,
         derived_speed_kmh: segmentSpeedKmh,
+        place_name: point.place_name || null,
+        line: point.line || null,
         timestamp,
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
@@ -3676,8 +4034,10 @@ def render_leaflet_map_html(plan: dict) -> str:
         return;
       }}
       const minSpeed = Math.max(0, Math.min(...values));
-      const maxSpeed = Math.max(...values);
-      speedBounds = {{ min: minSpeed, max: Math.max(minSpeed + 1, maxSpeed) }};
+      const p75Speed = percentile(values, 0.75) ?? minSpeed;
+      const p95Speed = percentile(values, 0.95) ?? p75Speed;
+      const robustMaxSpeed = Math.max(p95Speed, p75Speed * 1.5, 30);
+      speedBounds = {{ min: minSpeed, max: Math.max(minSpeed + 1, robustMaxSpeed) }};
     }};
     const routeColorFor = (point, prev = null) => {{
       if (routeColorMode === "bands") {{
@@ -3780,6 +4140,19 @@ def render_leaflet_map_html(plan: dict) -> str:
       `;
     }};
     const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const filteredTrackPointsForMode = () => filteredTrackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const filteredPointPopupHtml = (point) => `
+      <div class="segment-popup">
+        <strong>Filtered point</strong>
+        <div class="popup-meta">
+          <div>${{escapeHtml(point.time || "unknown")}}</div>
+          <div>Line: ${{escapeHtml(point.line || "")}}</div>
+          <div>Motion: ${{escapeHtml(point.motion_mode || "unknown")}}</div>
+          <div>Speed: ${{formatSpeed(point.speed_kmh)}} · Accuracy: ${{Number.isFinite(Number(point.accuracy_m)) ? Number(point.accuracy_m).toFixed(0) + " m" : "unknown"}}</div>
+          ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
+        </div>
+      </div>
+    `;
     const segmentPointsFor = (segment) => trackPoints.filter((point) => {{
       const timestamp = Number(point.timestamp);
       return Number.isFinite(timestamp) && timestamp >= Number(segment.start_timestamp) && timestamp <= Number(segment.end_timestamp);
@@ -3846,13 +4219,22 @@ def render_leaflet_map_html(plan: dict) -> str:
       const pointRadius = routePointRadius();
       refreshSpeedBounds();
       for (const point of points) {{
-        L.circleMarker([point.lat, point.lon], {{
+        const marker = L.circleMarker([point.lat, point.lon], {{
           radius: pointRadius,
           color: routeColorFor(point, previous),
           fillColor: routeColorFor(point, previous),
           fillOpacity: 0.9,
           weight: 0,
-        }}).addTo(routeLayer);
+        }});
+        if (point.place_name) {{
+          marker.bindTooltip(escapeHtml(point.place_name), {{
+            permanent: placeLabelsVisible && placeLabelsAllowedByZoom(),
+            direction: "right",
+            className: "place-label",
+          }});
+          marker.bindPopup(`<strong>${{escapeHtml(point.place_name)}}</strong><br>Line ${{escapeHtml(point.line || "")}}<br>${{formatTime(point.timestamp)}}`);
+        }}
+        marker.addTo(routeLayer);
         previous = point;
       }}
       drawEdges();
@@ -4140,6 +4522,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         button.classList.toggle("active", button.dataset.motionMode === activeMotionMode);
       }});
       drawRoute();
+      renderFilteredPoints();
     }};
     const syncEdgeButton = () => {{
       const button = document.getElementById("toggleEdges");
@@ -4179,6 +4562,43 @@ def render_leaflet_map_html(plan: dict) -> str:
         placeButton.classList.toggle("active", placeLabelsVisible);
       }}
     }};
+    const syncFilteredPointsButton = () => {{
+      const button = document.getElementById("toggleFilteredPoints");
+      if (!button) return;
+      const count = filteredTrackPointsForMode().length;
+      button.textContent = filteredPointsVisible ? `Hide filtered points (${{count}})` : `Show filtered points (${{count}})`;
+      button.classList.toggle("active", filteredPointsVisible);
+      button.disabled = count === 0;
+    }};
+    const renderFilteredPoints = () => {{
+      filteredPointLayer.clearLayers();
+      const points = filteredTrackPointsForMode();
+      if (!filteredPointsVisible || !points.length) {{
+        filteredPointLayer.remove();
+        syncFilteredPointsButton();
+        return;
+      }}
+      for (const point of points) {{
+        const lat = Number(point.lat);
+        const lon = Number(point.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        L.circleMarker([lat, lon], {{
+          radius: Math.max(3, routePointRadius() + 1),
+          color: "#111827",
+          fillColor: "#f8fafc",
+          fillOpacity: 0.7,
+          opacity: 0.85,
+          weight: 1.5,
+          dashArray: "3 3",
+        }}).bindPopup(filteredPointPopupHtml(point)).addTo(filteredPointLayer);
+      }}
+      filteredPointLayer.addTo(map);
+      syncFilteredPointsButton();
+    }};
+    const setFilteredPointsVisible = (visible) => {{
+      filteredPointsVisible = visible;
+      renderFilteredPoints();
+    }};
     const applyLabelVisibility = () => {{
       for (const stop of data.stops) {{
         const marker = markers.get(stop.alias);
@@ -4201,6 +4621,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const setPlaceLabelsVisible = (visible) => {{
       placeLabelsVisible = visible;
+      drawRoute();
       applyLabelVisibility();
     }};
     const refreshZoomSensitiveMarkers = () => {{
@@ -4549,6 +4970,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("togglePlaceLabels").addEventListener("click", () => {{
       setPlaceLabelsVisible(!placeLabelsVisible);
     }});
+    document.getElementById("toggleFilteredPoints").addEventListener("click", () => {{
+      setFilteredPointsVisible(!filteredPointsVisible);
+    }});
     document.getElementById("routeAnimPlay").addEventListener("click", () => {{
       playRouteAnimation();
     }});
@@ -4588,6 +5012,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     map.on("zoomend", () => {{
       drawRoute();
+      renderFilteredPoints();
       refreshZoomSensitiveMarkers();
       if (!routeAnimationRunning && routeAnimationElapsedMs > 0) renderRouteAnimation(routeAnimationElapsedMs);
     }});
@@ -4595,6 +5020,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     syncArrowButton();
     syncDayNavigationButtons();
     syncLabelButtons();
+    syncFilteredPointsButton();
     applyLabelVisibility();
     syncRouteColorButtons();
     syncProfileAxisButtons();
@@ -4604,6 +5030,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     setActiveMotionMode("all");
     setEdgesVisible(true);
     setArrowsVisible(true);
+    setFilteredPointsVisible(false);
     renderElevationProfile();
     document.getElementById("selectNearby").addEventListener("click", () => {{
       const picked = selectedStops()[0] || data.stops[0];
@@ -4652,7 +5079,13 @@ def render_leaflet_map_html(plan: dict) -> str:
 </html>"""
 
 
-def build_plan(events: list[Event], target_date: date, user_tags: dict | None = None) -> tuple[dict, list[Event]]:
+def build_plan(
+    events: list[Event],
+    target_date: date,
+    user_tags: dict | None = None,
+    home_filter: HomeFilterConfig | None = None,
+    stop_jitter_filter: StopJitterFilterConfig | None = None,
+) -> tuple[dict, list[Event]]:
     day_events = [event for event in events if event_date(event) == target_date]
     day_events.sort(key=event_time)
     start, end, basis = infer_ride_window(day_events)
@@ -4665,6 +5098,25 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
     ride_points = [event for event in track_points if is_moving_ride_point(event)]
     places = named_place_events(window_events)
     stops = candidate_stops(window_events)
+    home_anchor_points = home_anchors(events, home_filter)
+    stop_jitter_anchor_points = stop_jitter_anchors(events, stops, stop_jitter_filter)
+    if stop_jitter_filter and stop_jitter_filter.enabled:
+        preserve_lines = {
+            int(line)
+            for stop in stops
+            for line in (stop.get("start_line"), stop.get("end_line"))
+            if isinstance(line, int)
+        }
+        visual_track_points, filtered_stop_jitter_points = filter_stop_jitter_points(
+            track_points,
+            stop_jitter_filter,
+            stop_jitter_anchor_points,
+            preserve_lines,
+        )
+        filtered_home_points = 0
+    else:
+        visual_track_points, filtered_home_points = filter_home_area_points(track_points, home_filter, home_anchor_points)
+        filtered_stop_jitter_points = 0
     speeds = [event.speed_kmh for event in track_points if event.speed_kmh is not None]
     batteries = [event.payload.get("batt") for event in track_points if event.payload.get("batt") is not None]
     motion = motion_summary(track_points)
@@ -4682,6 +5134,9 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
             "events_on_day": len(day_events),
             "events_in_window": len(window_events),
             "track_points": len(track_points),
+            "visual_track_points": len(visual_track_points),
+            "filtered_home_points": filtered_home_points,
+            "filtered_stop_jitter_points": filtered_stop_jitter_points,
             "ride_points": len(ride_points),
             "approx_distance_km": round(summarize_distance(track_points), 2),
             "max_speed_kmh": max(speeds) if speeds else None,
@@ -4693,9 +5148,27 @@ def build_plan(events: list[Event], target_date: date, user_tags: dict | None = 
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
-        "sampled_track": [point_dict(event) for event in track_points],
+        "raw_sampled_track": point_dicts(track_points, events),
+        "sampled_track": point_dicts(visual_track_points, events),
+        "home_filter": {
+            "enabled": bool(home_filter and home_filter.enabled),
+            "radius_m": home_filter.radius_m if home_filter and home_filter.enabled else None,
+            "anchor_count": len(home_anchor_points),
+            "filtered_points": filtered_home_points,
+        },
+        "stop_jitter_filter": {
+            "enabled": bool(stop_jitter_filter and stop_jitter_filter.enabled),
+            "radius_m": stop_jitter_filter.radius_m if stop_jitter_filter and stop_jitter_filter.enabled else None,
+            "anchor_count": len(stop_jitter_anchor_points),
+            "filtered_points": filtered_stop_jitter_points,
+            "min_dwell_minutes": (
+                stop_jitter_filter.min_dwell_minutes
+                if stop_jitter_filter and stop_jitter_filter.enabled
+                else None
+            ),
+        },
     }
-    plan = apply_user_tags(plan, user_tags or {})
+    plan = apply_user_tags(plan, user_tags or {}, events)
     for index, stop in enumerate(plan["candidate_stops"], start=1):
         stop["alias"] = f"s{index}"
     plan["ride_segments"] = build_ride_segments(track_points, plan["candidate_stops"], places)
@@ -4789,6 +5262,20 @@ def render_digest(plan: dict) -> str:
         "",
         "Named places",
     ]
+    stop_jitter_filter = plan.get("stop_jitter_filter") or {}
+    home_filter = plan.get("home_filter") or {}
+    if stop_jitter_filter.get("enabled") and stop_jitter_filter.get("filtered_points"):
+        lines.insert(
+            9,
+            "Visualization filter: "
+            f"hid {stop_jitter_filter['filtered_points']} stop-jitter points near "
+            f"{stop_jitter_filter.get('anchor_count')} anchors within {stop_jitter_filter.get('radius_m')} m",
+        )
+    elif home_filter.get("enabled") and home_filter.get("filtered_points"):
+        lines.insert(
+            9,
+            f"Visualization filter: hid {home_filter['filtered_points']} home-area points within {home_filter.get('radius_m')} m",
+        )
     if not plan["named_places"]:
         lines.append("- None")
     for place in plan["named_places"]:
