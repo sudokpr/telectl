@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from owntracks.tagger import (
+    Event,
+    HomeFilterConfig,
     StopJitterFilterConfig,
+    build_activity_dashboard_summary,
+    build_stop_index_summary,
     build_plan,
     parse_log,
     render_leaflet_map_html,
+    render_activity_dashboard_html,
+    render_stop_index_html,
 )
 
 
@@ -104,3 +110,153 @@ def test_automotive_dwell_stops_and_filtered_overlay_payload_render(fixture_even
     assert "sampledTrack" in html
     assert "toggleFilteredPoints" in html
     assert "Show filtered points" in html
+
+
+def test_manual_route_point_is_restored_as_stop(fixture_events) -> None:
+    user_tags = {
+        "2026-06-14": {
+            "stops": {
+                "manual-stop-26": {
+                    "manual": True,
+                    "lat": 12.9716,
+                    "lon": 77.5946,
+                    "line": 26,
+                    "timestamp": 1781395200,
+                    "time": "08:00",
+                    "motion_mode": "stationary",
+                    "name": "Quick errand",
+                }
+            }
+        }
+    }
+
+    plan, _ = build_plan(fixture_events, date(2026, 6, 14), user_tags=user_tags)
+
+    stop = next(stop for stop in plan["candidate_stops"] if stop["id"] == "manual-stop-26")
+    assert stop["manual"] is True
+    assert stop["reviewed_name"] == "Quick errand"
+    assert stop["points"] == 1
+
+    html = render_leaflet_map_html(plan)
+    assert "Mark as stop" in html
+    assert "/owntracks/stops" in html
+    assert "Save stop changes" in html
+    assert "saveStopReviews" in html
+    assert "routeAnimationMaxZoom = 16" in html
+    assert "map.fitBounds(routeBounds" in html
+    assert "map.panInside(currentPosition" not in html
+    assert 'map.createPane("routePointsPane")' in html
+    assert 'routePointRenderer = L.svg({ pane: "routePointsPane"' in html
+    assert "renderer: routePointRenderer" in html
+    assert "weight: 10" in html
+
+
+def test_stop_index_groups_reviewed_places_and_renders_visit_details(fixture_events) -> None:
+    user_tags = {
+        "2026-06-12": {
+            "stops": {
+                "unnamed-stop-2-6": {
+                    "name": "Doctor",
+                    "tags": ["health", "doctor"],
+                    "note": "Annual checkup",
+                }
+            }
+        },
+        "2026-06-13": {
+            "stops": {
+                "unnamed-stop-3-18": {
+                    "name": "Doctor",
+                    "tags": ["health"],
+                }
+            }
+        },
+    }
+
+    summary = build_stop_index_summary(
+        fixture_events,
+        user_tags,
+        start=date(2026, 6, 12),
+        end=date(2026, 6, 13),
+    )
+
+    doctor = next(place for place in summary["places"] if place["name"] == "Doctor")
+    waypoint = next(place for place in summary["places"] if place["name"] == "Known family waypoint")
+    office = next(place for place in summary["places"] if place["name"] == "Office")
+    assert doctor["visit_count"] == 2
+    assert doctor["first_visit"] == "2026-06-12"
+    assert doctor["latest_visit"] == "2026-06-13"
+    assert doctor["tags"] == ["doctor", "health"]
+    assert [visit["date"] for visit in doctor["visits"]] == ["2026-06-13", "2026-06-12"]
+    assert waypoint["visit_count"] == 1
+    assert waypoint["visits"][0]["source"] == "waypoint"
+    assert waypoint["visits"][0]["motion_mode"] == "waypoint"
+    assert any(visit["source"] == "transition" for visit in office["visits"])
+
+    html = render_stop_index_html(summary)
+    assert "OwnTracks stop index" in html
+    assert "Doctor" in html
+    assert "Known family waypoint" in html
+    assert "Annual checkup" in html
+    assert "/owntracks/map/" in html
+    assert "Refresh search aliases" in html
+    assert "/owntracks/search-aliases" in html
+    assert "not generated yet" in html
+    assert "placeSearchScore" in html
+
+
+def test_stop_index_includes_later_location_points_inside_known_waypoint() -> None:
+    events = [
+        Event(
+            1,
+            datetime.fromisoformat("2026-06-01T09:00:00+05:30"),
+            "owntracks/test/device",
+            {"_type": "waypoint", "desc": "Sugganahalli Land", "lat": 12.795737, "lon": 77.324158, "rad": 30, "rid": "land"},
+            TZ,
+        ),
+        Event(
+            2,
+            datetime.fromisoformat("2026-06-14T15:59:21+05:30"),
+            "owntracks/test/device",
+            {"_type": "location", "lat": 12.795646, "lon": 77.324224, "tst": 1781432961, "motionactivities": ["automotive"], "vel": 20},
+            TZ,
+        ),
+        Event(
+            3,
+            datetime.fromisoformat("2026-06-14T16:04:21+05:30"),
+            "owntracks/test/device",
+            {"_type": "location", "lat": 12.795767, "lon": 77.324287, "tst": 1781433261, "motionactivities": ["automotive"], "vel": 20},
+            TZ,
+        ),
+    ]
+
+    summary = build_stop_index_summary(events, start=date(2026, 6, 14), end=date(2026, 6, 14))
+
+    land = next(place for place in summary["places"] if place["name"] == "Sugganahalli Land")
+    assert land["visit_count"] == 1
+    assert land["visits"][0]["source"] == "waypoint-proximity"
+    assert land["visits"][0]["date"] == "2026-06-14"
+    assert land["visits"][0]["duration"] == "5 min"
+
+
+def test_activity_dashboard_summarizes_days_and_places(fixture_events) -> None:
+    summary = build_activity_dashboard_summary(
+        fixture_events,
+        start=date(2026, 6, 12),
+        end=date(2026, 6, 14),
+        home_filter=HomeFilterConfig(True, ("Office",), 120),
+        stop_jitter_filter=jitter_config(),
+    )
+
+    assert summary["scope"]["days"] == 3
+    assert summary["stats"]["observed_days"] == 3
+    assert summary["stats"]["out_of_home_days"] >= 1
+    assert summary["stats"]["places"] >= 1
+    assert len(summary["daily"]) == 3
+
+    html = render_activity_dashboard_html(summary)
+    assert "OwnTracks activity dashboard" in html
+    assert "Active day calendar" in html
+    assert "Last month" in html
+    assert "Year to date" in html
+    assert "/owntracks/dashboard" in html
+    assert "/owntracks/map/" in html

@@ -13,6 +13,7 @@ import math
 import re
 import urllib.error
 import urllib.request
+from urllib.parse import quote, urlencode
 
 from metrics import OWNTRACKS_MAP_TILE_FETCHES_TOTAL
 
@@ -712,6 +713,186 @@ def named_place_events(events: list[Event]) -> list[dict]:
     return places
 
 
+def waypoint_index_events(events: list[Event], target_date: date, skip_proximity_names: set[str] | None = None) -> list[dict]:
+    skip_names = skip_proximity_names or set()
+    waypoints = []
+    definitions: list[dict] = []
+    for event in events:
+        if event.kind != "waypoint":
+            continue
+        desc = str(event.payload.get("desc") or "").strip()
+        if not desc:
+            continue
+        lat = event.lat
+        lon = event.lon
+        radius_m = as_float(event.payload.get("rad")) or 30
+        waypoint_id = str(event.payload.get("rid") or f"{slug(desc)}-{event.line_no}")
+        if lat is not None and lon is not None:
+            definitions.append(
+                {
+                    "id": waypoint_id,
+                    "name": desc,
+                    "lat": lat,
+                    "lon": lon,
+                    "radius_m": max(30, radius_m),
+                }
+            )
+        if event_date(event) != target_date:
+            continue
+        timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else None
+        waypoints.append(
+            {
+                "date": target_date.isoformat(),
+                "id": f"waypoint:{waypoint_id}",
+                "name": desc,
+                "raw_name": desc,
+                "start": fmt_dt(event_time(event)),
+                "end": fmt_dt(event_time(event)),
+                "start_timestamp": timestamp,
+                "end_timestamp": timestamp,
+                "duration": "0 min",
+                "duration_minutes": 0,
+                "lat": lat,
+                "lon": lon,
+                "points": 0,
+                "motion": "waypoint",
+                "motion_mode": "waypoint",
+                "tags": [f"waypoint:{slug(desc)}"],
+                "note": "",
+                "maps": maps_url(lat, lon) if lat is not None and lon is not None else "",
+                "reviewed": False,
+                "manual": False,
+                "source": "waypoint",
+            }
+        )
+    deduped_definitions = {
+        str(definition["id"]): definition
+        for definition in definitions
+    }
+    day_locations = [
+        event
+        for event in events
+        if event_date(event) == target_date and event.is_location and event.lat is not None and event.lon is not None
+    ]
+    for definition in deduped_definitions.values():
+        name_key = str(definition["name"]).casefold()
+        if name_key in skip_names:
+            continue
+        matches = [
+            event
+            for event in day_locations
+            if haversine_km(definition["lat"], definition["lon"], event.lat or 0, event.lon or 0) * 1000
+            <= float(definition["radius_m"])
+        ]
+        if not matches:
+            continue
+        clusters: list[list[Event]] = []
+        current: list[Event] = []
+        for event in sorted(matches, key=event_time):
+            if current and (event_time(event) - event_time(current[-1])).total_seconds() > 60 * 60:
+                clusters.append(current)
+                current = []
+            current.append(event)
+        if current:
+            clusters.append(current)
+        for cluster in clusters:
+            start = event_time(cluster[0])
+            end = event_time(cluster[-1])
+            duration_minutes = max(0, round((end - start).total_seconds() / 60))
+            lat = sum(event.lat or 0 for event in cluster) / len(cluster)
+            lon = sum(event.lon or 0 for event in cluster) / len(cluster)
+            modes = Counter(motion_mode(event) for event in cluster)
+            dominant_mode = modes.most_common(1)[0][0] if modes else "waypoint"
+            waypoints.append(
+                {
+                    "date": target_date.isoformat(),
+                    "id": f"waypoint-proximity:{definition['id']}-{cluster[0].line_no}-{cluster[-1].line_no}",
+                    "name": definition["name"],
+                    "raw_name": definition["name"],
+                    "start": fmt_dt(start),
+                    "end": fmt_dt(end),
+                    "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+                    "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
+                    "duration": fmt_duration(duration_minutes),
+                    "duration_minutes": duration_minutes,
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "points": len(cluster),
+                    "motion": ", ".join(f"{name}:{count}" for name, count in modes.most_common()) or "waypoint",
+                    "motion_mode": dominant_mode,
+                    "tags": [f"waypoint:{slug(definition['name'])}", "source:waypoint-proximity"],
+                    "note": "",
+                    "maps": maps_url(lat, lon),
+                    "reviewed": False,
+                    "manual": False,
+                    "source": "waypoint-proximity",
+                }
+            )
+    return waypoints
+
+
+def transition_index_events(events: list[Event], target_date: date) -> list[dict]:
+    transitions = [
+        event
+        for event in events
+        if event.kind == "transition" and event_date(event) == target_date and str(event.payload.get("desc") or "").strip()
+    ]
+    transitions.sort(key=event_time)
+    visits: list[dict] = []
+    open_entries: dict[str, Event] = {}
+
+    def visit_from_events(desc: str, start_event: Event, end_event: Event | None = None) -> dict:
+        start_dt = event_time(start_event)
+        end_dt = event_time(end_event) if end_event is not None else start_dt
+        duration_minutes = max(0, round((end_dt - start_dt).total_seconds() / 60))
+        lat = end_event.lat if end_event is not None and end_event.lat is not None else start_event.lat
+        lon = end_event.lon if end_event is not None and end_event.lon is not None else start_event.lon
+        action = str(start_event.payload.get("event") or "transition")
+        if end_event is not None:
+            action = f"{start_event.payload.get('event') or 'enter'}->{end_event.payload.get('event') or 'leave'}"
+        return {
+            "date": target_date.isoformat(),
+            "id": f"transition:{slug(desc)}-{start_event.line_no}" + (f"-{end_event.line_no}" if end_event else ""),
+            "name": desc,
+            "raw_name": desc,
+            "start": fmt_dt(start_dt),
+            "end": fmt_dt(end_dt),
+            "start_timestamp": int(start_dt.timestamp()) if start_dt.tzinfo is not None else None,
+            "end_timestamp": int(end_dt.timestamp()) if end_dt.tzinfo is not None else None,
+            "duration": fmt_duration(duration_minutes),
+            "duration_minutes": duration_minutes,
+            "lat": lat,
+            "lon": lon,
+            "points": 0,
+            "motion": action,
+            "motion_mode": "transition",
+            "tags": [f"place:{slug(desc)}", "geofence:transition"],
+            "note": "",
+            "maps": maps_url(lat, lon) if lat is not None and lon is not None else "",
+            "reviewed": False,
+            "manual": False,
+            "source": "transition",
+        }
+
+    for event in transitions:
+        desc = str(event.payload.get("desc") or "").strip()
+        key = desc.casefold()
+        action = str(event.payload.get("event") or "").casefold()
+        if action == "enter":
+            if key in open_entries:
+                visits.append(visit_from_events(desc, open_entries.pop(key)))
+            open_entries[key] = event
+        elif action == "leave" and key in open_entries:
+            visits.append(visit_from_events(desc, open_entries.pop(key), event))
+        else:
+            visits.append(visit_from_events(desc, event))
+
+    for key, event in open_entries.items():
+        desc = str(event.payload.get("desc") or key).strip()
+        visits.append(visit_from_events(desc, event))
+    return visits
+
+
 def is_stop_candidate_event(event: Event) -> bool:
     if not event.is_location:
         return False
@@ -914,6 +1095,47 @@ def load_user_tags(path: Path) -> dict:
 def save_user_tags(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def manual_stops_for_date(user_tags: dict, date_text: str) -> list[dict]:
+    """Restore route points that a user explicitly promoted to stops."""
+    day_tags = user_tags.get(date_text, {})
+    saved_stops = day_tags.get("stops", {}) if isinstance(day_tags, dict) else {}
+    manual_stops = []
+    for stop_id, saved in saved_stops.items():
+        if not isinstance(saved, dict) or not saved.get("manual"):
+            continue
+        lat = as_float(saved.get("lat"))
+        lon = as_float(saved.get("lon"))
+        if lat is None or lon is None:
+            continue
+        line = saved.get("line")
+        timestamp = saved.get("timestamp")
+        time_text = str(saved.get("time") or "")
+        manual_stops.append(
+            {
+                "id": str(stop_id),
+                "name": str(saved.get("name") or "manual stop"),
+                "start": time_text,
+                "end": time_text,
+                "start_line": line,
+                "end_line": line,
+                "start_timestamp": timestamp,
+                "end_timestamp": timestamp,
+                "duration_minutes": 0,
+                "duration": "0 min",
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
+                "points": 1,
+                "motion": str(saved.get("motion_mode") or "unknown"),
+                "motion_mode": str(saved.get("motion_mode") or "unknown"),
+                "motion_modes": str(saved.get("motion_mode") or "unknown") + ":1",
+                "tags": [f"stop:{stop_id}", "candidate:stop", "source:manual"],
+                "maps": maps_url(lat, lon),
+                "manual": True,
+            }
+        )
+    return manual_stops
 
 
 def location_override_for(stop: dict, user_tags: dict, current_date: str, radius_m: int = 150) -> dict:
@@ -1130,6 +1352,95 @@ def fetch_tile_data_uri(zoom: int, x: int, y: int, cache_dir: Path | None) -> st
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
+OWNTRACKS_NAV_CSS = """
+    .ot-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 10px 0 0;
+    }
+    .ot-nav a {
+      align-items: center;
+      background: #e5e7eb;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      color: #111827;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 800;
+      justify-content: center;
+      min-height: 32px;
+      padding: 6px 9px;
+      text-decoration: none;
+    }
+    .ot-nav a.active {
+      background: #111827;
+      border-color: #111827;
+      color: white;
+    }
+    .ot-nav a:hover {
+      border-color: #6b7280;
+    }
+"""
+
+
+OWNTRACKS_NAV_SCRIPT = """
+    const syncOwnTracksNav = () => {
+      const token = new URLSearchParams(window.location.search).get("token");
+      if (!token) return;
+      document.querySelectorAll(".ot-nav a").forEach((link) => {
+        const url = new URL(link.getAttribute("href"), window.location.origin);
+        url.searchParams.set("token", token);
+        link.setAttribute("href", `${url.pathname}${url.search}${url.hash}`);
+      });
+    };
+    syncOwnTracksNav();
+"""
+
+
+def owntracks_heatmap_scope(start: str | None = None, end: str | None = None, date_text: str | None = None) -> str:
+    start_text = (start or "").strip()
+    end_text = (end or "").strip()
+    date_value = (date_text or start_text or end_text).strip()
+    if start_text and end_text and start_text[:7] == end_text[:7]:
+        return start_text[:7]
+    if start_text and end_text and start_text[:4] == end_text[:4]:
+        return start_text[:4]
+    if len(date_value) >= 7:
+        return date_value[:7]
+    if len(date_value) >= 4:
+        return date_value[:4]
+    return ""
+
+
+def owntracks_nav_html(
+    active: str,
+    *,
+    date_text: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> str:
+    date_value = (date_text or end or start or "").strip()
+    start_value = (start or date_value or "").strip()
+    end_value = (end or date_value or "").strip()
+    heat_scope = owntracks_heatmap_scope(start_value, end_value, date_value)
+    day_href = f"/owntracks/map/{quote(date_value)}" if date_value else "/owntracks/map/today"
+    heat_href = f"/owntracks/map/{quote(heat_scope)}" if heat_scope else "/owntracks/map"
+    range_query = urlencode({key: value for key, value in (("start", start_value), ("end", end_value)) if value})
+    range_suffix = f"?{range_query}" if range_query else ""
+    links = [
+        ("day", "Day map", day_href),
+        ("heat", "Heat map", heat_href),
+        ("stops", "Stops", f"/owntracks/stops{range_suffix}"),
+        ("dashboard", "Dashboard", f"/owntracks/dashboard{range_suffix}"),
+    ]
+    items = []
+    for key, label, href in links:
+        active_class = " active" if key == active else ""
+        items.append(f'<a class="{active_class.strip()}" href="{escape(href)}">{escape(label)}</a>')
+    return '<nav class="ot-nav" aria-label="OwnTracks views">' + "".join(items) + "</nav>"
+
+
 def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     title = f"OwnTracks map - {plan['date']}"
     track_points = [
@@ -1341,6 +1652,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         ensure_ascii=False,
     ).replace("</", "<\\/")
     escaped_title = escape(title)
+    nav = owntracks_nav_html("day", date_text=str(plan.get("date") or ""))
     has_map_data = bool(finite_points)
     empty_svg = (
         ""
@@ -1415,6 +1727,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
       line-height: 1.25;
       margin: 0 0 8px;
     }}
+{OWNTRACKS_NAV_CSS}
     label {{
       color: #374151;
       display: block;
@@ -1733,6 +2046,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     <aside class="side">
       <section class="panel">
         <h1>{escaped_title}</h1>
+        {nav}
         <div class="row">
           <button id="selectAll" class="secondary" type="button">Select all</button>
           <button id="clearSelection" class="secondary" type="button">Clear</button>
@@ -1771,6 +2085,7 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
   </div>
   <script>
     const data = {payload};
+{OWNTRACKS_NAV_SCRIPT}
     const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
       "&": "&amp;",
       "<": "&lt;",
@@ -2394,6 +2709,614 @@ def heatmap_label_sources(events: list[Event], scope: OwnTracksScope, user_tags:
     return sources
 
 
+def stop_index_date_range(events: list[Event], start: date | None = None, end: date | None = None) -> tuple[date | None, date | None]:
+    event_dates = sorted({event_date(event) for event in events if event_date(event) is not None and event.is_location})
+    if not event_dates:
+        return start, end
+    range_start = start or event_dates[0]
+    range_end = end or event_dates[-1]
+    if range_start > range_end:
+        raise ValueError("start date must be before or equal to end date")
+    return range_start, range_end
+
+
+def stop_index_identity(stop: dict) -> tuple[str, str]:
+    label = str(stop.get("reviewed_name") or "").strip()
+    if label:
+        return f"name:{label.casefold()}", label
+    name = str(stop.get("name") or "").strip()
+    if name and not re.fullmatch(r"unnamed-stop-\d+", name):
+        return f"name:{name.casefold()}", name
+    lat = as_float(stop.get("lat"))
+    lon = as_float(stop.get("lon"))
+    if lat is not None and lon is not None:
+        rounded_lat = round(lat, 3)
+        rounded_lon = round(lon, 3)
+        return f"coord:{rounded_lat:.3f},{rounded_lon:.3f}", f"Near {rounded_lat:.3f}, {rounded_lon:.3f}"
+    stop_id = str(stop.get("id") or "unknown stop")
+    return f"id:{stop_id}", stop_id
+
+
+def build_stop_index_summary(
+    events: list[Event],
+    user_tags: dict | None = None,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    home_filter: HomeFilterConfig | None = None,
+    stop_jitter_filter: StopJitterFilterConfig | None = None,
+) -> dict:
+    start_date, end_date = stop_index_date_range(events, start, end)
+    if start_date is None or end_date is None:
+        return {
+            "title": "OwnTracks stop index",
+            "scope": {"start": "", "end": "", "days": 0},
+            "stats": {"places": 0, "visits": 0, "reviewed_visits": 0, "total_minutes": 0},
+            "places": [],
+        }
+
+    grouped: dict[str, dict] = {}
+
+    def add_visit(key: str, label: str, visit: dict) -> None:
+        tags = [str(tag) for tag in (visit.get("tags") or []) if str(tag).strip()]
+        duration_minutes = int(visit.get("duration_minutes") or 0)
+        place = grouped.setdefault(
+            key,
+            {
+                "key": key,
+                "name": label,
+                "lat": visit.get("lat"),
+                "lon": visit.get("lon"),
+                "visit_count": 0,
+                "total_minutes": 0,
+                "latest_visit": "",
+                "first_visit": "",
+                "tags": [],
+                "notes": 0,
+                "reviewed_visits": 0,
+                "visits": [],
+            },
+        )
+        place["visit_count"] += 1
+        place["total_minutes"] += duration_minutes
+        if tags:
+            place["tags"] = sorted(set(place["tags"]) | set(tags))
+        if visit.get("note"):
+            place["notes"] += 1
+        if visit.get("reviewed"):
+            place["reviewed_visits"] += 1
+        place["visits"].append(visit)
+        dates = [item["date"] for item in place["visits"]]
+        place["first_visit"] = min(dates)
+        place["latest_visit"] = max(dates)
+
+    current = start_date
+    while current <= end_date:
+        plan, _track_points = build_plan(events, current, user_tags or {}, home_filter, stop_jitter_filter)
+        covered_names: set[str] = set()
+        transition_visits = transition_index_events(events, current)
+        for stop in plan.get("candidate_stops", []):
+            lat = as_float(stop.get("lat"))
+            lon = as_float(stop.get("lon"))
+            key, label = stop_index_identity(stop)
+            covered_names.add(label.casefold())
+            tags = [str(tag) for tag in (stop.get("user_tags") or stop.get("tags") or []) if str(tag).strip()]
+            duration_minutes = int(stop.get("duration_minutes") or 0)
+            visit = {
+                "date": plan["date"],
+                "alias": stop.get("alias", ""),
+                "id": stop.get("id", ""),
+                "name": label,
+                "raw_name": stop.get("name", ""),
+                "start": stop.get("start", ""),
+                "end": stop.get("end", ""),
+                "start_timestamp": stop.get("start_timestamp"),
+                "end_timestamp": stop.get("end_timestamp"),
+                "duration": stop.get("duration", ""),
+                "duration_minutes": duration_minutes,
+                "lat": lat,
+                "lon": lon,
+                "points": stop.get("points", 0),
+                "motion": stop.get("motion", ""),
+                "motion_mode": stop.get("motion_mode", "unknown"),
+                "tags": tags,
+                "note": stop.get("user_note", ""),
+                "maps": stop.get("maps", ""),
+                "reviewed": bool(stop.get("reviewed_name") or stop.get("user_tags") or stop.get("user_note")),
+                "manual": bool(stop.get("manual")),
+                "source": "stop",
+            }
+            add_visit(key, label, visit)
+        for transition in transition_visits:
+            transition_key = f"name:{str(transition.get('name') or '').casefold()}"
+            covered_names.add(str(transition.get("name") or "").casefold())
+            add_visit(transition_key, str(transition.get("name") or "Transition"), transition)
+        for waypoint in waypoint_index_events(events, current, covered_names):
+            waypoint_key = f"name:{str(waypoint.get('name') or '').casefold()}"
+            add_visit(waypoint_key, str(waypoint.get("name") or "Waypoint"), waypoint)
+        current += timedelta(days=1)
+
+    places = list(grouped.values())
+    for place in places:
+        place["visits"].sort(key=lambda item: (item["date"], item.get("start_timestamp") or 0), reverse=True)
+    places.sort(key=lambda item: (str(item["name"]).casefold(), -int(item["visit_count"])))
+    return {
+        "title": "OwnTracks stop index",
+        "scope": {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "days": (end_date - start_date).days + 1,
+        },
+        "stats": {
+            "places": len(places),
+            "visits": sum(int(place["visit_count"]) for place in places),
+            "reviewed_visits": sum(int(place["reviewed_visits"]) for place in places),
+            "total_minutes": sum(int(place["total_minutes"]) for place in places),
+        },
+        "places": places,
+    }
+
+
+def build_activity_dashboard_summary(
+    events: list[Event],
+    user_tags: dict | None = None,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    home_filter: HomeFilterConfig | None = None,
+    stop_jitter_filter: StopJitterFilterConfig | None = None,
+) -> dict:
+    start_date, end_date = stop_index_date_range(events, start, end)
+    if start_date is None or end_date is None:
+        return {
+            "title": "OwnTracks activity dashboard",
+            "scope": {"start": "", "end": "", "days": 0},
+            "stats": {},
+            "daily": [],
+            "top_places": [],
+        }
+
+    dashboard_home_filter = home_filter
+    if home_filter and not home_filter.enabled:
+        dashboard_home_filter = HomeFilterConfig(True, home_filter.region_names, home_filter.radius_m)
+    anchors = home_anchors(events, dashboard_home_filter)
+    stop_index = build_stop_index_summary(
+        events,
+        user_tags,
+        start=start_date,
+        end=end_date,
+        home_filter=home_filter,
+        stop_jitter_filter=stop_jitter_filter,
+    )
+    visits_by_date: dict[str, list[dict]] = {}
+    for place in stop_index.get("places", []):
+        for visit in place.get("visits", []):
+            visits_by_date.setdefault(str(visit.get("date") or ""), []).append({**visit, "place_name": place.get("name")})
+
+    daily: list[dict] = []
+    current = start_date
+    while current <= end_date:
+        date_text = current.isoformat()
+        day_points = [event for event in events if event_date(event) == current and event.is_location]
+        day_points.sort(key=event_time)
+        outside_points = [
+            event for event in day_points if not is_home_area_point(event, dashboard_home_filter, anchors)
+        ]
+        distance_km = round(summarize_distance(day_points), 2)
+        outside_distance_km = round(summarize_distance(outside_points), 2)
+        outside_minutes = estimate_outside_home_minutes(day_points, dashboard_home_filter, anchors)
+        motion = motion_summary(day_points)
+        day_visits = visits_by_date.get(date_text, [])
+        top_visit_names = sorted({str(visit.get("place_name") or visit.get("name") or "") for visit in day_visits if str(visit.get("place_name") or visit.get("name") or "").strip()})
+        has_outside = bool(outside_points)
+        travel_day = distance_km >= 20 or outside_distance_km >= 10 or outside_minutes >= 180
+        daily.append(
+            {
+                "date": date_text,
+                "points": len(day_points),
+                "outside_points": len(outside_points),
+                "distance_km": distance_km,
+                "outside_distance_km": outside_distance_km,
+                "outside_minutes": outside_minutes,
+                "home_only": bool(day_points) and not has_outside,
+                "out_of_home": has_outside,
+                "travel_day": travel_day,
+                "dominant_motion": motion.get("dominant") or "unknown",
+                "motion_counts": motion.get("counts") or {},
+                "visit_count": len(day_visits),
+                "places": top_visit_names[:6],
+            }
+        )
+        current += timedelta(days=1)
+
+    observed_days = [day for day in daily if int(day["points"]) > 0]
+    out_days = [day for day in observed_days if day["out_of_home"]]
+    home_only_days = [day for day in observed_days if day["home_only"]]
+    travel_days = [day for day in observed_days if day["travel_day"]]
+    current_out_streak = current_activity_streak_days(daily, "out_of_home")
+    current_home_streak = current_activity_streak_days(daily, "home_only")
+    total_distance = round(sum(float(day["distance_km"]) for day in observed_days), 2)
+    outside_distance = round(sum(float(day["outside_distance_km"]) for day in observed_days), 2)
+    outside_minutes_total = sum(int(day["outside_minutes"]) for day in observed_days)
+    top_places = sorted(
+        stop_index.get("places", []),
+        key=lambda place: (int(place.get("visit_count") or 0), int(place.get("total_minutes") or 0), str(place.get("name") or "")),
+        reverse=True,
+    )[:15]
+    return {
+        "title": "OwnTracks activity dashboard",
+        "scope": {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "days": (end_date - start_date).days + 1,
+        },
+        "stats": {
+            "observed_days": len(observed_days),
+            "home_only_days": len(home_only_days),
+            "out_of_home_days": len(out_days),
+            "travel_days": len(travel_days),
+            "total_distance_km": total_distance,
+            "outside_distance_km": outside_distance,
+            "outside_minutes": outside_minutes_total,
+            "places": len(stop_index.get("places", [])),
+            "visits": sum(int(place.get("visit_count") or 0) for place in stop_index.get("places", [])),
+            "current_out_of_home_streak_days": current_out_streak,
+            "current_home_only_streak_days": current_home_streak,
+        },
+        "daily": daily,
+        "streaks": {
+            "out_of_home": activity_streaks(daily, "out_of_home"),
+            "home_only": activity_streaks(daily, "home_only"),
+        },
+        "top_places": top_places,
+    }
+
+
+def current_activity_streak_days(daily: list[dict], key: str) -> int:
+    count = 0
+    for day in reversed(daily):
+        if int(day.get("points") or 0) <= 0:
+            if count:
+                break
+            continue
+        if not day.get(key):
+            break
+        count += 1
+    return count
+
+
+def activity_streaks(daily: list[dict], key: str, min_days: int = 2) -> list[dict]:
+    streaks: list[dict] = []
+    current: list[dict] = []
+    for day in daily:
+        if day.get(key):
+            current.append(day)
+            continue
+        if len(current) >= min_days:
+            streaks.append(activity_streak_from_days(current))
+        current = []
+    if len(current) >= min_days:
+        streaks.append(activity_streak_from_days(current))
+    return sorted(streaks, key=lambda item: (int(item["days"]), str(item["end"])), reverse=True)
+
+
+def activity_streak_from_days(days: list[dict]) -> dict:
+    return {
+        "start": days[0]["date"],
+        "end": days[-1]["date"],
+        "days": len(days),
+        "distance_km": round(sum(float(day.get("distance_km") or 0) for day in days), 2),
+        "outside_minutes": sum(int(day.get("outside_minutes") or 0) for day in days),
+        "travel_days": sum(1 for day in days if day.get("travel_day")),
+    }
+
+
+def estimate_outside_home_minutes(
+    points: list[Event],
+    home_filter: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> int:
+    if len(points) < 2:
+        return 0
+    minutes = 0.0
+    sorted_points = sorted(points, key=event_time)
+    for previous, current in zip(sorted_points, sorted_points[1:]):
+        elapsed = (event_time(current) - event_time(previous)).total_seconds() / 60
+        if elapsed <= 0 or elapsed > 180:
+            continue
+        if not is_home_area_point(previous, home_filter, anchors) or not is_home_area_point(current, home_filter, anchors):
+            minutes += min(elapsed, 60)
+    return int(round(minutes))
+
+
+def render_activity_dashboard_html(summary: dict) -> str:
+    title = escape(summary["title"])
+    scope = summary.get("scope") or {}
+    stats = summary.get("stats") or {}
+    payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
+    nav = owntracks_nav_html("dashboard", start=scope.get("start"), end=scope.get("end"))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ background: #f8fafc; color: #111827; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; }}
+    [hidden] {{ display: none !important; }}
+    header {{ background: white; border-bottom: 1px solid #d1d5db; padding: 14px 18px; position: sticky; top: 0; z-index: 5; }}
+    h1 {{ font-size: 20px; margin: 0 0 8px; }}
+    .subtle {{ color: #4b5563; font-size: 13px; line-height: 1.4; }}
+{OWNTRACKS_NAV_CSS}
+    .filters {{ align-items: end; display: grid; gap: 10px; grid-template-columns: minmax(160px, 210px) repeat(2, minmax(140px, 180px)) auto minmax(180px, 1fr) auto; margin-top: 12px; }}
+    label {{ color: #374151; display: grid; font-size: 12px; font-weight: 800; gap: 4px; }}
+    input, select {{ border: 1px solid #d1d5db; border-radius: 6px; font: inherit; min-height: 36px; padding: 7px 9px; width: 100%; }}
+    input[type="checkbox"] {{ min-height: 0; width: auto; }}
+    .toggle {{ align-items: center; border: 1px solid #d1d5db; border-radius: 6px; display: inline-flex; gap: 7px; min-height: 36px; padding: 7px 9px; white-space: nowrap; }}
+    button, .button {{ background: #111827; border: 0; border-radius: 6px; color: white; cursor: pointer; display: inline-flex; font: inherit; font-size: 13px; font-weight: 800; justify-content: center; min-height: 36px; padding: 7px 11px; text-decoration: none; }}
+    main {{ display: grid; gap: 14px; padding: 14px; }}
+    .cards {{ display: grid; gap: 10px; grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+    .card, .panel {{ background: white; border: 1px solid #d1d5db; border-radius: 8px; }}
+    .card {{ padding: 10px 12px; }}
+    .card span {{ color: #6b7280; display: block; font-size: 11px; font-weight: 850; text-transform: uppercase; }}
+    .card strong {{ display: block; font-size: 20px; margin-top: 3px; }}
+    .grid {{ display: grid; gap: 14px; grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr); }}
+    .panel {{ overflow: hidden; }}
+    .panel h2 {{ border-bottom: 1px solid #e5e7eb; font-size: 15px; margin: 0; padding: 10px 12px; }}
+    .panel-head {{ align-items: center; border-bottom: 1px solid #e5e7eb; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; padding: 10px 12px; }}
+    .panel-head h2 {{ border-bottom: 0; padding: 0; }}
+    .legend {{ align-items: center; display: flex; flex-wrap: wrap; gap: 8px 12px; }}
+    .legend-item {{ align-items: center; color: #4b5563; display: inline-flex; font-size: 12px; font-weight: 750; gap: 5px; }}
+    .legend-swatch {{ border: 1px solid #d1d5db; border-radius: 4px; display: inline-block; height: 12px; width: 22px; }}
+    .legend-swatch.empty {{ background: #f3f4f6; border-color: #e5e7eb; }}
+    .legend-swatch.home {{ background: #ecfdf5; border-color: #a7f3d0; }}
+    .legend-swatch.out {{ background: #eff6ff; border-color: #bfdbfe; }}
+    .legend-swatch.travel {{ background: #fff7ed; border-color: #fed7aa; }}
+    .calendar {{ display: grid; gap: 6px; grid-template-columns: repeat(7, minmax(0, 1fr)); padding: 12px; }}
+    .weekday {{ color: #6b7280; font-size: 11px; font-weight: 850; padding: 0 7px 3px; text-transform: uppercase; }}
+    .day {{ border: 1px solid #e5e7eb; border-radius: 7px; color: #111827; min-height: 74px; padding: 7px; position: relative; text-decoration: none; z-index: 1; }}
+    .day.pad {{ background: #f9fafb; border-color: #eef2f7; pointer-events: none; }}
+    .day.empty {{ background: #f3f4f6; color: #9ca3af; }}
+    .day.home {{ background: #ecfdf5; border-color: #a7f3d0; }}
+    .day.out {{ background: #eff6ff; border-color: #bfdbfe; }}
+    .day.travel {{ background: #fff7ed; border-color: #fed7aa; }}
+    .day.connect-prev::before, .day.connect-next::after {{ content: ""; height: 4px; position: absolute; top: 50%; transform: translateY(-50%); width: 7px; z-index: -1; }}
+    .day.connect-prev::before {{ left: -7px; }}
+    .day.connect-next::after {{ right: -7px; }}
+    .day.week-prev::before, .day.week-next::after {{ content: ""; height: 7px; left: 50%; position: absolute; transform: translateX(-50%); width: 4px; z-index: -1; }}
+    .day.week-prev::before {{ top: -7px; }}
+    .day.week-next::after {{ bottom: -7px; }}
+    .day.home.connect-prev::before, .day.home.connect-next::after, .day.home.week-prev::before, .day.home.week-next::after {{ background: #a7f3d0; }}
+    .day.out.connect-prev::before, .day.out.connect-next::after, .day.out.week-prev::before, .day.out.week-next::after {{ background: #bfdbfe; }}
+    .day.travel.connect-prev::before, .day.travel.connect-next::after, .day.travel.week-prev::before, .day.travel.week-next::after {{ background: #fed7aa; }}
+    .day strong {{ display: block; font-size: 13px; }}
+    .day span {{ color: #4b5563; display: block; font-size: 11px; line-height: 1.35; margin-top: 2px; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border-bottom: 1px solid #e5e7eb; font-size: 13px; padding: 8px 10px; text-align: left; vertical-align: top; }}
+    th {{ background: #f9fafb; color: #374151; font-size: 12px; text-transform: uppercase; }}
+    .places {{ display: grid; gap: 8px; padding: 12px; }}
+    .place {{ border: 1px solid #e5e7eb; border-radius: 7px; padding: 9px; }}
+    .place strong {{ display: block; font-size: 13px; }}
+    .place span {{ color: #4b5563; display: block; font-size: 12px; margin-top: 3px; }}
+    @media (max-width: 850px) {{ .filters, .grid {{ grid-template-columns: 1fr; }} .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .calendar {{ gap: 4px; overflow-x: auto; }} .weekday {{ font-size: 10px; padding-inline: 3px; }} .day {{ min-height: 68px; min-width: 74px; padding: 5px; }} .day.connect-prev::before, .day.connect-next::after {{ width: 5px; }} .day.connect-prev::before {{ left: -5px; }} .day.connect-next::after {{ right: -5px; }} .day.week-prev::before, .day.week-next::after {{ height: 5px; }} .day.week-prev::before {{ top: -5px; }} .day.week-next::after {{ bottom: -5px; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{title}</h1>
+    <div class="subtle">{escape(scope.get("start") or "")} to {escape(scope.get("end") or "")} · raw movement, home-area classification, and indexed place visits</div>
+    {nav}
+    <form id="rangeForm" class="filters">
+      <label>Preset <select id="rangePreset">
+        <option value="">Custom dates</option>
+        <option value="last-week">Last week</option>
+        <option value="last-7-days">Last 7 days</option>
+        <option value="last-month">Last month</option>
+        <option value="month-to-date">Month to date</option>
+        <option value="year-to-date">Year to date</option>
+        <option value="all">All data</option>
+      </select></label>
+      <label>Start <input id="startDate" name="start" type="date" value="{escape(scope.get("start") or "")}"></label>
+      <label>End <input id="endDate" name="end" type="date" value="{escape(scope.get("end") or "")}"></label>
+      <button type="submit">Apply range</button>
+      <label>Calendar value <select id="metric"><option value="outside">Outside time</option><option value="distance">Distance</option><option value="visits">Visits</option></select></label>
+      <label class="toggle"><input id="travelSplit" type="checkbox"> Travel split</label>
+    </form>
+  </header>
+  <main>
+    <section class="cards">
+      <div class="card"><span>Observed days</span><strong>{int(stats.get("observed_days") or 0)}</strong></div>
+      <div class="card"><span>Home-only days</span><strong>{int(stats.get("home_only_days") or 0)}</strong></div>
+      <div class="card"><span>Out-of-home days</span><strong>{int(stats.get("out_of_home_days") or 0)}</strong></div>
+      <div class="card"><span>Travel days</span><strong>{int(stats.get("travel_days") or 0)}</strong></div>
+      <div class="card"><span>Total distance</span><strong>{float(stats.get("total_distance_km") or 0):.1f} km</strong></div>
+      <div class="card"><span>Outside distance</span><strong>{float(stats.get("outside_distance_km") or 0):.1f} km</strong></div>
+      <div class="card"><span>Outside time</span><strong>{fmt_duration(int(stats.get("outside_minutes") or 0))}</strong></div>
+      <div class="card"><span>Place visits</span><strong>{int(stats.get("visits") or 0)}</strong></div>
+      <div class="card"><span>Current out streak</span><strong>{int(stats.get("current_out_of_home_streak_days") or 0)} days</strong></div>
+      <div class="card"><span>Current home streak</span><strong>{int(stats.get("current_home_only_streak_days") or 0)} days</strong></div>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Active day calendar</h2>
+          <div class="legend" aria-label="Calendar color legend">
+            <span class="legend-item"><span class="legend-swatch empty"></span>No data</span>
+            <span class="legend-item"><span class="legend-swatch home"></span>Home only</span>
+            <span class="legend-item"><span class="legend-swatch out"></span>Out of home</span>
+            <span id="travelLegend" class="legend-item" hidden><span class="legend-swatch travel"></span>Travel day</span>
+          </div>
+        </div>
+        <div id="calendar" class="calendar"></div>
+      </div>
+      <div class="panel"><h2>Most common places</h2><div id="places" class="places"></div></div>
+    </section>
+    <section class="panel"><h2>Daily detail</h2><div id="daily"></div></section>
+  </main>
+  <script>
+    const data = {payload};
+    const calendar = document.getElementById("calendar");
+    const places = document.getElementById("places");
+    const daily = document.getElementById("daily");
+    const metric = document.getElementById("metric");
+    const rangePreset = document.getElementById("rangePreset");
+    const travelSplit = document.getElementById("travelSplit");
+    const travelLegend = document.getElementById("travelLegend");
+    const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }}[char]));
+    const tokenQuery = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return token ? `?token=${{encodeURIComponent(token)}}` : "";
+    }};
+    const mapHref = (date) => `/owntracks/map/${{encodeURIComponent(date)}}${{tokenQuery()}}`;
+    const stopHref = (name) => {{
+      const params = new URLSearchParams(window.location.search);
+      params.set("q", name);
+      return `/owntracks/stops${{params.toString() ? "?" + params.toString() : ""}}`;
+    }};
+    const fmtMin = (minutes) => {{
+      const value = Number(minutes) || 0;
+      if (value < 60) return `${{Math.round(value)}} min`;
+      return `${{Math.floor(value / 60)}}h ${{String(Math.round(value % 60)).padStart(2, "0")}}m`;
+    }};
+    const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const dateParts = (dateText) => {{
+      const match = String(dateText || "").match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})$/);
+      if (!match) return null;
+      return {{ year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }};
+    }};
+    const dateInputValue = (date) => {{
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return `${{year}}-${{month}}-${{day}}`;
+    }};
+    const addDays = (date, days) => {{
+      const next = new Date(date);
+      next.setDate(next.getDate() + days);
+      return next;
+    }};
+    const presetRange = (preset) => {{
+      const today = new Date();
+      const endToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      if (preset === "last-7-days") return {{ start: dateInputValue(addDays(endToday, -6)), end: dateInputValue(endToday) }};
+      if (preset === "last-week") {{
+        const mondayBasedDay = (endToday.getDay() + 6) % 7;
+        const thisMonday = addDays(endToday, -mondayBasedDay);
+        return {{ start: dateInputValue(addDays(thisMonday, -7)), end: dateInputValue(addDays(thisMonday, -1)) }};
+      }}
+      if (preset === "last-month") {{
+        const firstThisMonth = new Date(endToday.getFullYear(), endToday.getMonth(), 1);
+        return {{ start: dateInputValue(new Date(endToday.getFullYear(), endToday.getMonth() - 1, 1)), end: dateInputValue(addDays(firstThisMonth, -1)) }};
+      }}
+      if (preset === "month-to-date") return {{ start: dateInputValue(new Date(endToday.getFullYear(), endToday.getMonth(), 1)), end: dateInputValue(endToday) }};
+      if (preset === "year-to-date") return {{ start: dateInputValue(new Date(endToday.getFullYear(), 0, 1)), end: dateInputValue(endToday) }};
+      if (preset === "all") return {{ start: "", end: "" }};
+      return null;
+    }};
+    const weekdayIndex = (dateText) => {{
+      const parts = dateParts(dateText);
+      if (!parts) return 0;
+      return (new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay() + 6) % 7;
+    }};
+    const calendarCells = () => {{
+      const days = data.daily || [];
+      const first = days.length ? weekdayIndex(days[0].date) : 0;
+      const trailing = days.length ? (7 - ((first + days.length) % 7)) % 7 : 0;
+      return [
+        ...Array.from({{ length: first }}, () => null),
+        ...days,
+        ...Array.from({{ length: trailing }}, () => null),
+      ];
+    }};
+    const dayValue = (day) => metric.value === "distance" ? day.distance_km : metric.value === "visits" ? day.visit_count : day.outside_minutes;
+    const dayClass = (day) => !day.points ? "empty" : travelSplit.checked && day.travel_day ? "travel" : day.out_of_home ? "out" : "home";
+    const dayLabel = (day) => !day.points ? "no data" : travelSplit.checked && day.travel_day ? "travel" : day.out_of_home ? "out" : "home";
+    const streakKind = (day) => !day || !day.points ? "" : travelSplit.checked && day.travel_day ? "travel" : day.out_of_home ? "out" : day.home_only ? "home" : "";
+    const connectorClass = (day, index, days) => {{
+      const kind = streakKind(day);
+      if (!kind) return "";
+      const parts = [];
+      const previous = days[index - 1];
+      const next = days[index + 1];
+      if (previous && streakKind(previous) === kind) parts.push(weekdayIndex(day.date) === 0 ? "week-prev" : "connect-prev");
+      if (next && streakKind(next) === kind) parts.push(weekdayIndex(day.date) === 6 ? "week-next" : "connect-next");
+      return parts.join(" ");
+    }};
+    const renderCalendar = () => {{
+      travelLegend.hidden = !travelSplit.checked;
+      const days = data.daily || [];
+      calendar.innerHTML = `
+        ${{weekdays.map((weekday) => `<div class="weekday">${{weekday}}</div>`).join("")}}
+        ${{calendarCells().map((day) => day ? `
+        <a class="day ${{dayClass(day)}} ${{connectorClass(day, days.indexOf(day), days)}}" href="${{escapeHtml(mapHref(day.date))}}">
+          <strong>${{escapeHtml(day.date.slice(5))}}</strong>
+          <span>${{escapeHtml(weekdays[weekdayIndex(day.date)])}}</span>
+          <span>${{escapeHtml(day.points ? `${{dayValue(day)}} ${{metric.value === "distance" ? "km" : metric.value === "visits" ? "visits" : "min outside"}}` : "no data")}}</span>
+          <span>${{escapeHtml(day.dominant_motion || "unknown")}}</span>
+        </a>
+      ` : '<div class="day pad" aria-hidden="true"></div>').join("")}}
+      `;
+    }};
+    const renderPlaces = () => {{
+      places.innerHTML = (data.top_places || []).map((place) => `
+        <a class="place" href="${{escapeHtml(stopHref(place.name || ""))}}">
+          <strong>${{escapeHtml(place.name || "Unknown place")}}</strong>
+          <span>${{place.visit_count || 0}} visits · ${{fmtMin(place.total_minutes || 0)}} dwell · latest ${{escapeHtml(place.latest_visit || "")}}</span>
+        </a>
+      `).join("") || '<div class="place"><strong>No places found</strong></div>';
+    }};
+    const renderDaily = () => {{
+      daily.innerHTML = `
+        <table>
+          <thead><tr><th>Date</th><th>Class</th><th>Distance</th><th>Outside</th><th>Motion</th><th>Places</th></tr></thead>
+          <tbody>
+            ${{(data.daily || []).map((day) => `
+              <tr>
+                <td><a href="${{escapeHtml(mapHref(day.date))}}">${{escapeHtml(day.date)}}</a></td>
+                <td>${{dayLabel(day)}}</td>
+                <td>${{Number(day.distance_km || 0).toFixed(2)}} km</td>
+                <td>${{fmtMin(day.outside_minutes || 0)}} · ${{Number(day.outside_distance_km || 0).toFixed(2)}} km</td>
+                <td>${{escapeHtml(day.dominant_motion || "unknown")}}</td>
+                <td>${{(day.places || []).map(escapeHtml).join(", ")}}</td>
+              </tr>
+            `).join("")}}
+          </tbody>
+        </table>
+      `;
+    }};
+    const applyDashboardRange = () => {{
+      const params = new URLSearchParams(window.location.search);
+      const start = document.getElementById("startDate").value;
+      const end = document.getElementById("endDate").value;
+      if (start) params.set("start", start); else params.delete("start");
+      if (end) params.set("end", end); else params.delete("end");
+      window.location.href = `/owntracks/dashboard?${{params.toString()}}`;
+    }};
+    document.getElementById("rangeForm").addEventListener("submit", (event) => {{
+      event.preventDefault();
+      applyDashboardRange();
+    }});
+    rangePreset.addEventListener("change", () => {{
+      const range = presetRange(rangePreset.value);
+      if (!range) return;
+      document.getElementById("startDate").value = range.start;
+      document.getElementById("endDate").value = range.end;
+      applyDashboardRange();
+    }});
+    document.getElementById("startDate").addEventListener("input", () => {{ rangePreset.value = ""; }});
+    document.getElementById("endDate").addEventListener("input", () => {{ rangePreset.value = ""; }});
+    metric.addEventListener("change", renderCalendar);
+    travelSplit.addEventListener("change", () => {{ renderCalendar(); renderDaily(); }});
+{OWNTRACKS_NAV_SCRIPT}
+    renderCalendar();
+    renderPlaces();
+    renderDaily();
+  </script>
+</body>
+</html>"""
+
+
 def best_heatmap_match(lat: float, lon: float, sources: list[dict], radius_m: int = 400) -> dict | None:
     best: tuple[int, str, float, str] | None = None
     best_source: dict | None = None
@@ -2515,6 +3438,7 @@ def render_static_heatmap_html(summary: dict, *, initial_filter: str | None = No
     title = escape(summary["title"])
     scope = summary["scope"]
     stats = summary["stats"]
+    nav = owntracks_nav_html("heat", start=scope.get("start"), end=scope.get("end"))
     filter_text = (initial_filter or "").strip().lower()
 
     def matches_filter(spot: dict) -> bool:
@@ -2589,6 +3513,7 @@ def render_static_heatmap_html(summary: dict, *, initial_filter: str | None = No
     body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #0f172a; }}
     header {{ padding: 16px 20px; background: white; border-bottom: 1px solid #cbd5e1; }}
     h1 {{ font-size: 20px; margin: 0 0 6px; }}
+{OWNTRACKS_NAV_CSS}
     .subtle {{ color: #475569; font-size: 13px; }}
     .wrap {{ display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); padding: 16px; }}
     svg {{ background: #e2e8f0; border: 1px solid #cbd5e1; border-radius: 10px; height: auto; max-width: 100%; }}
@@ -2603,6 +3528,7 @@ def render_static_heatmap_html(summary: dict, *, initial_filter: str | None = No
   <header>
     <h1>{title}</h1>
     <div class="subtle">{scope["start"]} to {scope["end"]} · {stats["location_points"]} points · {stats["unique_locations"]} locations</div>
+    {nav}
     {filter_note}
   </header>
   <main class="wrap">
@@ -2616,6 +3542,9 @@ def render_static_heatmap_html(summary: dict, *, initial_filter: str | None = No
       <table><thead><tr><th>Location</th><th>Mode</th><th>Visits</th><th>Minutes</th><th>Tags</th></tr></thead><tbody>{rows}</tbody></table>
     </section>
   </main>
+  <script>
+{OWNTRACKS_NAV_SCRIPT}
+  </script>
 </body>
 </html>"""
 
@@ -2628,6 +3557,7 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
     title = escape(summary["title"])
     scope = summary["scope"]
     stats = summary["stats"]
+    nav = owntracks_nav_html("heat", start=scope.get("start"), end=scope.get("end"))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2671,6 +3601,10 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
     .panel h1 {{
       font-size: 16px;
       margin: 0;
+    }}
+{OWNTRACKS_NAV_CSS}
+    .panel .ot-nav {{
+      margin-bottom: 8px;
     }}
     .panel-toggle {{
       appearance: none;
@@ -2886,6 +3820,7 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
       <h1>{title}</h1>
       <button type="button" id="toggleHeatmapPanel" class="panel-toggle">Hide</button>
     </div>
+    {nav}
     <div class="panel-body">
       <div class="subtle">{scope["start"]} to {scope["end"]}</div>
       <div class="panel-actions">
@@ -2919,6 +3854,7 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
   <script>
     const data = {payload};
     const initialFilterText = {initial_filter_payload};
+{OWNTRACKS_NAV_SCRIPT}
     const allSpots = data.heat_points.map((item) => ({{
       lat: item.lat,
       lon: item.lon,
@@ -3149,6 +4085,539 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
 </html>"""
 
 
+def render_stop_index_html(summary: dict) -> str:
+    title = escape(summary["title"])
+    scope = summary.get("scope") or {}
+    stats = summary.get("stats") or {}
+    alias_meta = summary.get("search_aliases_meta") or {}
+    generated_alias_meta = alias_meta.get("generated") or {}
+    alias_updated_at = generated_alias_meta.get("updated_at")
+    alias_status = (
+        f"{int(alias_meta.get('categories') or 0)} active alias categories · "
+        f"{int(alias_meta.get('terms') or 0)} terms · "
+        f"last generated {alias_updated_at}"
+        if alias_updated_at
+        else f"{len(summary.get('search_aliases') or {})} active alias categories · not generated yet"
+    )
+    payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
+    nav = owntracks_nav_html("stops", start=scope.get("start"), end=scope.get("end"))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --border: #d1d5db;
+      --ink: #111827;
+      --muted: #4b5563;
+      --panel: #ffffff;
+      --soft: #f3f4f6;
+      --accent: #0f766e;
+      --accent-soft: #ccfbf1;
+    }}
+    * {{
+      box-sizing: border-box;
+    }}
+    body {{
+      background: #f8fafc;
+      color: var(--ink);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+    }}
+    header {{
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 18px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }}
+    h1 {{
+      font-size: 20px;
+      line-height: 1.2;
+      margin: 0 0 8px;
+    }}
+{OWNTRACKS_NAV_CSS}
+    .subtle {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }}
+    .filters {{
+      align-items: end;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(180px, 1fr) repeat(2, minmax(130px, 160px)) auto;
+      margin-top: 12px;
+    }}
+    label {{
+      color: #374151;
+      display: grid;
+      font-size: 12px;
+      font-weight: 800;
+      gap: 4px;
+    }}
+    input {{
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--ink);
+      font: inherit;
+      min-height: 36px;
+      padding: 7px 9px;
+      width: 100%;
+    }}
+    button, .button {{
+      align-items: center;
+      background: var(--ink);
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      cursor: pointer;
+      display: inline-flex;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      justify-content: center;
+      min-height: 36px;
+      padding: 7px 11px;
+      text-decoration: none;
+    }}
+    button.secondary, .button.secondary {{
+      background: #e5e7eb;
+      color: var(--ink);
+    }}
+    main {{
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+      padding: 14px;
+    }}
+    .stats {{
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 10px;
+    }}
+    .stat {{
+      background: var(--soft);
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      padding: 8px 10px;
+    }}
+    .stat span {{
+      color: var(--muted);
+      display: block;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }}
+    .stat strong {{
+      display: block;
+      font-size: 17px;
+      margin-top: 2px;
+    }}
+    .alias-actions {{
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .alias-status {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }}
+    .places, .details {{
+      min-height: calc(100vh - 160px);
+    }}
+    .places {{
+      display: grid;
+      gap: 8px;
+      max-height: calc(100vh - 164px);
+      overflow: auto;
+    }}
+    .place {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      padding: 10px;
+      text-align: left;
+      width: 100%;
+    }}
+    .place.active {{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-soft) inset;
+    }}
+    .place-name {{
+      display: block;
+      font-size: 14px;
+      font-weight: 850;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }}
+    .place-meta {{
+      color: var(--muted);
+      display: block;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-top: 4px;
+    }}
+    .tags {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 7px;
+    }}
+    .tag {{
+      background: #eef2ff;
+      border-radius: 999px;
+      color: #3730a3;
+      font-size: 11px;
+      font-weight: 750;
+      padding: 2px 7px;
+    }}
+    .details {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .detail-head {{
+      border-bottom: 1px solid var(--border);
+      padding: 14px;
+    }}
+    .detail-head h2 {{
+      font-size: 18px;
+      margin: 0 0 6px;
+      overflow-wrap: anywhere;
+    }}
+    .visits {{
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+    }}
+    .visit {{
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px;
+    }}
+    .visit-top {{
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }}
+    .visit-date {{
+      font-size: 14px;
+      font-weight: 850;
+    }}
+    .visit-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .visit-actions .button {{
+      font-size: 12px;
+      min-height: 30px;
+      padding: 5px 8px;
+    }}
+    .note {{
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      border-radius: 6px;
+      color: #78350f;
+      font-size: 13px;
+      line-height: 1.4;
+      margin-top: 8px;
+      padding: 8px;
+      white-space: pre-wrap;
+    }}
+    .empty {{
+      color: var(--muted);
+      font-size: 14px;
+      padding: 18px;
+    }}
+    @media (max-width: 800px) {{
+      header {{
+        position: static;
+      }}
+      .filters {{
+        grid-template-columns: 1fr;
+      }}
+      .stats {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      main {{
+        grid-template-columns: 1fr;
+      }}
+      .places {{
+        max-height: 42vh;
+      }}
+      .places, .details {{
+        min-height: 0;
+      }}
+      .visit-top {{
+        align-items: flex-start;
+        flex-direction: column;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{title}</h1>
+    <div class="subtle">{escape(scope.get("start") or "no data")} to {escape(scope.get("end") or "no data")} · built from raw OwnTracks logs and saved stop reviews</div>
+    {nav}
+    <form id="rangeForm" class="filters">
+      <label>Search
+        <input id="search" name="q" placeholder="doctor, dentist, office, tag, note, date">
+      </label>
+      <label>Start
+        <input id="startDate" name="start" type="date" value="{escape(scope.get("start") or "")}">
+      </label>
+      <label>End
+        <input id="endDate" name="end" type="date" value="{escape(scope.get("end") or "")}">
+      </label>
+      <button type="submit">Apply range</button>
+    </form>
+    <div class="alias-actions">
+      <button id="refreshAliases" type="button" class="secondary">Refresh search aliases</button>
+      <span id="aliasStatus" class="alias-status">{escape(alias_status)}</span>
+    </div>
+    <div class="stats">
+      <div class="stat"><span>Places</span><strong>{int(stats.get("places") or 0)}</strong></div>
+      <div class="stat"><span>Visits</span><strong>{int(stats.get("visits") or 0)}</strong></div>
+      <div class="stat"><span>Reviewed</span><strong>{int(stats.get("reviewed_visits") or 0)}</strong></div>
+      <div class="stat"><span>Total dwell</span><strong>{fmt_duration(int(stats.get("total_minutes") or 0))}</strong></div>
+    </div>
+  </header>
+  <main>
+    <section id="placeList" class="places" aria-label="Stop places"></section>
+    <section id="details" class="details" aria-label="Visit details"></section>
+  </main>
+  <script>
+    const data = {payload};
+    const placeList = document.getElementById("placeList");
+    const details = document.getElementById("details");
+    const search = document.getElementById("search");
+    const rangeForm = document.getElementById("rangeForm");
+    const refreshAliases = document.getElementById("refreshAliases");
+    const aliasStatus = document.getElementById("aliasStatus");
+    const searchAliases = data.search_aliases || {{}};
+    let activeKey = "";
+    const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }}[char]));
+    const normalize = (value) => String(value == null ? "" : value).trim().toLowerCase();
+    const tokenQuery = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return token ? `?token=${{encodeURIComponent(token)}}` : "";
+    }};
+    const mapHref = (visit) => `/owntracks/map/${{encodeURIComponent(visit.date)}}${{tokenQuery()}}`;
+{OWNTRACKS_NAV_SCRIPT}
+    const termsForText = (value) => normalize(value).split(/[^a-z0-9:_-]+/).filter(Boolean);
+    const expandTerms = (parts) => {{
+      const values = parts.flatMap((part) => termsForText(part));
+      const expanded = new Set(values);
+      for (const [category, aliases] of Object.entries(searchAliases)) {{
+        const categoryTerm = normalize(category);
+        const aliasTerms = (aliases || []).map(normalize).filter(Boolean);
+        const matched = aliasTerms.some((term) => expanded.has(term)) || expanded.has(categoryTerm);
+        if (!matched) continue;
+        expanded.add(categoryTerm);
+        expanded.add(`category:${{categoryTerm}}`);
+        aliasTerms.forEach((term) => expanded.add(term));
+      }}
+      return [...expanded].join(" ");
+    }};
+    const rawPlaceParts = (place) => [
+      place.name,
+      place.first_visit,
+      place.latest_visit,
+      ...(place.tags || []),
+      ...(place.visits || []).flatMap((visit) => [
+        visit.date,
+        visit.raw_name,
+        visit.alias,
+        visit.id,
+        visit.note,
+        visit.motion,
+        visit.motion_mode,
+        visit.source,
+        ...(visit.tags || []),
+      ]),
+    ];
+    const placeText = (place) => expandTerms(rawPlaceParts(place));
+    const containsTerm = (value, term) => normalize(value).includes(term);
+    const exactTerm = (value, term) => normalize(value) === term;
+    const termScore = (value, term, exactPoints, containsPoints) => {{
+      const text = normalize(value);
+      if (!text) return 0;
+      if (text === term) return exactPoints;
+      if (text.startsWith(`${{term}} `) || text.includes(` ${{term}} `) || text.endsWith(` ${{term}}`)) return Math.round(containsPoints * 1.2);
+      return text.includes(term) ? containsPoints : 0;
+    }};
+    const placeSearchScore = (place, directTerms, expandedTerms) => {{
+      const direct = new Set(directTerms);
+      let score = 0;
+      for (const term of expandedTerms) {{
+        const multiplier = direct.has(term) ? 4 : 1;
+        score += multiplier * termScore(place.name, term, 1000, 700);
+        for (const tag of place.tags || []) score += multiplier * termScore(tag, term, 800, 550);
+        for (const visit of place.visits || []) {{
+          score += multiplier * termScore(visit.raw_name, term, 650, 420);
+          score += multiplier * termScore(visit.note, term, 520, 320);
+          score += multiplier * termScore(visit.id, term, 220, 120);
+          score += multiplier * termScore(visit.alias, term, 180, 90);
+          for (const tag of visit.tags || []) score += multiplier * termScore(tag, term, 720, 500);
+        }}
+        if (!direct.has(term) && placeText(place).includes(term)) score += 20;
+      }}
+      score += Math.min(Number(place.reviewed_visits) || 0, 10) * 8;
+      return score;
+    }};
+    const filteredPlaces = () => {{
+      const directTerms = termsForText(search.value);
+      const query = expandTerms([search.value]);
+      const places = data.places || [];
+      if (!query) return places;
+      const expandedTerms = query.split(" ").filter(Boolean);
+      return places
+        .filter((place) => expandedTerms.every((term) => placeText(place).includes(term)))
+        .map((place) => [placeSearchScore(place, directTerms, expandedTerms), place])
+        .sort((left, right) =>
+          right[0] - left[0]
+          || String(right[1].latest_visit || "").localeCompare(String(left[1].latest_visit || ""))
+          || (Number(right[1].visit_count) || 0) - (Number(left[1].visit_count) || 0)
+          || (Number(right[1].total_minutes) || 0) - (Number(left[1].total_minutes) || 0)
+          || String(left[1].name || "").localeCompare(String(right[1].name || ""))
+        )
+        .map((item) => item[1]);
+    }};
+    const formatMinutes = (minutes) => {{
+      const value = Number(minutes) || 0;
+      if (value < 60) return `${{value}} min`;
+      return `${{Math.floor(value / 60)}}h ${{String(value % 60).padStart(2, "0")}}m`;
+    }};
+    const renderTags = (tags) => (tags || []).length
+      ? `<div class="tags">${{tags.map((tag) => `<span class="tag">${{escapeHtml(tag)}}</span>`).join("")}}</div>`
+      : "";
+    const setActive = (key) => {{
+      activeKey = key;
+      renderPlaces();
+      renderDetails((data.places || []).find((place) => place.key === key));
+    }};
+    const renderPlaces = () => {{
+      const places = filteredPlaces();
+      if (!places.length) {{
+        placeList.innerHTML = '<div class="empty">No stop places match this search.</div>';
+        renderDetails(null);
+        return;
+      }}
+      if (!places.some((place) => place.key === activeKey)) activeKey = places[0].key;
+      placeList.innerHTML = places.map((place) => `
+        <button type="button" class="place ${{place.key === activeKey ? "active" : ""}}" data-key="${{escapeHtml(place.key)}}">
+          <span class="place-name">${{escapeHtml(place.name)}}</span>
+          <span class="place-meta">${{place.visit_count}} visit${{place.visit_count === 1 ? "" : "s"}} · ${{formatMinutes(place.total_minutes)}} · latest ${{escapeHtml(place.latest_visit || "")}}</span>
+          ${{renderTags((place.tags || []).slice(0, 5))}}
+        </button>
+      `).join("");
+      placeList.querySelectorAll("[data-key]").forEach((button) => {{
+        button.addEventListener("click", () => setActive(button.dataset.key || ""));
+      }});
+      renderDetails((data.places || []).find((place) => place.key === activeKey));
+    }};
+    const renderDetails = (place) => {{
+      if (!place) {{
+        details.innerHTML = '<div class="empty">Select a stop place to see visits.</div>';
+        return;
+      }}
+      details.innerHTML = `
+        <div class="detail-head">
+          <h2>${{escapeHtml(place.name)}}</h2>
+          <div class="subtle">
+            ${{place.visit_count}} visit${{place.visit_count === 1 ? "" : "s"}} ·
+            ${{formatMinutes(place.total_minutes)}} total dwell ·
+            first ${{escapeHtml(place.first_visit || "")}} · latest ${{escapeHtml(place.latest_visit || "")}}
+          </div>
+          ${{renderTags(place.tags || [])}}
+        </div>
+        <div class="visits">
+          ${{(place.visits || []).map((visit) => `
+            <article class="visit">
+              <div class="visit-top">
+                <div>
+                  <div class="visit-date">${{escapeHtml(visit.date)}} · ${{escapeHtml(visit.duration || formatMinutes(visit.duration_minutes))}}</div>
+                  <div class="subtle">${{escapeHtml(visit.start)}} to ${{escapeHtml(visit.end)}} · ${{escapeHtml(visit.motion_mode || "unknown")}} · ${{escapeHtml(visit.points || 0)}} points</div>
+                </div>
+                <div class="visit-actions">
+                  <a class="button secondary" href="${{escapeHtml(mapHref(visit))}}">Day map</a>
+                  ${{visit.maps ? `<a class="button secondary" href="${{escapeHtml(visit.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>` : ""}}
+                </div>
+              </div>
+              ${{renderTags(visit.tags || [])}}
+              ${{visit.note ? `<div class="note">${{escapeHtml(visit.note)}}</div>` : ""}}
+            </article>
+          `).join("")}}
+        </div>
+      `;
+    }};
+    rangeForm.addEventListener("submit", (event) => {{
+      event.preventDefault();
+      const params = new URLSearchParams(window.location.search);
+      const start = document.getElementById("startDate").value;
+      const end = document.getElementById("endDate").value;
+      if (start) params.set("start", start); else params.delete("start");
+      if (end) params.set("end", end); else params.delete("end");
+      if (search.value.trim()) params.set("q", search.value.trim()); else params.delete("q");
+      window.location.href = `/owntracks/stops${{params.toString() ? "?" + params.toString() : ""}}`;
+    }});
+    const aliasEndpoint = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/search-aliases${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    refreshAliases.addEventListener("click", async () => {{
+      refreshAliases.disabled = true;
+      refreshAliases.textContent = "Refreshing...";
+      aliasStatus.textContent = "Running Codex alias generation for this date range...";
+      try {{
+        const response = await fetch(aliasEndpoint(), {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            start: document.getElementById("startDate").value,
+            end: document.getElementById("endDate").value,
+          }}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        aliasStatus.textContent = `Saved ${{payload.categories}} categories and ${{payload.terms}} terms. Reloading...`;
+        window.location.reload();
+      }} catch (error) {{
+        aliasStatus.textContent = `Alias refresh failed: ${{error.message || error}}`;
+        refreshAliases.disabled = false;
+        refreshAliases.textContent = "Refresh search aliases";
+      }}
+    }});
+    search.addEventListener("input", renderPlaces);
+    const params = new URLSearchParams(window.location.search);
+    search.value = params.get("q") || "";
+    renderPlaces();
+  </script>
+</body>
+</html>"""
+
+
 def render_leaflet_map_html(plan: dict) -> str:
     title = f"OwnTracks map - {plan['date']}"
     track = [
@@ -3209,6 +4678,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         ensure_ascii=False,
     ).replace("</", "<\\/")
     escaped_title = escape(title)
+    nav = owntracks_nav_html("day", date_text=str(plan.get("date") or ""))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3226,6 +4696,10 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     #map {{
       background: #dbeafe;
+    }}
+{OWNTRACKS_NAV_CSS}
+    .tools .ot-nav {{
+      margin: 8px 0;
     }}
     .tools {{
       background: rgb(255 255 255 / 0.94);
@@ -3662,6 +5136,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       <h1>{escaped_title}</h1>
       <button id="toggleTools" type="button" class="secondary">Hide</button>
     </div>
+    {nav}
     <div id="toolsBody" class="tools-body">
       <div class="row">
         <button id="selectAll" type="button" class="secondary">Select all</button>
@@ -3733,15 +5208,18 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="applyName" type="button">Apply</button>
       </div>
       <div id="stopList" class="stop-list"></div>
-      <label for="commands">Paste this in Telegram</label>
+      <button id="saveChanges" type="button" style="margin-top: 8px; width: 100%">Save stop changes</button>
+      <div id="saveFeedback" class="status"></div>
+      <label id="commandsLabel" for="commands">Telegram fallback</label>
       <textarea id="commands" readonly></textarea>
-      <button id="copyCommands" type="button" class="secondary" style="margin-top: 8px; width: 100%">Copy</button>
+      <button id="copyCommands" type="button" class="secondary" style="margin-top: 8px; width: 100%">Copy Telegram commands</button>
       <div id="status" class="status">loading</div>
     </div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const data = {payload};
+{OWNTRACKS_NAV_SCRIPT}
     const selected = new Set();
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
     const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
@@ -3752,6 +5230,8 @@ def render_leaflet_map_html(plan: dict) -> str:
     const status = document.getElementById("status");
     let clipboardStatus = "";
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
+    map.createPane("routePointsPane");
+    map.getPane("routePointsPane").style.zIndex = "450";
     const tiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
@@ -3768,6 +5248,10 @@ def render_leaflet_map_html(plan: dict) -> str:
     const placeMarkers = [];
     const routeRenderer = L.svg();
     routeRenderer.addTo(map);
+    // SVG only captures pointer events on circle paths; a canvas renderer would
+    // block the segment layer across the entire map surface.
+    const routePointRenderer = L.svg({{ pane: "routePointsPane", padding: 0.5 }});
+    routePointRenderer.addTo(map);
     const edgeLayer = L.layerGroup().addTo(map);
     const arrowLayer = L.layerGroup().addTo(map);
     const routeLayer = L.layerGroup().addTo(map);
@@ -3786,6 +5270,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let routeAnimationStartMs = null;
     let routeAnimationElapsedMs = 0;
     let routeAnimationStaticVisibility = null;
+    const routeAnimationMaxZoom = 16;
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
     const routeColorModes = ["motion", "speed", "bands", "slope"];
     const profileAxes = ["distance", "time"];
@@ -3921,6 +5406,96 @@ def render_leaflet_map_html(plan: dict) -> str:
       return null;
     }};
     const parseTags = (value) => value.split(/[\\s,]+/).map((item) => item.trim()).filter(Boolean);
+    const changedStops = () => data.stops.filter((stop) =>
+      stop.name !== originalNames.get(stop.alias)
+      || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
+      || (stop.note || "") !== originalNotes.get(stop.alias)
+    );
+    const owntracksStopsEndpoint = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/stops${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    const syncStopFromEditors = (stop, popupOnly = false) => {{
+      const fields = [
+        ["name", popupOnly ? `[data-popup-name="${{stop.alias}}"]` : `[data-name="${{stop.alias}}"]`],
+        ["tags", popupOnly ? `[data-popup-tags="${{stop.alias}}"]` : `[data-tags="${{stop.alias}}"]`],
+        ["note", popupOnly ? `[data-popup-note="${{stop.alias}}"]` : `[data-note="${{stop.alias}}"]`],
+      ];
+      for (const [field, selector] of fields) {{
+        const editors = document.querySelectorAll(selector);
+        const editor = editors.length ? editors[editors.length - 1] : null;
+        if (!editor) continue;
+        if (field === "tags") stop.tags = parseTags(editor.value);
+        else stop[field] = editor.value.trim();
+      }}
+    }};
+    const setSaveFeedback = (message, failed = false) => {{
+      const feedback = document.getElementById("saveFeedback");
+      if (!feedback) return;
+      feedback.textContent = message;
+      feedback.style.color = failed ? "#b91c1c" : "#166534";
+    }};
+    const saveStopReviews = async (requestedStops = null) => {{
+      const editorsToSync = requestedStops || data.stops;
+      editorsToSync.forEach((stop) => syncStopFromEditors(stop, Boolean(requestedStops)));
+      const stops = requestedStops || changedStops();
+      if (!canSaveManualStops()) {{
+        clipboardStatus = " · hosted map required";
+        setSaveFeedback("Open the hosted map to save directly.", true);
+        updateStatus();
+        return false;
+      }}
+      if (!stops.length) {{
+        clipboardStatus = " · no changes";
+        setSaveFeedback("No unsaved changes.");
+        updateStatus();
+        return true;
+      }}
+      const saveButton = document.getElementById("saveChanges");
+      if (saveButton) {{
+        saveButton.disabled = true;
+        saveButton.textContent = "Saving...";
+      }}
+      setSaveFeedback(`Saving ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}...`);
+      clipboardStatus = ` · saving ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}...`;
+      updateStatus();
+      try {{
+        for (const stop of stops) {{
+          const response = await fetch(owntracksStopsEndpoint(), {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{
+              date: data.date,
+              id: stop.id,
+              lat: stop.lat,
+              lon: stop.lon,
+              name: stop.name,
+              tags: stop.tags || [],
+              note: stop.note || "",
+            }}),
+          }});
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+          originalNames.set(stop.alias, stop.name);
+          originalTags.set(stop.alias, (stop.tags || []).join(" "));
+          originalNotes.set(stop.alias, stop.note || "");
+        }}
+        clipboardStatus = ` · saved ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}`;
+        setSaveFeedback(`Saved ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}.`);
+        updateCommands(false);
+        return true;
+      }} catch (error) {{
+        clipboardStatus = ` · save failed: ${{error.message || error}}`;
+        setSaveFeedback(`Save failed: ${{error.message || error}}`, true);
+        updateStatus();
+        return false;
+      }} finally {{
+        if (saveButton) {{
+          saveButton.disabled = false;
+          saveButton.textContent = "Save stop changes";
+        }}
+      }}
+    }};
     const copyCommandsToClipboard = async (automatic = false) => {{
       if (!commands.value) return false;
       try {{
@@ -3941,12 +5516,8 @@ def render_leaflet_map_html(plan: dict) -> str:
         return false;
       }}
     }};
-    const updateCommands = (autoCopy = true) => {{
-      const changed = data.stops.filter((stop) =>
-        stop.name !== originalNames.get(stop.alias)
-        || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
-        || (stop.note || "") !== originalNotes.get(stop.alias)
-      );
+    const updateCommands = (autoCopy = false) => {{
+      const changed = changedStops();
       commands.value = changed.length
         ? [
             "/otb " + data.date,
@@ -4000,7 +5571,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const currentTrackPoint = {{ lat, lon, timestamp }};
       const segmentSpeedKmh = derivedSpeedKmh(previousTrackPoint, currentTrackPoint);
       if (previousTrackPoint) cumulativeTrackDistanceKm += distanceMeters(previousTrackPoint, currentTrackPoint) / 1000;
-      trackPoints.push({{
+        trackPoints.push({{
         lat,
         lon,
         alt_m: Number.isFinite(alt) ? alt : null,
@@ -4008,9 +5579,11 @@ def render_leaflet_map_html(plan: dict) -> str:
         speed_kmh: bestSpeedKmh(speedKmh, segmentSpeedKmh),
         reported_speed_kmh: Number.isFinite(speedKmh) ? speedKmh : null,
         derived_speed_kmh: segmentSpeedKmh,
-        place_name: point.place_name || null,
-        line: point.line || null,
-        timestamp,
+          place_name: point.place_name || null,
+          line: point.line || null,
+          time: point.time || "",
+          maps: point.maps || "",
+          timestamp,
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
       previousTrackPoint = currentTrackPoint;
@@ -4153,6 +5726,52 @@ def render_leaflet_map_html(plan: dict) -> str:
         </div>
       </div>
     `;
+    const canSaveManualStops = () => window.location.protocol === "http:" || window.location.protocol === "https:";
+    const routePointPopupHtml = (point) => `
+      <div class="segment-popup">
+        <strong>${{point.place_name ? escapeHtml(point.place_name) : "Route point"}}</strong>
+        <div class="popup-meta">
+          <div>${{formatTime(point.timestamp)}} · Line ${{escapeHtml(point.line || "")}}</div>
+          <div>Motion: ${{escapeHtml(point.motion_mode || "unknown")}} · Speed: ${{formatSpeed(point.speed_kmh)}}</div>
+          ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
+        </div>
+        ${{canSaveManualStops() && point.line ? '<button type="button" data-mark-manual-stop>Mark as stop</button>' : '<div class="popup-meta">Open the hosted map to mark this point as a stop.</div>'}}
+        <div class="popup-meta" data-manual-stop-status></div>
+      </div>
+    `;
+    const saveManualStop = async (point, popupElement) => {{
+      const button = popupElement.querySelector("[data-mark-manual-stop]");
+      const result = popupElement.querySelector("[data-manual-stop-status]");
+      const name = window.prompt("Optional name for this stop:", point.place_name || "") || "";
+      if (button) button.disabled = true;
+      if (result) result.textContent = "Saving...";
+      try {{
+        const query = new URLSearchParams(window.location.search);
+        const token = query.get("token");
+        const endpoint = `/owntracks/stops${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+        const response = await fetch(endpoint, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            date: data.date,
+            lat: point.lat,
+            lon: point.lon,
+            line: point.line,
+            timestamp: point.timestamp,
+            time: point.time || formatTime(point.timestamp),
+            motion_mode: point.motion_mode || "unknown",
+            name,
+          }}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        if (result) result.textContent = "Saved. Reloading map...";
+        window.location.reload();
+      }} catch (error) {{
+        if (result) result.textContent = `Could not save: ${{error.message || error}}`;
+        if (button) button.disabled = false;
+      }}
+    }};
     const segmentPointsFor = (segment) => trackPoints.filter((point) => {{
       const timestamp = Number(point.timestamp);
       return Number.isFinite(timestamp) && timestamp >= Number(segment.start_timestamp) && timestamp <= Number(segment.end_timestamp);
@@ -4220,11 +5839,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       refreshSpeedBounds();
       for (const point of points) {{
         const marker = L.circleMarker([point.lat, point.lon], {{
+          renderer: routePointRenderer,
           radius: pointRadius,
           color: routeColorFor(point, previous),
           fillColor: routeColorFor(point, previous),
           fillOpacity: 0.9,
-          weight: 0,
+          // A transparent stroke provides a reliable touch target without
+          // visually enlarging dense GPS samples.
+          opacity: 0,
+          weight: 10,
         }});
         if (point.place_name) {{
           marker.bindTooltip(escapeHtml(point.place_name), {{
@@ -4232,8 +5855,15 @@ def render_leaflet_map_html(plan: dict) -> str:
             direction: "right",
             className: "place-label",
           }});
-          marker.bindPopup(`<strong>${{escapeHtml(point.place_name)}}</strong><br>Line ${{escapeHtml(point.line || "")}}<br>${{formatTime(point.timestamp)}}`);
         }}
+        marker.bindPopup(routePointPopupHtml(point), {{ maxWidth: 320 }});
+        marker.on("popupopen", () => {{
+          const element = marker.getPopup() && marker.getPopup().getElement();
+          if (!element) return;
+          L.DomEvent.disableClickPropagation(element);
+          const button = element.querySelector("[data-mark-manual-stop]");
+          if (button) button.addEventListener("click", () => saveManualStop(point, element), {{ once: true }});
+        }});
         marker.addTo(routeLayer);
         previous = point;
       }}
@@ -4417,7 +6047,28 @@ def render_leaflet_map_html(plan: dict) -> str:
           interactive: false,
         }}).addTo(animationLayer);
       }}
-      const current = segments[Math.min(maxIndex, segments.length - 1)];
+      const scaledProgress = progress * segments.length;
+      const currentIndex = progress >= 1
+        ? segments.length - 1
+        : Math.min(segments.length - 1, Math.floor(scaledProgress));
+      const current = segments[currentIndex];
+      const segmentProgress = progress >= 1 ? 1 : Math.max(0, Math.min(1, scaledProgress - Math.floor(scaledProgress)));
+      const currentPosition = current
+        ? [
+            interpolateNumber(current.start[0], current.end[0], segmentProgress),
+            interpolateNumber(current.start[1], current.end[1], segmentProgress),
+          ]
+        : null;
+      if (currentPosition) {{
+        L.circleMarker(currentPosition, {{
+          radius: 7,
+          color: "#ffffff",
+          fillColor: current.color,
+          fillOpacity: 1,
+          weight: 3,
+          interactive: false,
+        }}).addTo(animationLayer);
+      }}
       const timeText = current && Number.isFinite(current.timestamp)
         ? new Date(current.timestamp * 1000).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit" }})
         : "";
@@ -4450,6 +6101,14 @@ def render_leaflet_map_html(plan: dict) -> str:
         return;
       }}
       hideStaticRouteForAnimation();
+      const segments = routeAnimationSegments();
+      if (segments.length) {{
+        const routeBounds = L.latLngBounds([
+          segments[0].start,
+          ...segments.map((segment) => segment.end),
+        ]);
+        map.fitBounds(routeBounds, {{ padding: [60, 60], maxZoom: routeAnimationMaxZoom, animate: true }});
+      }}
       routeAnimationRunning = true;
       routeAnimationStartMs = null;
       syncRouteAnimationButton();
@@ -4771,6 +6430,8 @@ def render_leaflet_map_html(plan: dict) -> str:
         <input id="popup-tags-${{escapeHtml(stop.alias)}}" data-popup-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
         <label for="popup-note-${{escapeHtml(stop.alias)}}">Note</label>
         <textarea id="popup-note-${{escapeHtml(stop.alias)}}" data-popup-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
+        ${{canSaveManualStops() ? `<button type="button" data-save-stop="${{escapeHtml(stop.alias)}}">Save changes</button>` : ""}}
+        <div class="popup-meta" data-save-stop-feedback></div>
       </div>
     `;
     const attachPopupHandlers = (stop) => {{
@@ -4779,6 +6440,17 @@ def render_leaflet_map_html(plan: dict) -> str:
       const element = popup && popup.getElement ? popup.getElement() : null;
       if (!element) return;
       L.DomEvent.disableClickPropagation(element);
+      const saveButton = element.querySelector("[data-save-stop]");
+      if (saveButton) saveButton.addEventListener("click", async () => {{
+        const feedback = element.querySelector("[data-save-stop-feedback]");
+        saveButton.disabled = true;
+        saveButton.textContent = "Saving...";
+        if (feedback) feedback.textContent = "Saving...";
+        const saved = await saveStopReviews([stop]);
+        if (feedback) feedback.textContent = saved ? "Saved." : "Save failed; see Tools status.";
+        saveButton.disabled = false;
+        saveButton.textContent = "Save changes";
+      }});
     }};
     const refreshStop = (stop, refreshPopup = true) => {{
       const marker = markers.get(stop.alias);
@@ -4911,6 +6583,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       marker.on("click", () => {{
         toggleStop(stop);
         marker.openPopup();
+        // Selection refresh replaces the popup DOM, so attach to the final button.
+        attachPopupHandlers(stop);
       }});
       marker.on("mouseover", () => {{
         if (!stopLabelsVisible || stopLabelMode() === "hidden") return;
@@ -5054,6 +6728,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       updateCommands();
       await copyCommandsToClipboard(false);
     }});
+    document.getElementById("saveChanges").addEventListener("click", () => saveStopReviews());
+    document.getElementById("saveChanges").disabled = !canSaveManualStops();
+    document.getElementById("commandsLabel").textContent = canSaveManualStops()
+      ? "Telegram fallback"
+      : "Paste this in Telegram";
     document.getElementById("fitAll").addEventListener("click", () => {{
       if (fitPoints.length === 1) {{
         map.setView(fitPoints[0], zoomAtLeast(14));
@@ -5098,6 +6777,19 @@ def build_plan(
     ride_points = [event for event in track_points if is_moving_ride_point(event)]
     places = named_place_events(window_events)
     stops = candidate_stops(window_events)
+    detected_stop_ids = {stop["id"] for stop in stops}
+    detected_stop_lines = {
+        line
+        for stop in stops
+        for line in range(int(stop["start_line"]), int(stop["end_line"]) + 1)
+    }
+    stops.extend(
+        stop
+        for stop in manual_stops_for_date(user_tags or {}, target_date.isoformat())
+        if stop["id"] not in detected_stop_ids
+        and int(stop.get("start_line") or 0) not in detected_stop_lines
+    )
+    stops.sort(key=lambda stop: (int(stop.get("start_line") or 0), int(stop.get("end_line") or 0)))
     home_anchor_points = home_anchors(events, home_filter)
     stop_jitter_anchor_points = stop_jitter_anchors(events, stops, stop_jitter_filter)
     if stop_jitter_filter and stop_jitter_filter.enabled:

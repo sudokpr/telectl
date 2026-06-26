@@ -24,7 +24,17 @@ from metrics import (
     observe_http_auth_failure,
     observe_http_request,
 )
-from owntracks.digest import generate_hosted_map, generate_sample_heatmap
+from owntracks.digest import (
+    generate_activity_dashboard,
+    generate_hosted_map,
+    generate_sample_heatmap,
+    generate_search_aliases,
+    generate_stop_index,
+)
+from owntracks.tagger import load_user_tags, save_user_tags
+
+
+_OWNTRACKS_TAGS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,7 @@ class HttpIntakeConfig:
     notify_telegram: bool
     fuel_csv_path: str
     owntracks_derived_dir: str
+    owntracks_user_tags_path: str
 
 
 def build_http_config(env: dict[str, str]) -> HttpIntakeConfig:
@@ -48,6 +59,7 @@ def build_http_config(env: dict[str, str]) -> HttpIntakeConfig:
         in {"1", "true", "yes", "on"},
         fuel_csv_path=env.get("FUEL_CSV_PATH", "./data/fuel/fuel.csv"),
         owntracks_derived_dir=env.get("OWNTRACKS_DERIVED_DIR", "./data/owntracks/derived"),
+        owntracks_user_tags_path=env.get("OWNTRACKS_USER_TAGS_PATH", "./data/owntracks/user_tags.json"),
     )
 
 
@@ -170,6 +182,62 @@ def make_handler(
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if parsed.path in {"/owntracks/stops", "/owntracks/stops.html"}:
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        query = parse_qs(parsed.query)
+                        start_text = (query.get("start") or [""])[0].strip()
+                        end_text = (query.get("end") or [""])[0].strip()
+                        for label, value in (("start", start_text), ("end", end_text)):
+                            if value and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+                                raise ValueError(f"invalid {label} date")
+                        _summary, html = generate_stop_index(start_text or None, end_text or None)
+                    except ValueError as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                        return
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_stop_index", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                        return
+                    body = html.encode("utf-8")
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if parsed.path in {"/owntracks/dashboard", "/owntracks/dashboard.html"}:
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        query = parse_qs(parsed.query)
+                        start_text = (query.get("start") or [""])[0].strip()
+                        end_text = (query.get("end") or [""])[0].strip()
+                        for label, value in (("start", start_text), ("end", end_text)):
+                            if value and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+                                raise ValueError(f"invalid {label} date")
+                        _summary, html = generate_activity_dashboard(start_text or None, end_text or None)
+                    except ValueError as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                        return
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_dashboard", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                        return
+                    body = html.encode("utf-8")
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 match = parsed.path.removeprefix("/owntracks/map/").removesuffix(".html")
                 if parsed.path.startswith("/owntracks/map/") and match:
                     if not authorized(self, http_cfg.token):
@@ -202,6 +270,104 @@ def make_handler(
             start = time.monotonic()
             try:
                 parsed = urlparse(self.path)
+                if parsed.path == "/owntracks/search-aliases":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        data = read_json(self)
+                        start_text = str(data.get("start") or "").strip()
+                        end_text = str(data.get("end") or "").strip()
+                        for label, value in (("start", start_text), ("end", end_text)):
+                            if value and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+                                raise ValueError(f"invalid {label} date")
+                        aliases, path = generate_search_aliases(start_text or None, end_text or None)
+                        write_json(
+                            self,
+                            HTTPStatus.OK,
+                            {
+                                "ok": True,
+                                "path": str(path),
+                                "categories": len(aliases),
+                                "terms": sum(len(terms) for terms in aliases.values()),
+                            },
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_search_aliases", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                if parsed.path == "/owntracks/stops":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        data = read_json(self)
+                        date_text = str(data.get("date") or "")
+                        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+                            raise ValueError("invalid date")
+                        lat = float(data.get("lat"))
+                        lon = float(data.get("lon"))
+                        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                            raise ValueError("invalid coordinates")
+                        requested_stop_id = str(data.get("id") or "").strip()
+                        if requested_stop_id:
+                            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", requested_stop_id):
+                                raise ValueError("invalid stop id")
+                            raw_tags = data.get("tags") or []
+                            if not isinstance(raw_tags, list):
+                                raise ValueError("tags must be a list")
+                            saved_review = {
+                                "lat": round(lat, 6),
+                                "lon": round(lon, 6),
+                                "tags": [str(tag).strip()[:100] for tag in raw_tags if str(tag).strip()][:50],
+                                "note": str(data.get("note") or "").strip()[:2000],
+                            }
+                            name = str(data.get("name") or "").strip()
+                            if name:
+                                saved_review["name"] = name[:200]
+                            tags_path = project_relative_path(http_cfg.owntracks_user_tags_path)
+                            with _OWNTRACKS_TAGS_LOCK:
+                                tags = load_user_tags(tags_path)
+                                existing = tags.setdefault(date_text, {}).setdefault("stops", {}).setdefault(requested_stop_id, {})
+                                if not name:
+                                    existing.pop("name", None)
+                                existing.update(saved_review)
+                                save_user_tags(tags_path, tags)
+                            write_json(self, HTTPStatus.OK, {"ok": True, "id": requested_stop_id})
+                            return
+                        line = int(data.get("line"))
+                        if line < 1:
+                            raise ValueError("invalid line")
+                        stop_id = f"manual-stop-{line}"
+                        saved = {
+                            "manual": True,
+                            "lat": round(lat, 6),
+                            "lon": round(lon, 6),
+                            "line": line,
+                            "timestamp": data.get("timestamp"),
+                            "time": str(data.get("time") or ""),
+                            "motion_mode": str(data.get("motion_mode") or "unknown"),
+                        }
+                        name = str(data.get("name") or "").strip()
+                        if name:
+                            saved["name"] = name[:200]
+                        tags_path = project_relative_path(http_cfg.owntracks_user_tags_path)
+                        with _OWNTRACKS_TAGS_LOCK:
+                            tags = load_user_tags(tags_path)
+                            existing = tags.setdefault(date_text, {}).setdefault("stops", {}).setdefault(stop_id, {})
+                            existing.update(saved)
+                            save_user_tags(tags_path, tags)
+                        write_json(self, HTTPStatus.CREATED, {"ok": True, "id": stop_id})
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_manual_stop", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
                 if parsed.path != "/memory":
                     write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                     return

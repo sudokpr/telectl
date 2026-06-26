@@ -13,6 +13,7 @@ from typing import Any
 
 import requests
 
+from codex_llm import CodexLlmConfig, ask_codex_image, build_codex_llm_config
 from image_summary import IST, env_bool, env_int, env_topic_id, log
 
 
@@ -46,9 +47,11 @@ class FuelConfig:
     topic_id: int
     work_dir: Path
     csv_path: Path
+    llm_provider: str
     model: str
     ollama_url: str
     ollama_timeout_seconds: int
+    codex_llm_config: CodexLlmConfig
     pending_window_seconds: int
     correction_window_seconds: int
     csv_fields: tuple[str, ...]
@@ -74,6 +77,9 @@ class FuelApproval:
 
 def build_fuel_config(env: dict[str, str], fallback_chat_id: int) -> FuelConfig:
     work_dir = Path(env.get("FUEL_WORK_DIR", "./data/fuel")).expanduser()
+    llm_provider = env.get("FUEL_LLM_PROVIDER", "codex").strip().lower()
+    if llm_provider not in {"codex", "ollama"}:
+        raise ValueError("FUEL_LLM_PROVIDER must be one of: codex, ollama")
     fields = tuple(
         part.strip()
         for part in env.get("FUEL_CSV_FIELDS", ",".join(DEFAULT_FIELDS)).split(",")
@@ -85,9 +91,11 @@ def build_fuel_config(env: dict[str, str], fallback_chat_id: int) -> FuelConfig:
         topic_id=env_topic_id(env.get("FUEL_TOPIC_ID"), 349),
         work_dir=work_dir,
         csv_path=Path(env.get("FUEL_CSV_PATH", str(work_dir / "fuel.csv"))).expanduser(),
+        llm_provider=llm_provider,
         model=env.get("FUEL_MODEL", "minicpm-v:latest"),
         ollama_url=env.get("IMAGE_SUMMARY_OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         ollama_timeout_seconds=env_int(env.get("IMAGE_SUMMARY_OLLAMA_TIMEOUT_SECONDS"), 600),
+        codex_llm_config=build_codex_llm_config(env),
         pending_window_seconds=env_int(env.get("FUEL_PENDING_WINDOW_SECONDS"), 90),
         correction_window_seconds=env_int(env.get("FUEL_CORRECTION_WINDOW_SECONDS"), 300),
         csv_fields=fields or tuple(DEFAULT_FIELDS),
@@ -123,7 +131,17 @@ def normalize_date(value: str) -> str:
     value = value.strip()
     if not value:
         return ""
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d", "%Y.%m.%d"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+        "%d/%m/%y",
+        "%d-%m-%y",
+        "%d.%m.%y",
+    ):
         try:
             return dt.datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
@@ -276,19 +294,10 @@ Rules:
 - Preserve numbers as printed, but remove obvious leading zero padding where safe.
 - Do not invent values. If uncertain, mention uncertainty in notes.
 """.strip()
-    images = [base64.b64encode(path.read_bytes()).decode("ascii") for path in image_paths]
-    resp = requests.post(
-        f"{cfg.ollama_url}/api/chat",
-        json={
-            "model": cfg.model,
-            "messages": [{"role": "user", "content": prompt, "images": images}],
-            "stream": False,
-        },
-        timeout=cfg.ollama_timeout_seconds,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Ollama {cfg.model} failed: HTTP {resp.status_code}: {resp.text[:500]}")
-    content = resp.json().get("message", {}).get("content", "")
+    if cfg.llm_provider == "codex":
+        content = ask_codex_image(prompt, image_paths, cfg.codex_llm_config)
+    else:
+        content = extract_fuel_fields_ollama(prompt, image_paths, cfg)
     data = parse_json_object(content)
     extracted = {
         "date": normalize_date(normalize_value(data.get("date", ""))),
@@ -303,6 +312,22 @@ Rules:
         "notes": normalize_value(data.get("notes", "")),
     }
     return extracted
+
+
+def extract_fuel_fields_ollama(prompt: str, image_paths: list[Path], cfg: FuelConfig) -> str:
+    images = [base64.b64encode(path.read_bytes()).decode("ascii") for path in image_paths]
+    resp = requests.post(
+        f"{cfg.ollama_url}/api/chat",
+        json={
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": prompt, "images": images}],
+            "stream": False,
+        },
+        timeout=cfg.ollama_timeout_seconds,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama {cfg.model} failed: HTTP {resp.status_code}: {resp.text[:500]}")
+    return resp.json().get("message", {}).get("content", "")
 
 
 def read_csv_rows(path: Path) -> list[list[str]]:

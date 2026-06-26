@@ -44,6 +44,9 @@ For a persistent local service, run it with user systemd:
 make start
 ```
 
+This enables and starts the user unit at `systemd/telegram-control.service`.
+With user lingering enabled, the bot starts again after reboot.
+
 Check status:
 
 ```bash
@@ -118,6 +121,14 @@ In hosted mode, `/otm` replies with a link like
 `/owntracks/map/YYYY-MM-DD?token=...` instead of attaching the HTML file. The
 hosted route renders the map dynamically from the OwnTracks log on each
 request, so there is no per-day HTML file to regenerate for map UI changes.
+The hosted stop index at `/owntracks/stops?token=...` is also rendered on
+request from the raw OwnTracks log plus saved stop reviews. It groups visits by
+reviewed stop/place name when available, falls back to coordinate buckets for
+unnamed stops, and lets you search names, tags, notes, and visit dates without
+using an LLM. Search expansion is deterministic: built-in aliases are merged
+with Codex-generated aliases from
+`data/owntracks/search_aliases.generated.json` and optional manual aliases from
+`data/owntracks/search_aliases.local.json`.
 Use `/otme` to force a self-contained embedded HTML attachment even when hosted
 delivery is configured. Embedded attachments download OpenStreetMap tiles during
 generation and store them as data URLs, so Telegram does not need to fetch map
@@ -176,11 +187,45 @@ Month and year scopes such as `/owntracks/map/YYYY-MM` and
 map tiles are loaded from OpenStreetMap when the hosted map is opened. The
 heatmap panel can filter locations by motion mode. `/owntracks/sample` serves a
 synthetic heatmap with points across countries, cities, and city areas for
-visual testing without OwnTracks logs. For
+visual testing without OwnTracks logs. `/owntracks/stops` serves a searchable
+stop/place index with visit details and links back to each daily map.
+`/owntracks/dashboard` serves an activity dashboard for a date range with
+home-only days, out-of-home days, travel days, distance, outside-home time, a
+daily activity calendar, and most visited places. For
 Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
 select stops, click a stop for a popup editor, rename stops locally, add
 tags/notes, and copy a generated `/otb` command back into Telegram to save
 those reviews. Each stop gets a short alias such as `s1`, `s2`, etc.
+
+On a hosted daily map, every visible route point is clickable. Use **Mark as
+stop** in its popup to persist a short visit that automatic dwell detection
+missed. The point becomes a normal stop after the map reloads and can then be
+named, tagged, and reviewed like detected stops. Name, tag, and note edits on
+hosted maps can be saved directly over the authenticated HTTP intake; Telegram
+command export remains available as a fallback. Attached HTML maps are
+view-only for these actions because they cannot write back to the local service.
+
+To refresh generated stop-index search aliases with Codex:
+
+```bash
+uv --cache-dir .uv-cache run python -m owntracks.digest --generate-search-aliases
+```
+
+You can also open `/owntracks/stops` and use **Refresh search aliases**. That
+runs the same Codex generation pipeline for the currently selected date range,
+writes `search_aliases.generated.json`, and reloads the index.
+
+Optional bounds limit the evidence window:
+
+```bash
+uv --cache-dir .uv-cache run python -m owntracks.digest --generate-search-aliases --start 2026-06-01 --end 2026-06-30
+```
+
+The generated file is active immediately on the next `/owntracks/stops` page
+load. Local aliases in `search_aliases.local.json` are also active and are
+merged after generated aliases. The weekly timer template is
+`systemd/my-owntracks-search-aliases.timer`; enable it only after confirming
+the Codex SDK settings work in the service environment.
 
 Short commands in the OwnTracks topic:
 
@@ -366,13 +411,17 @@ screenshot and an odometer photo together as a Telegram media group. If they are
 sent separately, the bot groups fuel images received within
 `FUEL_PENDING_WINDOW_SECONDS`.
 
-The bot uses `FUEL_MODEL` through Ollama to extract:
+The bot uses Codex by default to extract:
 
 - odometer reading
 - fuel volume
 - fuel rate
 - total amount
 - station/date/time/receipt number when visible
+
+Fuel extraction reuses the `CODEX_LLM_*` SDK settings. To use the old local
+Ollama vision path, set `FUEL_LLM_PROVIDER=ollama`; in that mode `FUEL_MODEL`
+selects the local vision model.
 
 It sends an approval message with inline buttons for full tank, partial fill,
 correction, or reject. The normal case is full tank; partial fill writes

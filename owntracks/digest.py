@@ -7,19 +7,30 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .env import env_int, load_env, project_path
+from .search_aliases import (
+    alias_paths,
+    generate_aliases_with_codex,
+    load_search_aliases,
+    save_generated_aliases,
+    search_alias_metadata,
+)
 from .tagger import (
     build_home_filter_config,
     build_geojson,
+    build_activity_dashboard_summary,
     build_heatmap_summary,
     build_plan,
+    build_stop_index_summary,
     build_sample_heatmap_summary,
     build_stop_jitter_filter_config,
     load_user_tags,
     parse_log,
     render_digest,
+    render_activity_dashboard_html,
     render_heatmap_html,
     render_leaflet_map_html,
     render_map_html,
+    render_stop_index_html,
     target_date_from_text,
     target_scope_from_text,
 )
@@ -105,6 +116,65 @@ def generate_sample_heatmap() -> tuple[dict, str]:
     return summary, render_heatmap_html(summary)
 
 
+def generate_stop_index(start_text: str | None = None, end_text: str | None = None) -> tuple[dict, str]:
+    env = load_env()
+    local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
+    home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
+    log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
+    tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
+
+    events = parse_log(log_path, local_tz)
+    user_tags = load_user_tags(tags_path)
+    start = target_date_from_text(start_text, local_tz) if start_text else None
+    end = target_date_from_text(end_text, local_tz) if end_text else None
+    summary = build_stop_index_summary(
+        events,
+        user_tags,
+        start=start,
+        end=end,
+        home_filter=home_filter,
+        stop_jitter_filter=stop_jitter_filter,
+    )
+    summary["search_aliases"] = load_search_aliases(env)
+    summary["search_aliases_meta"] = search_alias_metadata(env)
+    return summary, render_stop_index_html(summary)
+
+
+def generate_activity_dashboard(start_text: str | None = None, end_text: str | None = None) -> tuple[dict, str]:
+    env = load_env()
+    local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
+    home_filter = build_home_filter_config(env)
+    stop_jitter_filter = build_stop_jitter_filter_config(env)
+    log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
+    tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
+
+    today = datetime.now(local_tz).date()
+    default_start = today.replace(day=1)
+    start = target_date_from_text(start_text, local_tz) if start_text else default_start
+    end = target_date_from_text(end_text, local_tz) if end_text else today
+    events = parse_log(log_path, local_tz)
+    user_tags = load_user_tags(tags_path)
+    summary = build_activity_dashboard_summary(
+        events,
+        user_tags,
+        start=start,
+        end=end,
+        home_filter=home_filter,
+        stop_jitter_filter=stop_jitter_filter,
+    )
+    return summary, render_activity_dashboard_html(summary)
+
+
+def generate_search_aliases(start_text: str | None = None, end_text: str | None = None) -> tuple[dict, Path]:
+    env = load_env()
+    summary, _html = generate_stop_index(start_text, end_text)
+    aliases = generate_aliases_with_codex(summary, env)
+    generated_path, _local_path = alias_paths(env)
+    save_generated_aliases(generated_path, aliases)
+    return aliases, generated_path
+
+
 def generate_owntracks_visualization(scope_text: str | None = None) -> tuple[dict, str, Path]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
@@ -161,12 +231,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate or send OwnTracks daily digest.")
     parser.add_argument("--date", help="YYYY-MM-DD, today, or yesterday. Defaults to today.")
     parser.add_argument("--send", action="store_true", help="Send digest to Telegram after generating it.")
+    parser.add_argument("--generate-search-aliases", action="store_true", help="Use Codex to generate OwnTracks search aliases.")
+    parser.add_argument("--start", help="Start date for search alias generation, YYYY-MM-DD.")
+    parser.add_argument("--end", help="End date for search alias generation, YYYY-MM-DD.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.send:
+    if args.generate_search_aliases:
+        aliases, path = generate_search_aliases(args.start, args.end)
+        print(json.dumps(aliases, indent=2, ensure_ascii=False))
+        print()
+        print(f"Wrote {path}")
+    elif args.send:
         send_daily(args.date)
     else:
         _plan, digest, path = generate_digest(args.date)

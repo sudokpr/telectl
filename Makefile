@@ -3,12 +3,14 @@ UV_CACHE_DIR ?= .uv-cache
 PYTHON ?= python
 SERVICE_NAME ?= telegram-control
 SERVICE_UNIT ?= $(SERVICE_NAME).service
+SERVICE_FILE ?= $(CURDIR)/systemd/$(SERVICE_UNIT)
 HTTP_HEALTH_URL ?= http://127.0.0.1:8787/health
 
 .PHONY: help sync run compile test check \
 	start stop restart status logs logs-follow \
 	service-start service-stop service-restart service-status service-logs service-logs-follow \
-	logs-image health
+	logs-image health \
+	backup-run backup-timers backup-status backup-logs backup-logs-follow
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -23,7 +25,7 @@ help:
 	@printf '  %-22s %s\n' 'status' 'Alias for service-status'
 	@printf '  %-22s %s\n' 'logs' 'Alias for service-logs'
 	@printf '  %-22s %s\n' 'logs-follow' 'Alias for service-logs-follow'
-	@printf '  %-22s %s\n' 'service-start' 'Create/start the user systemd service with systemd-run'
+	@printf '  %-22s %s\n' 'service-start' 'Enable/start the user systemd service'
 	@printf '  %-22s %s\n' 'service-stop' 'Stop the user systemd service'
 	@printf '  %-22s %s\n' 'service-restart' 'Restart the user systemd service'
 	@printf '  %-22s %s\n' 'service-status' 'Show user systemd service status'
@@ -31,6 +33,11 @@ help:
 	@printf '  %-22s %s\n' 'service-logs-follow' 'Follow service journal logs'
 	@printf '  %-22s %s\n' 'logs-image' 'Follow image summary worker log'
 	@printf '  %-22s %s\n' 'health' 'Check local HTTP intake health endpoint'
+	@printf '  %-22s %s\n' 'backup-run' 'Run the DietPi backup now'
+	@printf '  %-22s %s\n' 'backup-timers' 'Show the DietPi backup timer schedule'
+	@printf '  %-22s %s\n' 'backup-status' 'Show the DietPi backup service/timer status'
+	@printf '  %-22s %s\n' 'backup-logs' 'Show recent DietPi backup logs'
+	@printf '  %-22s %s\n' 'backup-logs-follow' 'Follow DietPi backup logs'
 
 sync:
 	$(UV) --cache-dir $(UV_CACHE_DIR) sync
@@ -59,21 +66,14 @@ logs: service-logs
 logs-follow: service-logs-follow
 
 service-start:
-	@if systemctl --user is-active --quiet $(SERVICE_UNIT); then \
-		printf '%s\n' '$(SERVICE_UNIT) is already running'; \
-	else \
-		systemd-run --user --unit=$(SERVICE_NAME) --working-directory=$(CURDIR) $(UV) --cache-dir $(UV_CACHE_DIR) run $(PYTHON) bot.py; \
-	fi
+	systemctl --user enable --now $(SERVICE_FILE)
 
 service-stop:
 	systemctl --user stop $(SERVICE_UNIT)
 
 service-restart:
-	@if systemctl --user list-unit-files $(SERVICE_UNIT) >/dev/null 2>&1 || systemctl --user status $(SERVICE_UNIT) >/dev/null 2>&1; then \
-		systemctl --user restart $(SERVICE_UNIT); \
-	else \
-		$(MAKE) service-start; \
-	fi
+	systemctl --user enable $(SERVICE_FILE)
+	systemctl --user restart $(SERVICE_UNIT)
 
 service-status:
 	systemctl --user status $(SERVICE_UNIT) --no-pager
@@ -90,3 +90,18 @@ logs-image:
 health:
 	curl --fail --show-error --silent $(HTTP_HEALTH_URL)
 	@printf '\n'
+
+backup-run:
+	systemctl --user start telegram-control-backup.service
+
+backup-timers:
+	systemctl --user list-timers telegram-control-backup.timer --no-pager
+
+backup-status:
+	systemctl --user status telegram-control-backup.timer telegram-control-backup.service --no-pager
+
+backup-logs:
+	journalctl --user -u telegram-control-backup.service -n 100 --no-pager
+
+backup-logs-follow:
+	journalctl --user -u telegram-control-backup.service -f
