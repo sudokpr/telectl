@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up Telegram Control data to DietPi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kp/workspace/projects/telegram_control
+ExecStart=/home/kp/workspace/projects/telegram_control/scripts/backup_to_dietpi.sh
