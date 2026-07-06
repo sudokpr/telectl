@@ -95,9 +95,35 @@ intake is enabled, metrics are served by the intake server at `/metrics`; if
 
 Metrics cover Telegram update volume, handler latency/errors, image summary
 jobs, Ollama latency, OCR output size, memory extraction/query outcomes, fuel
-approval flow, OwnTracks digest/map generation, HTTP intake requests, and
-process/config gauges. Codex remote-control commands are intentionally not
-instrumented.
+approval flow, OwnTracks digest/map generation, hosted OwnTracks UI render
+latency, HTTP intake requests, and process/config gauges. Codex remote-control
+commands are intentionally not instrumented. Use
+`telegram_control_http_request_duration_seconds{route="/owntracks/stops"}` and
+`telegram_control_http_request_duration_seconds{route="/owntracks/dashboard"}`
+for full request latency, or
+`telegram_control_owntracks_ui_render_duration_seconds{view="stops"}` and
+`telegram_control_owntracks_ui_render_duration_seconds{view="dashboard"}` for
+server-side page generation latency.
+
+
+### Backup Metrics
+
+The daily DietPi backup job can emit a Prometheus text snapshot and push it to
+a Pushgateway-compatible endpoint:
+
+```text
+BACKUP_PROMETHEUS_METRICS_ENABLED=true
+BACKUP_PROMETHEUS_METRICS_FILE=data/metrics/telegram_control_backup.prom
+BACKUP_PROMETHEUS_METRICS_PUSH_URL=http://prometheus-pushgateway:9091/metrics/job/telegram_control_backup
+```
+
+Backup run metrics:
+
+- `telegram_control_backup_last_run_timestamp_seconds`
+- `telegram_control_backup_last_success_timestamp_seconds`
+- `telegram_control_backup_last_failure_timestamp_seconds`
+- `telegram_control_backup_last_duration_seconds`
+- `telegram_control_backup_last_exit_code`
 
 For iOS map viewing, `/otm` can send either an HTML attachment or a hosted
 local URL. Attachment mode is the default:
@@ -193,17 +219,29 @@ stop/place index with visit details and links back to each daily map.
 home-only days, out-of-home days, travel days, distance, outside-home time, a
 daily activity calendar, and most visited places. For
 Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
-select stops, click a stop for a popup editor, rename stops locally, add
-tags/notes, and copy a generated `/otb` command back into Telegram to save
-those reviews. Each stop gets a short alias such as `s1`, `s2`, etc.
+review visits chronologically, click a visit for a popup editor, rename it,
+add tags/notes, adjust entry or exit time, promote it as a reusable trip place,
+attach local media such as outing photos or running certificates, or dismiss
+traffic-like visits while keeping raw route samples visible. Long
+silent gaps are shown as editable arrival/departure windows instead of precise
+interpolated times. Transition/geofence markers are hidden by default behind
+the **Show transition points** toggle. Each visit gets a short alias such as
+`s1`, `s2`, etc.
 
-On a hosted daily map, every visible route point is clickable. Use **Mark as
-stop** in its popup to persist a short visit that automatic dwell detection
-missed. The point becomes a normal stop after the map reloads and can then be
-named, tagged, and reviewed like detected stops. Name, tag, and note edits on
-hosted maps can be saved directly over the authenticated HTTP intake; Telegram
-command export remains available as a fallback. Attached HTML maps are
+On a hosted daily map, every visible route point is clickable. Use **Save
+visit** in its popup to persist a short visit that automatic dwell detection
+missed. The point becomes a normal visit after the map reloads and can then be
+named, tagged, adjusted, and reviewed like detected visits. Hosted maps can
+save these edits directly over the authenticated HTTP intake; Telegram command
+export remains available for name/tag/note fallback. Attached HTML maps are
 view-only for these actions because they cannot write back to the local service.
+
+Hosted OwnTracks media is HTTP-only. The daily map popup and `/owntracks/stops`
+visit cards let you choose an image or PDF, add a caption, upload it, view the
+thumbnail/link, and delete mistakes. Files are stored under `OWNTRACKS_MEDIA_DIR`
+(default `data/owntracks/media`) and referenced from `OWNTRACKS_USER_TAGS_PATH`;
+the raw OwnTracks MQTT log is not modified. Media routes use the same
+`HTTP_INTAKE_TOKEN` protection as the hosted OwnTracks pages.
 
 To refresh generated stop-index search aliases with Codex:
 

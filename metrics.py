@@ -216,6 +216,16 @@ OWNTRACKS_RIDE_SEGMENTS = Histogram(
     "telegram_control_owntracks_ride_segments",
     "Ride segment count in OwnTracks plans.",
 )
+OWNTRACKS_UI_RENDER_TOTAL = Counter(
+    "telegram_control_owntracks_ui_render_total",
+    "OwnTracks hosted UI render attempts by view and result.",
+    ["view", "result"],
+)
+OWNTRACKS_UI_RENDER_DURATION_SECONDS = Histogram(
+    "telegram_control_owntracks_ui_render_duration_seconds",
+    "OwnTracks hosted UI server-side render duration in seconds.",
+    ["view", "result"],
+)
 
 HTTP_REQUESTS_TOTAL = Counter(
     "telegram_control_http_requests_total",
@@ -291,6 +301,11 @@ def observe_plan(plan: dict) -> None:
     OWNTRACKS_RIDE_SEGMENTS.observe(len(plan.get("ride_segments") or []))
 
 
+def observe_owntracks_ui_render(view: str, start: float, result: str) -> None:
+    OWNTRACKS_UI_RENDER_TOTAL.labels(view=view, result=result).inc()
+    OWNTRACKS_UI_RENDER_DURATION_SECONDS.labels(view=view, result=result).observe(time.monotonic() - start)
+
+
 def set_config_enabled(*, image_summary: bool, memory: bool, fuel: bool, http_intake: bool, owntracks: bool) -> None:
     INFO.labels(version="0.1.0").set(1)
     UPTIME_SECONDS.set_function(lambda: max(0.0, time.time() - START_TIME))
@@ -328,6 +343,18 @@ def http_route(path: str) -> str:
         return "/fuel.csv"
     if clean in {"/owntracks/sample", "/owntracks/sample.html"}:
         return "/owntracks/sample"
+    if clean in {"/owntracks/stops", "/owntracks/stops.html"}:
+        return "/owntracks/stops"
+    if clean in {"/owntracks/trips", "/owntracks/trips.html"}:
+        return "/owntracks/trips"
+    if clean in {"/owntracks/dashboard", "/owntracks/dashboard.html"}:
+        return "/owntracks/dashboard"
+    if clean == "/owntracks/search-aliases":
+        return "/owntracks/search-aliases"
+    if clean == "/owntracks/media":
+        return "/owntracks/media"
+    if clean.startswith("/owntracks/media/"):
+        return "/owntracks/media/:file"
     if clean.startswith("/owntracks/map/"):
         return "/owntracks/map/:scope"
     return "not_found"

@@ -75,6 +75,9 @@ MOTION_COLORS = {
     "unknown": "#64748b",
 }
 
+DEFAULT_VISIT_RADIUS_M = 180
+VISIT_BOUNDARY_INTERPOLATION_MAX_GAP_SECONDS = 20 * 60
+
 
 @dataclass(frozen=True)
 class OwnTracksScope:
@@ -237,7 +240,7 @@ def home_anchors(events: list[Event], config: HomeFilterConfig | None) -> list[t
     anchors: list[tuple[float, float, str]] = []
     seen: set[tuple[float, float, str]] = set()
     for event in events:
-        if event.kind != "transition" or event.lat is None or event.lon is None:
+        if event.kind not in {"transition", "waypoint"} or event.lat is None or event.lon is None:
             continue
         desc = str(event.payload.get("desc") or "").strip()
         if desc.casefold() not in names:
@@ -248,6 +251,24 @@ def home_anchors(events: list[Event], config: HomeFilterConfig | None) -> list[t
         seen.add(key)
         anchors.append((event.lat, event.lon, desc or "home"))
     return anchors
+
+
+def distance_to_nearest_anchor_m(event: Event, anchors: list[tuple[float, float, str]]) -> float | None:
+    if event.lat is None or event.lon is None or not anchors:
+        return None
+    return min(haversine_km(event.lat, event.lon, lat, lon) * 1000 for lat, lon, _name in anchors)
+
+
+def is_near_home_boundary(event: Event, config: HomeFilterConfig | None, anchors: list[tuple[float, float, str]]) -> bool:
+    if not config or not config.enabled or not event.is_location:
+        return False
+    names = home_region_names(config)
+    if names and event_region_names(event) & names:
+        return True
+    distance_m = distance_to_nearest_anchor_m(event, anchors)
+    if distance_m is None:
+        return False
+    return distance_m <= max(float(config.radius_m), 300.0)
 
 
 def is_home_area_point(
@@ -306,6 +327,8 @@ def stop_jitter_anchors(
 
     if config.include_candidate_stops:
         for stop in candidate_stops:
+            if stop.get("manual") and not stop.get("place"):
+                continue
             if int(stop.get("duration_minutes") or 0) < config.min_dwell_minutes:
                 continue
             label = stop.get("reviewed_name") or stop.get("name") or stop.get("alias") or stop.get("id")
@@ -411,13 +434,22 @@ def motion_summary(points: list[Event]) -> dict:
 
 def point_dict(event: Event) -> dict:
     dt = event_time(event)
+    received_timestamp = int(event.received_at.timestamp()) if event.received_at and event.received_at.tzinfo is not None else None
+    recorded_timestamp = int(dt.timestamp()) if dt.tzinfo is not None else None
     altitude = event.payload.get("alt")
     if altitude is None:
         altitude = event.payload.get("ele")
     return {
         "line": event.line_no,
         "time": fmt_dt(dt),
-        "timestamp": int(dt.timestamp()) if dt.tzinfo is not None else None,
+        "timestamp": recorded_timestamp,
+        "received_time": fmt_dt(event.received_at),
+        "received_timestamp": received_timestamp,
+        "upload_delay_seconds": (
+            received_timestamp - recorded_timestamp
+            if isinstance(received_timestamp, int) and isinstance(recorded_timestamp, int)
+            else None
+        ),
         "lat": event.lat,
         "lon": event.lon,
         "alt_m": as_float(altitude),
@@ -435,11 +467,35 @@ def point_dicts(events: list[Event], all_events: list[Event]) -> list[dict]:
     points = []
     for event in events:
         point = point_dict(event)
-        label = waypoint_name_for(event.lat, event.lon, all_events)
+        label = waypoint_name_for(event.lat, event.lon, all_events, use_default_radius=False)
         if label:
             point["place_name"] = label
         points.append(point)
     return points
+
+
+def apply_stop_labels_to_point_dicts(plan: dict) -> None:
+    reviewed_ranges = []
+    for stop in plan.get("candidate_stops", []):
+        label = str(stop.get("reviewed_name") or "").strip()
+        if not stop.get("user_reviewed"):
+            continue
+        start_timestamp = stop.get("start_timestamp")
+        end_timestamp = stop.get("end_timestamp")
+        if not label or not isinstance(start_timestamp, int) or not isinstance(end_timestamp, int):
+            continue
+        reviewed_ranges.append((start_timestamp, end_timestamp, label))
+    if not reviewed_ranges:
+        return
+    for key in ("raw_sampled_track", "sampled_track"):
+        for point in plan.get(key, []):
+            timestamp = point.get("timestamp")
+            if not isinstance(timestamp, int):
+                continue
+            for start_timestamp, end_timestamp, label in reviewed_ranges:
+                if start_timestamp <= timestamp <= end_timestamp:
+                    point["place_name"] = label
+                    break
 
 
 def is_moving_ride_point(event: Event) -> bool:
@@ -631,6 +687,851 @@ def ride_segment_stats(points: list[Event], start_ts: int, end_ts: int, label: s
 
 def statistics_mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def stop_anchor_name(stop: dict) -> str:
+    return str(stop.get("reviewed_name") or stop.get("name") or stop.get("alias") or "stop")
+
+
+def travel_anchor_key(name: object) -> str:
+    clean = str(name or "").strip()
+    return f"name:{clean.casefold()}" if clean else "name:unknown"
+
+
+def stop_travel_anchors(stops: list[dict], places: list[dict] | None = None) -> list[dict]:
+    anchors: list[dict] = []
+    for stop in stops:
+        start_ts = stop.get("visit_start_timestamp", stop.get("start_timestamp"))
+        end_ts = stop.get("visit_end_timestamp", stop.get("end_timestamp"))
+        if not isinstance(start_ts, int) or not isinstance(end_ts, int):
+            continue
+        name = stop_anchor_name(stop)
+        anchors.append(
+            {
+                "entry": start_ts,
+                "exit": end_ts,
+                "name": name,
+                "key": travel_anchor_key(name),
+                "kind": "stop",
+                "alias": stop.get("alias", ""),
+                "id": stop.get("id", ""),
+                "lat": stop.get("lat"),
+                "lon": stop.get("lon"),
+                "entry_status": stop.get("entry_status"),
+                "exit_status": stop.get("exit_status"),
+                "entry_window": stop.get("entry_window"),
+                "exit_window": stop.get("exit_window"),
+            }
+        )
+    for place in places or []:
+        timestamp = place.get("timestamp")
+        if not isinstance(timestamp, int):
+            continue
+        name = str(place.get("name") or "place")
+        action = str(place.get("action") or "event")
+        anchors.append(
+            {
+                "entry": timestamp,
+                "exit": timestamp,
+                "name": name,
+                "key": travel_anchor_key(name),
+                "kind": f"geofence:{action}",
+                "alias": "",
+                "id": str(place.get("id") or ""),
+                "lat": place.get("lat"),
+                "lon": place.get("lon"),
+            }
+        )
+
+    deduped: list[dict] = []
+    for anchor in sorted(anchors, key=lambda item: (item["entry"], item["exit"], item["name"], item["kind"])):
+        if (
+            deduped
+            and abs(anchor["entry"] - deduped[-1]["entry"]) <= 30
+            and anchor["key"] == deduped[-1]["key"]
+        ):
+            deduped[-1]["exit"] = max(deduped[-1]["exit"], anchor["exit"])
+            deduped[-1]["kind"] = f"{deduped[-1]['kind']}+{anchor['kind']}"
+            if anchor.get("alias") and not deduped[-1].get("alias"):
+                deduped[-1]["alias"] = anchor.get("alias")
+            continue
+        deduped.append(anchor)
+    return deduped
+
+
+def build_stop_travel_segments(points: list[Event], stops: list[dict], places: list[dict] | None = None) -> list[dict]:
+    anchors = stop_travel_anchors(stops, places)
+    for point in points:
+        if point.payload.get("t") != "c":
+            continue
+        regions = [str(region).strip() for region in (point.payload.get("inregions") or []) if str(region).strip()]
+        if not regions or point.recorded_at is None:
+            continue
+        name = regions[0]
+        timestamp = int(point.recorded_at.timestamp())
+        anchors.append(
+            {
+                "entry": timestamp,
+                "exit": timestamp,
+                "name": name,
+                "key": travel_anchor_key(name),
+                "kind": "connector",
+                "alias": "",
+                "id": f"connector:{slug(name)}-{point.line_no}",
+                "lat": point.lat,
+                "lon": point.lon,
+            }
+        )
+    deduped: list[dict] = []
+    for anchor in sorted(anchors, key=lambda item: (item["entry"], item["exit"], item["name"], item["kind"])):
+        if (
+            deduped
+            and abs(anchor["entry"] - deduped[-1]["entry"]) <= 30
+            and anchor["key"] == deduped[-1]["key"]
+        ):
+            deduped[-1]["exit"] = max(deduped[-1]["exit"], anchor["exit"])
+            deduped[-1]["kind"] = f"{deduped[-1]['kind']}+{anchor['kind']}"
+            if anchor.get("alias") and not deduped[-1].get("alias"):
+                deduped[-1]["alias"] = anchor.get("alias")
+            continue
+        deduped.append(anchor)
+    anchors = deduped
+    segments: list[dict] = []
+    for previous_anchor, next_anchor in zip(anchors, anchors[1:]):
+        start_ts = previous_anchor["exit"]
+        end_ts = next_anchor["entry"]
+        if end_ts <= start_ts or previous_anchor["key"] == next_anchor["key"]:
+            continue
+        segment_points = [
+            point
+            for point in points
+            if point.is_location
+            and point.recorded_at is not None
+            and start_ts <= int(point.recorded_at.timestamp()) <= end_ts
+        ]
+        distance_km = round(summarize_distance(segment_points), 2) if len(segment_points) >= 2 else 0.0
+        duration_seconds = end_ts - start_ts
+        start_name = str(previous_anchor["name"])
+        end_name = str(next_anchor["name"])
+        segment = {
+            "id": f"t{len(segments) + 1}",
+            "label": f"{start_name} to {end_name}",
+            "start_name": start_name,
+            "end_name": end_name,
+            "start_key": previous_anchor["key"],
+            "end_key": next_anchor["key"],
+            "start_alias": previous_anchor.get("alias", ""),
+            "end_alias": next_anchor.get("alias", ""),
+            "start_kind": previous_anchor.get("kind", ""),
+            "end_kind": next_anchor.get("kind", ""),
+            "start_status": previous_anchor.get("exit_status"),
+            "end_status": next_anchor.get("entry_status"),
+            "start_window": previous_anchor.get("exit_window"),
+            "end_window": next_anchor.get("entry_window"),
+            "start_time": fmt_dt(datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(points[0].local_tz)) if points else "",
+            "end_time": fmt_dt(datetime.fromtimestamp(end_ts, tz=timezone.utc).astimezone(points[0].local_tz)) if points else "",
+            "start_timestamp": start_ts,
+            "end_timestamp": end_ts,
+            "duration_seconds": duration_seconds,
+            "duration_minutes": max(0, round(duration_seconds / 60)),
+            "duration": fmt_duration(max(0, round(duration_seconds / 60))),
+            "distance_km": distance_km,
+            "point_count": len(segment_points),
+            "start_lat": previous_anchor.get("lat"),
+            "start_lon": previous_anchor.get("lon"),
+            "end_lat": next_anchor.get("lat"),
+            "end_lon": next_anchor.get("lon"),
+        }
+        segments.append(segment)
+    return segments
+
+
+def attach_stop_travel_context(stops: list[dict], segments: list[dict]) -> None:
+    for stop in stops:
+        alias = stop.get("alias")
+        if not alias:
+            continue
+        previous_segment = next((segment for segment in segments if segment.get("end_alias") == alias), None)
+        next_segment = next((segment for segment in segments if segment.get("start_alias") == alias), None)
+        if previous_segment:
+            stop["previous_travel"] = previous_segment
+        if next_segment:
+            stop["next_travel"] = next_segment
+
+
+def travel_pair_summaries(segments: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for segment in segments:
+        key = (str(segment.get("start_key") or ""), str(segment.get("end_key") or ""))
+        if not key[0] or not key[1]:
+            continue
+        grouped.setdefault(key, []).append(segment)
+
+    summaries: list[dict] = []
+    for (_start_key, _end_key), items in grouped.items():
+        durations = sorted(int(item.get("duration_seconds") or 0) for item in items if int(item.get("duration_seconds") or 0) > 0)
+        if not durations:
+            continue
+        fastest = min(items, key=lambda item: int(item.get("duration_seconds") or 0))
+        average_seconds = round(sum(durations) / len(durations))
+        median_seconds = durations[len(durations) // 2] if len(durations) % 2 else round((durations[len(durations) // 2 - 1] + durations[len(durations) // 2]) / 2)
+        summaries.append(
+            {
+                "start_key": fastest.get("start_key"),
+                "end_key": fastest.get("end_key"),
+                "start_name": fastest.get("start_name"),
+                "end_name": fastest.get("end_name"),
+                "count": len(durations),
+                "min_seconds": durations[0],
+                "min_duration": fmt_duration(round(durations[0] / 60)),
+                "avg_seconds": average_seconds,
+                "avg_duration": fmt_duration(round(average_seconds / 60)),
+                "median_seconds": median_seconds,
+                "median_duration": fmt_duration(round(median_seconds / 60)),
+                "fastest": fastest,
+            }
+        )
+    return sorted(summaries, key=lambda item: (str(item["start_name"]).casefold(), str(item["end_name"]).casefold()))
+
+
+def unique_location_points(events: list[Event], target_date: date) -> list[Event]:
+    points = [event for event in events if event_date(event) == target_date and event.is_location]
+    points.sort(key=lambda event: (event_time(event), event.line_no))
+    deduped: list[Event] = []
+    seen: set[tuple[int, float, float]] = set()
+    for event in points:
+        timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else event.line_no
+        key = (timestamp, round(event.lat or 0, 6), round(event.lon or 0, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
+def trip_place_definitions(
+    events: list[Event],
+    user_tags: dict | None = None,
+    target_date: date | None = None,
+    home_filter: HomeFilterConfig | None = None,
+) -> list[dict]:
+    places: dict[str, dict] = {}
+
+    def add_place(
+        name: object,
+        lat: object,
+        lon: object,
+        radius_m: object = None,
+        source: str = "place",
+        *,
+        key: str | None = None,
+        display_name: object = None,
+        visit: dict | None = None,
+    ) -> None:
+        label = str(name or "").strip()
+        place_lat = as_float(lat)
+        place_lon = as_float(lon)
+        if not label or place_lat is None or place_lon is None:
+            return
+        key = key or f"name:{label.casefold()}"
+        radius = max(150.0, as_float(radius_m) or 0.0)
+        existing = places.get(key)
+        if existing is None:
+            place = {
+                "key": key,
+                "name": label,
+                "display_name": str(display_name or label).strip() or label,
+                "lat": place_lat,
+                "lon": place_lon,
+                "radius_m": round(radius),
+                "sources": [source],
+            }
+            if visit:
+                place.update(visit)
+            places[key] = place
+            return
+        existing["radius_m"] = max(float(existing.get("radius_m") or 0), round(radius))
+        if source not in existing["sources"]:
+            existing["sources"].append(source)
+
+    for event in events:
+        if event.kind == "waypoint":
+            add_place(event.payload.get("desc"), event.lat, event.lon, event.payload.get("rad"), "waypoint")
+        elif event.kind == "transition":
+            add_place(event.payload.get("desc"), event.lat, event.lon, 150, "transition")
+
+    for day_tags in (user_tags or {}).values():
+        if not isinstance(day_tags, dict):
+            continue
+        for saved in (day_tags.get("stops") or {}).values():
+            if not isinstance(saved, dict):
+                continue
+            if not saved.get("place"):
+                continue
+            add_place(saved.get("name"), saved.get("lat"), saved.get("lon"), 150, "review")
+
+    if target_date is not None:
+        day_events = [event for event in events if event_date(event) == target_date]
+        day_events.sort(key=event_time)
+        stops = candidate_stops(day_events)
+        home_anchor_points = home_anchors(events, home_filter)
+        stops.extend(boundary_home_stops(day_events, stops, home_filter, home_anchor_points))
+        detected_stop_ids = {stop["id"] for stop in stops}
+        stops.extend(
+            stop
+            for stop in manual_stops_for_date(user_tags or {}, target_date.isoformat())
+            if stop["id"] not in detected_stop_ids
+        )
+        stop_overrides = ((user_tags or {}).get(target_date.isoformat(), {}) or {}).get("stops", {})
+        stops = [stop for stop in stops if not stop_is_ignored(stop, stop_overrides)]
+        annotate_visit_boundaries(stops, [event for event in day_events if event.is_location])
+        stops.sort(
+            key=lambda stop: (
+                int(stop.get("start_timestamp") or 0),
+                int(stop.get("start_line") or 0),
+                str(stop.get("id") or ""),
+            )
+        )
+        plan = {
+            "date": target_date.isoformat(),
+            "candidate_stops": stops,
+            "recommended_tags": [],
+        }
+        apply_user_tags(plan, user_tags or {}, events)
+        for index, stop in enumerate(plan["candidate_stops"], start=1):
+            stop["alias"] = f"s{index}"
+            name = stop_anchor_name(stop)
+            start = str(stop.get("start") or "").strip()
+            end = str(stop.get("end") or "").strip()
+            display_name = f"{stop['alias']}: {name}"
+            entry_display = str(stop.get("entry_display") or start).strip()
+            exit_display = str(stop.get("exit_display") or end).strip()
+            if entry_display and exit_display and exit_display != entry_display:
+                display_name = f"{display_name} · {entry_display} -> {exit_display}"
+            elif entry_display:
+                display_name = f"{display_name} · {entry_display}"
+            add_place(
+                name,
+                stop.get("lat"),
+                stop.get("lon"),
+                stop.get("radius_m") or DEFAULT_VISIT_RADIUS_M,
+                "visit",
+                key=f"visit:{stop.get('id') or stop['alias']}",
+                display_name=display_name,
+                visit={
+                    "visit_id": stop.get("id") or stop["alias"],
+                    "visit_alias": stop["alias"],
+                    "visit_start_timestamp": stop.get("visit_start_timestamp", stop.get("start_timestamp")),
+                    "visit_end_timestamp": stop.get("visit_end_timestamp", stop.get("end_timestamp")),
+                    "visit_start": entry_display,
+                    "visit_end": exit_display,
+                    "visit_entry_status": stop.get("entry_status"),
+                    "visit_exit_status": stop.get("exit_status"),
+                    "visit_entry_window": stop.get("entry_window"),
+                    "visit_exit_window": stop.get("exit_window"),
+                    "manual": bool(stop.get("manual")),
+                },
+            )
+
+    return sorted(
+        places.values(),
+        key=lambda item: (
+            0 if "visit" in item.get("sources", []) else 1,
+            int(item.get("visit_start_timestamp") or 0),
+            str(item.get("display_name") or item["name"]).casefold(),
+        ),
+    )
+
+
+def point_distance_m(point: Event, place: dict) -> float:
+    return haversine_km(float(place["lat"]), float(place["lon"]), point.lat or 0, point.lon or 0) * 1000
+
+
+def event_timestamp(event: Event) -> int | None:
+    dt = event_time(event)
+    return int(dt.timestamp()) if dt.tzinfo is not None else None
+
+
+def timestamp_tz(points: list[Event], fallback: ZoneInfo | timezone = timezone.utc) -> ZoneInfo | timezone:
+    return points[0].local_tz if points else fallback
+
+
+def datetime_from_timestamp_with_tz(timestamp: int, local_tz: ZoneInfo | timezone) -> datetime:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(local_tz)
+
+
+def fmt_time_only(timestamp: int | None, local_tz: ZoneInfo | timezone) -> str:
+    if not isinstance(timestamp, int):
+        return "unknown"
+    return datetime_from_timestamp_with_tz(timestamp, local_tz).strftime("%H:%M:%S")
+
+
+def fmt_visit_window(start_timestamp: int | None, end_timestamp: int | None, local_tz: ZoneInfo | timezone) -> str:
+    return f"unknown/window {fmt_time_only(start_timestamp, local_tz)}-{fmt_time_only(end_timestamp, local_tz)}"
+
+
+def visit_radius_m(stop: dict) -> float:
+    radius = as_float(stop.get("radius_m"))
+    return float(radius or DEFAULT_VISIT_RADIUS_M)
+
+
+def visit_place_for_stop(stop: dict) -> dict:
+    return {
+        "lat": stop.get("lat"),
+        "lon": stop.get("lon"),
+        "radius_m": visit_radius_m(stop),
+    }
+
+
+def sample_for_line(points: list[Event], line_no: object) -> Event | None:
+    try:
+        target = int(line_no)
+    except (TypeError, ValueError):
+        return None
+    return next((point for point in points if point.line_no == target), None)
+
+
+def boundary_gap_seconds(left: Event, right: Event) -> float:
+    return abs((event_time(right) - event_time(left)).total_seconds())
+
+
+def interpolation_allowed(left: Event, right: Event) -> bool:
+    return boundary_gap_seconds(left, right) <= VISIT_BOUNDARY_INTERPOLATION_MAX_GAP_SECONDS
+
+
+def annotated_visit_duration(stop: dict) -> None:
+    start_ts = stop.get("visit_start_timestamp", stop.get("start_timestamp"))
+    end_ts = stop.get("visit_end_timestamp", stop.get("end_timestamp"))
+    if not isinstance(start_ts, int) or not isinstance(end_ts, int) or end_ts < start_ts:
+        return
+    duration_minutes = max(0, round((end_ts - start_ts) / 60))
+    stop["visit_duration_minutes"] = duration_minutes
+    stop["visit_duration"] = fmt_duration(duration_minutes)
+
+
+def annotate_visit_boundaries(stops: list[dict], track_points: list[Event]) -> None:
+    points = sorted([point for point in track_points if point.is_location and event_timestamp(point) is not None], key=event_time)
+    local_tz = timestamp_tz(points)
+    point_timestamps = [(point, event_timestamp(point)) for point in points]
+
+    for stop in stops:
+        start_ts = stop.get("start_timestamp")
+        end_ts = stop.get("end_timestamp")
+        if not isinstance(start_ts, int) or not isinstance(end_ts, int):
+            continue
+        stop.setdefault("radius_m", DEFAULT_VISIT_RADIUS_M)
+        stop["raw_start"] = stop.get("start", "")
+        stop["raw_end"] = stop.get("end", "")
+        stop["raw_start_timestamp"] = start_ts
+        stop["raw_end_timestamp"] = end_ts
+        stop["visit_start_timestamp"] = start_ts
+        stop["visit_end_timestamp"] = end_ts
+        stop["entry_display"] = stop.get("start", "")
+        stop["exit_display"] = stop.get("end", "")
+        stop["entry_status"] = "sample"
+        stop["exit_status"] = "sample"
+        stop["visit_source"] = "manual" if stop.get("manual") else "home-boundary" if stop.get("boundary") else "detected-stop"
+
+        first_point = sample_for_line(points, stop.get("start_line"))
+        last_point = sample_for_line(points, stop.get("end_line"))
+        previous_point = next((point for point, timestamp in reversed(point_timestamps) if timestamp is not None and timestamp < start_ts), None)
+        next_point = next((point for point, timestamp in point_timestamps if timestamp is not None and timestamp > end_ts), None)
+        place = visit_place_for_stop(stop)
+        radius_m = visit_radius_m(stop)
+
+        stop["evidence"] = {
+            "start_line": stop.get("start_line"),
+            "end_line": stop.get("end_line"),
+            "raw_start": stop.get("raw_start"),
+            "raw_end": stop.get("raw_end"),
+            "previous_line": previous_point.line_no if previous_point else None,
+            "previous_time": fmt_dt(event_time(previous_point)) if previous_point else "",
+            "next_line": next_point.line_no if next_point else None,
+            "next_time": fmt_dt(event_time(next_point)) if next_point else "",
+        }
+
+        if previous_point is not None and first_point is not None:
+            previous_ts = event_timestamp(previous_point)
+            if isinstance(previous_ts, int) and interpolation_allowed(previous_point, first_point):
+                interpolated = interpolated_arrival_timestamp(previous_point, first_point, place, radius_m)
+                if isinstance(interpolated, int) and interpolated != start_ts:
+                    stop["visit_start_timestamp"] = interpolated
+                    stop["entry_status"] = "interpolated"
+                    stop["entry_display"] = fmt_dt(datetime_from_timestamp_with_tz(interpolated, local_tz))
+
+        if next_point is not None and last_point is not None:
+            next_ts = event_timestamp(next_point)
+            if isinstance(next_ts, int) and next_ts - end_ts > VISIT_BOUNDARY_INTERPOLATION_MAX_GAP_SECONDS:
+                stop["exit_status"] = "window"
+                stop["exit_window"] = {
+                    "start_timestamp": end_ts,
+                    "end_timestamp": next_ts,
+                    "start": stop.get("raw_end", ""),
+                    "end": fmt_dt(event_time(next_point)),
+                }
+                stop["exit_display"] = fmt_visit_window(end_ts, next_ts, local_tz)
+            elif interpolation_allowed(last_point, next_point):
+                interpolated = interpolated_boundary_timestamp(last_point, next_point, place, radius_m)
+                if isinstance(interpolated, int) and interpolated != end_ts:
+                    stop["visit_end_timestamp"] = interpolated
+                    stop["exit_status"] = "interpolated"
+                    stop["exit_display"] = fmt_dt(datetime_from_timestamp_with_tz(interpolated, local_tz))
+
+        if stop.get("entry_status") == "window" or stop.get("exit_status") == "window":
+            stop["confidence"] = "low"
+        elif stop.get("entry_status") == "interpolated" or stop.get("exit_status") == "interpolated":
+            stop["confidence"] = "medium"
+        elif int(stop.get("points") or 0) >= 2:
+            stop["confidence"] = "high"
+        else:
+            stop["confidence"] = "medium" if stop.get("manual") else "low"
+        annotated_visit_duration(stop)
+
+
+def parse_visit_override_timestamp(value: object, date_text: str, local_tz: ZoneInfo | timezone) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    approximate = text.startswith("~")
+    if approximate:
+        text = text[1:].strip()
+    if re.fullmatch(r"\d{10,}", text):
+        return int(text)
+    if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", text):
+        text = f"{date_text}T{text}"
+    normalized = text.replace(" ", "T", 1)
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_tz)
+    return int(parsed.astimezone(timezone.utc).timestamp())
+
+
+def override_timestamp_for(override: dict, prefix: str, date_text: str, local_tz: ZoneInfo | timezone) -> int | None:
+    return parse_visit_override_timestamp(
+        override.get(f"{prefix}_timestamp", override.get(f"{prefix}_time")),
+        date_text,
+        local_tz,
+    )
+
+
+def apply_visit_timing_override(stop: dict, override: dict, date_text: str, local_tz: ZoneInfo | timezone) -> None:
+    radius = as_float(override.get("radius_m"))
+    if radius is not None and 10 <= radius <= 5000:
+        stop["radius_m"] = round(radius)
+    if "place" in override:
+        stop["place"] = bool(override.get("place"))
+
+    entry_ts = override_timestamp_for(override, "entry", date_text, local_tz)
+    exit_ts = override_timestamp_for(override, "exit", date_text, local_tz)
+    if entry_ts is not None:
+        stop["entry_override"] = str(override.get("entry_time") or override.get("entry_timestamp") or "")
+        stop["visit_start_timestamp"] = entry_ts
+        stop["start_timestamp"] = entry_ts
+        stop["start"] = fmt_dt(datetime_from_timestamp_with_tz(entry_ts, local_tz))
+        stop["entry_display"] = stop["start"]
+        stop["entry_status"] = "corrected"
+        stop["entry_corrected"] = True
+        stop["user_reviewed"] = True
+    if exit_ts is not None:
+        stop["exit_override"] = str(override.get("exit_time") or override.get("exit_timestamp") or "")
+        stop["visit_end_timestamp"] = exit_ts
+        stop["end_timestamp"] = exit_ts
+        stop["end"] = fmt_dt(datetime_from_timestamp_with_tz(exit_ts, local_tz))
+        stop["exit_display"] = stop["end"]
+        stop["exit_status"] = "corrected"
+        stop["exit_corrected"] = True
+        stop["user_reviewed"] = True
+    if entry_ts is not None or exit_ts is not None:
+        start_ts = stop.get("visit_start_timestamp")
+        end_ts = stop.get("visit_end_timestamp")
+        if isinstance(start_ts, int) and isinstance(end_ts, int) and end_ts >= start_ts:
+            duration_minutes = max(0, round((end_ts - start_ts) / 60))
+            stop["duration_minutes"] = duration_minutes
+            stop["duration"] = fmt_duration(duration_minutes)
+            stop["visit_duration_minutes"] = duration_minutes
+            stop["visit_duration"] = stop["duration"]
+        stop["confidence"] = "corrected"
+
+
+def interpolated_boundary_timestamp(
+    inside_point: Event,
+    outside_point: Event,
+    place: dict,
+    radius_m: float,
+) -> int | None:
+    inside_time = event_time(inside_point)
+    outside_time = event_time(outside_point)
+    if inside_time.tzinfo is None or outside_time.tzinfo is None:
+        return None
+    inside_distance = point_distance_m(inside_point, place)
+    outside_distance = point_distance_m(outside_point, place)
+    if inside_distance > radius_m or outside_distance <= radius_m or outside_distance <= inside_distance:
+        return None
+    elapsed = (outside_time - inside_time).total_seconds()
+    if elapsed <= 0:
+        return None
+    ratio = max(0.0, min(1.0, (radius_m - inside_distance) / (outside_distance - inside_distance)))
+    return round(inside_time.timestamp() + elapsed * ratio)
+
+
+def interpolated_arrival_timestamp(
+    outside_point: Event,
+    inside_point: Event,
+    place: dict,
+    radius_m: float,
+) -> int | None:
+    outside_time = event_time(outside_point)
+    inside_time = event_time(inside_point)
+    if outside_time.tzinfo is None or inside_time.tzinfo is None:
+        return None
+    outside_distance = point_distance_m(outside_point, place)
+    inside_distance = point_distance_m(inside_point, place)
+    if outside_distance <= radius_m or inside_distance > radius_m or outside_distance <= inside_distance:
+        return None
+    elapsed = (inside_time - outside_time).total_seconds()
+    if elapsed <= 0:
+        return None
+    ratio = max(0.0, min(1.0, (outside_distance - radius_m) / (outside_distance - inside_distance)))
+    return round(outside_time.timestamp() + elapsed * ratio)
+
+
+def datetime_from_timestamp(timestamp: int, points: list[Event]) -> datetime:
+    local_tz = points[0].local_tz if points else timezone.utc
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(local_tz)
+
+
+def trip_timeline_rows(points: list[Event], places: list[dict]) -> list[dict]:
+    rows = []
+    for point in points:
+        nearest = None
+        nearest_distance = None
+        for place in places:
+            distance_m = point_distance_m(point, place)
+            if nearest_distance is None or distance_m < nearest_distance:
+                nearest = place
+                nearest_distance = distance_m
+        rows.append(
+            {
+                "line": point.line_no,
+                "time": fmt_dt(event_time(point)),
+                "timestamp": int(event_time(point).timestamp()) if event_time(point).tzinfo is not None else None,
+                "motion_mode": motion_mode(point),
+                "t": point.payload.get("t"),
+                "speed_kmh": point.speed_kmh,
+                "nearest_place": nearest.get("name") if nearest else "",
+                "nearest_distance_m": round(nearest_distance) if nearest_distance is not None else None,
+                "lat": point.lat,
+                "lon": point.lon,
+            }
+        )
+    return rows
+
+
+def trip_query_result(points: list[Event], origin: dict, destination: dict) -> dict:
+    dest_radius = float(destination.get("radius_m") or 150)
+    origin_radius = float(origin.get("radius_m") or 150)
+
+    def visit_window_points(place: dict, candidates: list[Event]) -> list[Event]:
+        start_ts = place.get("visit_start_timestamp")
+        end_ts = place.get("visit_end_timestamp")
+        if not isinstance(start_ts, int) or not isinstance(end_ts, int):
+            return []
+        return [
+            point
+            for point in candidates
+            if event_time(point).tzinfo is not None
+            and start_ts <= int(event_time(point).timestamp()) <= end_ts
+            and point_distance_m(point, place) <= float(place.get("radius_m") or 150)
+        ]
+
+    destination_visit_points = visit_window_points(destination, points)
+    arrival = destination_visit_points[0] if destination_visit_points else next((point for point in points if point_distance_m(point, destination) <= dest_radius), None)
+    if arrival is None:
+        return {
+            "ok": False,
+            "reason": f"No sample within {round(dest_radius)} m of {destination.get('name')}.",
+            "origin_key": origin.get("key"),
+            "destination_key": destination.get("key"),
+        }
+
+    before_arrival = [point for point in points if event_time(point) <= event_time(arrival)]
+    origin_visit_points = visit_window_points(origin, before_arrival)
+    origin_points = origin_visit_points or [point for point in before_arrival if point_distance_m(point, origin) <= origin_radius]
+    last_origin = origin_points[-1] if origin_points else None
+    after_origin = [
+        point
+        for point in before_arrival
+        if last_origin is None or event_time(point) > event_time(last_origin)
+    ]
+    outbound = [
+        point
+        for point in after_origin
+        if point_distance_m(point, origin) > origin_radius
+    ]
+    preferred = next(
+        (
+            point
+            for point in outbound
+            if point.payload.get("t") in {"v", "c"}
+            and motion_mode(point) in {"automotive", "moving", "cycling", "walking"}
+        ),
+        None,
+    )
+    if preferred is None:
+        preferred = next(
+            (point for point in outbound if motion_mode(point) in {"automotive", "moving", "cycling", "walking"}),
+            outbound[0] if outbound else last_origin,
+        )
+    if preferred is None:
+        return {
+            "ok": False,
+            "reason": f"No origin sample before arrival at {destination.get('name')}.",
+            "origin_key": origin.get("key"),
+            "destination_key": destination.get("key"),
+        }
+
+    arrival_index = points.index(arrival)
+    previous_arrival_point = points[arrival_index - 1] if arrival_index > 0 else None
+    visit_arrival_timestamp = destination.get("visit_start_timestamp")
+    arrival_timestamp = visit_arrival_timestamp if isinstance(visit_arrival_timestamp, int) else None
+    arrival_source = "visit"
+    if arrival_timestamp is None:
+        arrival_source = "sample"
+        arrival_timestamp = (
+            interpolated_arrival_timestamp(previous_arrival_point, arrival, destination, dest_radius)
+            if previous_arrival_point and interpolation_allowed(previous_arrival_point, arrival)
+            else None
+        )
+        if arrival_timestamp is not None:
+            arrival_source = "interpolated"
+    if arrival_timestamp is None:
+        arrival_timestamp = int(event_time(arrival).timestamp()) if event_time(arrival).tzinfo is not None else None
+
+    last_origin_index = points.index(last_origin) if last_origin in points else None
+    next_origin_point = points[last_origin_index + 1] if isinstance(last_origin_index, int) and last_origin_index + 1 < len(points) else None
+    visit_departure_timestamp = origin.get("visit_end_timestamp")
+    departure_timestamp = visit_departure_timestamp if isinstance(visit_departure_timestamp, int) else None
+    departure_source = "visit"
+    departure_boundary_sample = next_origin_point or last_origin or preferred
+    if departure_timestamp is None:
+        departure_source = "sample"
+        departure_timestamp = (
+            interpolated_boundary_timestamp(last_origin, next_origin_point, origin, origin_radius)
+            if last_origin and next_origin_point and interpolation_allowed(last_origin, next_origin_point)
+            else None
+        )
+        if departure_timestamp is not None:
+            departure_source = "interpolated"
+            departure_boundary_sample = next_origin_point or preferred
+    if departure_timestamp is None:
+        departure_boundary_sample = outbound[0] if outbound else preferred
+        departure_timestamp = int(event_time(departure_boundary_sample).timestamp()) if event_time(departure_boundary_sample).tzinfo is not None else None
+
+    if departure_timestamp is None or arrival_timestamp is None:
+        start = event_time(preferred)
+        end = event_time(arrival)
+        preferred_seconds = int((end - start).total_seconds())
+        departure_sample = preferred
+    else:
+        start = datetime_from_timestamp(departure_timestamp, points)
+        end = datetime_from_timestamp(arrival_timestamp, points)
+        preferred_seconds = max(0, arrival_timestamp - departure_timestamp)
+        departure_sample = departure_boundary_sample
+    last_origin_seconds = int((end - event_time(last_origin)).total_seconds()) if last_origin else None
+    return {
+        "ok": True,
+        "origin_key": origin.get("key"),
+        "destination_key": destination.get("key"),
+        "origin_name": origin.get("name"),
+        "destination_name": destination.get("name"),
+        "departure": {
+            "line": departure_sample.line_no,
+            "time": fmt_dt(start),
+            "sample_time": fmt_dt(event_time(departure_sample)),
+            "timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+            "estimated": departure_source == "interpolated",
+            "corrected": origin.get("visit_exit_status") == "corrected",
+            "source": departure_source,
+            "window": origin.get("visit_exit_window"),
+            "motion_mode": motion_mode(departure_sample),
+            "t": departure_sample.payload.get("t"),
+            "distance_from_origin_m": round(point_distance_m(departure_sample, origin)),
+        },
+        "arrival": {
+            "line": arrival.line_no,
+            "time": fmt_dt(end),
+            "sample_time": fmt_dt(event_time(arrival)),
+            "timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
+            "estimated": arrival_source == "interpolated",
+            "corrected": destination.get("visit_entry_status") == "corrected",
+            "source": arrival_source,
+            "window": destination.get("visit_entry_window"),
+            "motion_mode": motion_mode(arrival),
+            "t": arrival.payload.get("t"),
+            "distance_to_destination_m": round(point_distance_m(arrival, destination)),
+        },
+        "duration_seconds": preferred_seconds,
+        "duration": fmt_duration(round(preferred_seconds / 60)),
+        "last_origin": (
+            {
+                "line": last_origin.line_no,
+                "time": fmt_dt(event_time(last_origin)),
+                "duration_seconds": last_origin_seconds,
+                "duration": fmt_duration(round((last_origin_seconds or 0) / 60)),
+                "distance_from_origin_m": round(point_distance_m(last_origin, origin)),
+            }
+            if last_origin
+            else None
+        ),
+        "heuristic": "uses corrected same-day visit boundaries when present; otherwise interpolates only across short adjacent boundary gaps",
+    }
+
+
+def build_trip_summary(
+    events: list[Event],
+    user_tags: dict | None = None,
+    *,
+    target_date: date,
+    origin_key: str | None = None,
+    destination_key: str | None = None,
+    home_filter: HomeFilterConfig | None = None,
+) -> dict:
+    places = trip_place_definitions(events, user_tags, target_date, home_filter)
+    points = unique_location_points(events, target_date)
+    selected_origin = next((place for place in places if place["key"] == origin_key), None)
+    selected_destination = next((place for place in places if place["key"] == destination_key), None)
+    if selected_origin is None:
+        selected_origin = next((place for place in places if str(place["name"]).casefold() == "home"), places[0] if places else None)
+    if selected_destination is None:
+        selected_destination = next(
+            (place for place in places if "sugganahalli" in str(place["name"]).casefold()),
+            places[1] if len(places) > 1 else None,
+        )
+    query = (
+        trip_query_result(points, selected_origin, selected_destination)
+        if selected_origin and selected_destination and selected_origin["key"] != selected_destination["key"]
+        else {"ok": False, "reason": "Select two different places."}
+    )
+    return {
+        "title": "OwnTracks trips",
+        "date": target_date.isoformat(),
+        "places": places,
+        "selected": {
+            "origin_key": selected_origin.get("key") if selected_origin else "",
+            "destination_key": selected_destination.get("key") if selected_destination else "",
+        },
+        "query": query,
+        "timeline": trip_timeline_rows(points, places),
+    }
 
 
 def build_ride_segments(points: list[Event], stops: list[dict], places: list[dict]) -> list[dict]:
@@ -831,6 +1732,104 @@ def waypoint_index_events(events: list[Event], target_date: date, skip_proximity
     return waypoints
 
 
+def saved_place_index_events(
+    events: list[Event],
+    target_date: date,
+    user_tags: dict | None = None,
+    skip_proximity_names: set[str] | None = None,
+) -> list[dict]:
+    skip_names = skip_proximity_names or set()
+    definitions: dict[str, dict] = {}
+    for day_tags in (user_tags or {}).values():
+        if not isinstance(day_tags, dict):
+            continue
+        for saved in (day_tags.get("stops") or {}).values():
+            if not isinstance(saved, dict) or not saved.get("place"):
+                continue
+            name = str(saved.get("name") or "").strip()
+            lat = as_float(saved.get("lat"))
+            lon = as_float(saved.get("lon"))
+            if not name or lat is None or lon is None:
+                continue
+            key = f"name:{name.casefold()}"
+            if key not in definitions:
+                definitions[key] = {
+                    "id": slug(name),
+                    "name": name,
+                    "lat": lat,
+                    "lon": lon,
+                    "radius_m": max(150.0, as_float(saved.get("radius_m")) or 0.0),
+                    "tags": [str(tag) for tag in saved.get("tags", []) if str(tag).strip()],
+                }
+
+    day_locations = [
+        event
+        for event in events
+        if event_date(event) == target_date and event.is_location and event.lat is not None and event.lon is not None
+    ]
+    visits: list[dict] = []
+    for definition in definitions.values():
+        name_key = str(definition["name"]).casefold()
+        if name_key in skip_names:
+            continue
+        matches = [
+            event
+            for event in day_locations
+            if haversine_km(definition["lat"], definition["lon"], event.lat or 0, event.lon or 0) * 1000
+            <= float(definition["radius_m"])
+        ]
+        if not matches:
+            continue
+        clusters: list[list[Event]] = []
+        current: list[Event] = []
+        for event in sorted(matches, key=event_time):
+            if current and (event_time(event) - event_time(current[-1])).total_seconds() > 60 * 60:
+                clusters.append(current)
+                current = []
+            current.append(event)
+        if current:
+            clusters.append(current)
+        for cluster in clusters:
+            start = event_time(cluster[0])
+            end = event_time(cluster[-1])
+            duration_minutes = max(0, round((end - start).total_seconds() / 60))
+            lat = sum(event.lat or 0 for event in cluster) / len(cluster)
+            lon = sum(event.lon or 0 for event in cluster) / len(cluster)
+            modes = Counter(motion_mode(event) for event in cluster)
+            dominant_mode = modes.most_common(1)[0][0] if modes else "review"
+            tags = [
+                f"place:{slug(definition['name'])}",
+                "source:review-proximity",
+                *definition.get("tags", []),
+            ]
+            visits.append(
+                {
+                    "date": target_date.isoformat(),
+                    "id": f"review-proximity:{definition['id']}-{cluster[0].line_no}-{cluster[-1].line_no}",
+                    "name": definition["name"],
+                    "raw_name": definition["name"],
+                    "start": fmt_dt(start),
+                    "end": fmt_dt(end),
+                    "start_timestamp": int(start.timestamp()) if start.tzinfo is not None else None,
+                    "end_timestamp": int(end.timestamp()) if end.tzinfo is not None else None,
+                    "duration": fmt_duration(duration_minutes),
+                    "duration_minutes": duration_minutes,
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "points": len(cluster),
+                    "motion": ", ".join(f"{name}:{count}" for name, count in modes.most_common()) or "review",
+                    "motion_mode": dominant_mode,
+                    "tags": sorted(set(tags)),
+                    "note": "",
+                    "maps": maps_url(lat, lon),
+                    "reviewed": False,
+                    "manual": False,
+                    "source": "review-proximity",
+                }
+            )
+    return visits
+
+
 def transition_index_events(events: list[Event], target_date: date) -> list[dict]:
     transitions = [
         event
@@ -893,6 +1892,39 @@ def transition_index_events(events: list[Event], target_date: date) -> list[dict
     return visits
 
 
+def proximity_named_place_events(
+    events: list[Event],
+    target_date: date,
+    user_tags: dict | None = None,
+    skip_names: set[str] | None = None,
+) -> list[dict]:
+    places: list[dict] = []
+    covered = set(skip_names or set())
+    proximity_visits = waypoint_index_events(events, target_date, covered)
+    for visit in proximity_visits:
+        covered.add(str(visit.get("name") or "").casefold())
+    proximity_visits.extend(saved_place_index_events(events, target_date, user_tags or {}, covered))
+    for visit in proximity_visits:
+        places.append(
+            {
+                "id": visit.get("id", ""),
+                "name": visit.get("name", ""),
+                "action": "visit",
+                "time": visit.get("start", ""),
+                "timestamp": visit.get("start_timestamp"),
+                "lat": visit.get("lat"),
+                "lon": visit.get("lon"),
+                "line": "",
+                "tags": visit.get("tags", []),
+                "maps": visit.get("maps", ""),
+                "source": visit.get("source", "proximity"),
+                "points": visit.get("points", 0),
+                "duration": visit.get("duration", ""),
+            }
+        )
+    return places
+
+
 def is_stop_candidate_event(event: Event) -> bool:
     if not event.is_location:
         return False
@@ -941,6 +1973,67 @@ def stop_from_cluster(cluster: list[Event], index: int) -> dict | None:
         "tags": [f"stop:{stop_id}", "candidate:stop"],
         "maps": maps_url(lat, lon),
     }
+
+
+def stop_covers_event(stop: dict, event: Event) -> bool:
+    timestamp = int(event_time(event).timestamp()) if event_time(event).tzinfo is not None else None
+    start_timestamp = stop.get("start_timestamp")
+    end_timestamp = stop.get("end_timestamp")
+    if isinstance(timestamp, int) and isinstance(start_timestamp, int) and isinstance(end_timestamp, int):
+        return start_timestamp <= timestamp <= end_timestamp
+    return int(stop.get("start_line") or -1) <= event.line_no <= int(stop.get("end_line") or -1)
+
+
+def boundary_home_stop(event: Event, index: int, boundary: str) -> dict | None:
+    stop = stop_from_cluster([event], index)
+    if stop is None:
+        return None
+    stop["id"] = f"boundary-home-{boundary}-{event.line_no}"
+    stop["name"] = "Home"
+    stop["tags"] = [f"stop:{stop['id']}", "candidate:stop", "source:home-boundary"]
+    stop["boundary"] = boundary
+    stop["estimated_boundary"] = True
+    return stop
+
+
+def boundary_home_stops(
+    events: list[Event],
+    existing_stops: list[dict],
+    config: HomeFilterConfig | None,
+    anchors: list[tuple[float, float, str]],
+) -> list[dict]:
+    points = [event for event in events if event.is_location]
+    if not points or not config or not config.enabled:
+        return []
+    points.sort(key=event_time)
+    inferred: list[dict] = []
+    next_index = len(existing_stops) + 1
+
+    first = points[0]
+    second = points[1] if len(points) > 1 else None
+    if (
+        second is not None
+        and is_near_home_boundary(first, config, anchors)
+        and not is_near_home_boundary(second, config, anchors)
+        and not any(stop_covers_event(stop, first) for stop in existing_stops)
+    ):
+        stop = boundary_home_stop(first, next_index, "start")
+        if stop is not None:
+            inferred.append(stop)
+            next_index += 1
+
+    last = points[-1]
+    previous = points[-2] if len(points) > 1 else None
+    if (
+        previous is not None
+        and is_near_home_boundary(last, config, anchors)
+        and not is_near_home_boundary(previous, config, anchors)
+        and not any(stop_covers_event(stop, last) for stop in [*existing_stops, *inferred])
+    ):
+        stop = boundary_home_stop(last, next_index, "end")
+        if stop is not None:
+            inferred.append(stop)
+    return inferred
 
 
 def same_place_dwell_clusters(events: list[Event], min_minutes: int, radius_m: int) -> list[list[Event]]:
@@ -1037,6 +2130,103 @@ def candidate_stops(events: list[Event], min_minutes: int = 10, radius_m: int = 
     return sorted(stops, key=lambda stop: (int(stop["start_line"]), int(stop["end_line"])))
 
 
+def possible_missed_stops(
+    events: list[Event],
+    existing_stops: list[dict],
+    *,
+    min_gap_minutes: int = 20,
+    max_accuracy_m: int = 250,
+) -> list[dict]:
+    points = [event for event in events if event.is_location]
+    points.sort(key=event_time)
+    if len(points) < 3:
+        return []
+
+    suggestions: list[dict] = []
+    seen_locations: list[tuple[float, float]] = []
+    for index, point in enumerate(points):
+        if any(stop_covers_event(stop, point) for stop in existing_stops):
+            continue
+        accuracy = as_float(point.payload.get("acc"))
+        if accuracy is not None and accuracy > max_accuracy_m:
+            continue
+        mode = motion_mode(point)
+        if mode in {"automotive", "cycling", "moving"}:
+            continue
+        if point.speed_kmh is not None and point.speed_kmh > 5:
+            continue
+
+        previous = points[index - 1] if index > 0 else None
+        next_point = points[index + 1] if index + 1 < len(points) else None
+        previous_gap = (event_time(point) - event_time(previous)).total_seconds() if previous else None
+        next_gap = (event_time(next_point) - event_time(point)).total_seconds() if next_point else None
+        if not (
+            (previous_gap is not None and previous_gap >= min_gap_minutes * 60)
+            or (next_gap is not None and next_gap >= min_gap_minutes * 60)
+        ):
+            continue
+
+        previous_distance = (
+            haversine_km(previous.lat or 0, previous.lon or 0, point.lat or 0, point.lon or 0) * 1000
+            if previous
+            else None
+        )
+        next_distance = (
+            haversine_km(point.lat or 0, point.lon or 0, next_point.lat or 0, next_point.lon or 0) * 1000
+            if next_point
+            else None
+        )
+        if previous_distance is not None and previous_distance <= DEFAULT_VISIT_RADIUS_M and previous_gap is not None and previous_gap >= min_gap_minutes * 60:
+            continue
+        if next_distance is not None and next_distance <= DEFAULT_VISIT_RADIUS_M and next_gap is not None and next_gap >= min_gap_minutes * 60:
+            continue
+        if any(haversine_km(lat, lon, point.lat or 0, point.lon or 0) * 1000 <= DEFAULT_VISIT_RADIUS_M for lat, lon in seen_locations):
+            continue
+
+        recorded = event_time(point)
+        received = point.received_at
+        upload_delay_seconds = (
+            int((received - recorded).total_seconds())
+            if received is not None and received.tzinfo is not None and recorded.tzinfo is not None
+            else None
+        )
+        reasons = []
+        if previous_gap is not None and previous_gap >= min_gap_minutes * 60:
+            reasons.append(f"{fmt_duration(round(previous_gap / 60))} since previous sample")
+        if next_gap is not None and next_gap >= min_gap_minutes * 60:
+            reasons.append(f"{fmt_duration(round(next_gap / 60))} until next sample")
+        if upload_delay_seconds is not None and upload_delay_seconds >= 30 * 60:
+            reasons.append(f"buffered upload delayed {fmt_duration(round(upload_delay_seconds / 60))}")
+        if mode in {"stationary", "unknown"} or point.speed_kmh in (None, 0):
+            reasons.append("not clearly moving")
+
+        suggestions.append(
+            {
+                "id": f"possible-stop-{point.line_no}",
+                "line": point.line_no,
+                "lat": round(point.lat or 0, 6),
+                "lon": round(point.lon or 0, 6),
+                "time": fmt_dt(recorded),
+                "timestamp": int(recorded.timestamp()) if recorded.tzinfo is not None else None,
+                "received_time": fmt_dt(received),
+                "received_timestamp": int(received.timestamp()) if received and received.tzinfo is not None else None,
+                "upload_delay_seconds": upload_delay_seconds,
+                "motion_mode": mode,
+                "speed_kmh": point.speed_kmh,
+                "accuracy_m": accuracy,
+                "previous_gap_minutes": round(previous_gap / 60) if previous_gap is not None else None,
+                "next_gap_minutes": round(next_gap / 60) if next_gap is not None else None,
+                "previous_distance_m": round(previous_distance) if previous_distance is not None else None,
+                "next_distance_m": round(next_distance) if next_distance is not None else None,
+                "confidence": "low",
+                "reason": "; ".join(reasons),
+                "maps": maps_url(point.lat or 0, point.lon or 0),
+            }
+        )
+        seen_locations.append((point.lat or 0, point.lon or 0))
+    return suggestions
+
+
 def heatmap_visit_clusters(events: list[Event], min_minutes: int = 10, radius_m: int = 180, max_gap_minutes: int = 45) -> list[dict]:
     low_motion = [
         event
@@ -1103,7 +2293,7 @@ def manual_stops_for_date(user_tags: dict, date_text: str) -> list[dict]:
     saved_stops = day_tags.get("stops", {}) if isinstance(day_tags, dict) else {}
     manual_stops = []
     for stop_id, saved in saved_stops.items():
-        if not isinstance(saved, dict) or not saved.get("manual"):
+        if not isinstance(saved, dict) or not saved.get("manual") or saved.get("ignored"):
             continue
         lat = as_float(saved.get("lat"))
         lon = as_float(saved.get("lon"))
@@ -1130,12 +2320,32 @@ def manual_stops_for_date(user_tags: dict, date_text: str) -> list[dict]:
                 "motion": str(saved.get("motion_mode") or "unknown"),
                 "motion_mode": str(saved.get("motion_mode") or "unknown"),
                 "motion_modes": str(saved.get("motion_mode") or "unknown") + ":1",
-                "tags": [f"stop:{stop_id}", "candidate:stop", "source:manual"],
+                "tags": [f"stop:{stop_id}", "candidate:stop", "source:manual", *[str(tag) for tag in saved.get("tags", []) if str(tag).strip()]],
+                "user_tags": [str(tag) for tag in saved.get("tags", []) if str(tag).strip()],
+                "user_note": str(saved.get("note") or ""),
+                "media": [item for item in saved.get("media", []) if isinstance(item, dict)],
+                "user_reviewed": True,
                 "maps": maps_url(lat, lon),
                 "manual": True,
+                "place": bool(saved.get("place")),
             }
         )
     return manual_stops
+
+
+def saved_stop_matches_stop(saved_stop: dict, stop: dict) -> bool:
+    saved_timestamp = saved_stop.get("timestamp")
+    start_timestamp = stop.get("start_timestamp")
+    end_timestamp = stop.get("end_timestamp")
+    if isinstance(saved_timestamp, int) and isinstance(start_timestamp, int) and isinstance(end_timestamp, int):
+        return start_timestamp <= saved_timestamp <= end_timestamp
+    saved_line = saved_stop.get("line")
+    start_line = stop.get("start_line")
+    end_line = stop.get("end_line")
+    if isinstance(saved_line, int) and isinstance(start_line, int) and isinstance(end_line, int):
+        if start_line <= saved_line <= end_line:
+            return True
+    return False
 
 
 def location_override_for(stop: dict, user_tags: dict, current_date: str, radius_m: int = 150) -> dict:
@@ -1143,8 +2353,9 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
     stop_lon = as_float(stop.get("lon"))
     if stop_lat is None or stop_lon is None:
         return {}
-    best_key: tuple[bool, str, float] | None = None
-    best_override: dict | None = None
+    stop_name = str(stop.get("name") or "").strip()
+    exact_override: dict | None = None
+    exact_key: tuple[bool, str, int] | None = None
     for date_key, day_tags in user_tags.items():
         if not isinstance(day_tags, dict):
             continue
@@ -1152,6 +2363,31 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
             continue
         for saved_stop in day_tags.get("stops", {}).values():
             if not isinstance(saved_stop, dict) or not saved_stop.get("name"):
+                continue
+            if saved_stop.get("manual"):
+                continue
+            if not saved_stop_matches_stop(saved_stop, stop):
+                continue
+            saved_timestamp = saved_stop.get("timestamp") if isinstance(saved_stop.get("timestamp"), int) else 0
+            candidate_key = (date_key == current_date, date_key, saved_timestamp)
+            if exact_key is None or candidate_key > exact_key:
+                exact_key = candidate_key
+                exact_override = {**saved_stop, "_match": "exact"}
+    if exact_override is not None:
+        return exact_override
+    if stop_name and not re.fullmatch(r"unnamed-stop-\d+", stop_name):
+        return {}
+    best_key: tuple[bool, str, float] | None = None
+    best_override: dict | None = None
+    for date_key, day_tags in user_tags.items():
+        if not isinstance(day_tags, dict):
+            continue
+        if date_key >= current_date:
+            continue
+        for saved_stop in day_tags.get("stops", {}).values():
+            if not isinstance(saved_stop, dict) or not saved_stop.get("name"):
+                continue
+            if saved_stop.get("manual") and not saved_stop.get("place"):
                 continue
             saved_lat = as_float(saved_stop.get("lat"))
             saved_lon = as_float(saved_stop.get("lon"))
@@ -1163,16 +2399,29 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
             candidate_key = (date_key == current_date, date_key, -distance_m)
             if best_key is None or candidate_key > best_key:
                 best_key = candidate_key
-                best_override = {**saved_stop, "_date": date_key, "_distance_m": round(distance_m)}
+                best_override = {**saved_stop, "_date": date_key, "_distance_m": round(distance_m), "_match": "proximity"}
     if best_override is None:
         return {}
     override = best_override.copy()
     override.pop("note", None)
+    override.pop("entry_time", None)
+    override.pop("entry_timestamp", None)
+    override.pop("exit_time", None)
+    override.pop("exit_timestamp", None)
+    override.pop("radius_m", None)
+    override.pop("media", None)
     override.pop("_date", None)
     return override
 
 
-def waypoint_name_for(lat: float | None, lon: float | None, events: list[Event], radius_m: int = 150) -> str | None:
+def waypoint_name_for(
+    lat: float | None,
+    lon: float | None,
+    events: list[Event],
+    radius_m: int = 150,
+    *,
+    use_default_radius: bool = True,
+) -> str | None:
     if lat is None or lon is None:
         return None
     best_key: tuple[int, float] | None = None
@@ -1184,7 +2433,9 @@ def waypoint_name_for(lat: float | None, lon: float | None, events: list[Event],
         if not name:
             continue
         waypoint_radius = as_float(event.payload.get("rad")) or 0
-        match_radius = max(radius_m, waypoint_radius)
+        match_radius = max(radius_m, waypoint_radius) if use_default_radius else waypoint_radius
+        if match_radius <= 0:
+            continue
         distance_m = haversine_km(lat, lon, event.lat, event.lon) * 1000
         if distance_m > match_radius:
             continue
@@ -1208,22 +2459,42 @@ def apply_user_tags(plan: dict, user_tags: dict, events: list[Event] | None = No
     global_tags = day_tags.get("activity", day_tags.get("ride", {})).get("tags", [])
     plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + global_tags))
     stop_overrides = day_tags.get("stops", {})
+    local_tz = events[0].local_tz if events else ZoneInfo("Asia/Kolkata")
     for stop in plan["candidate_stops"]:
+        waypoint_override = waypoint_override_for(stop, events or [])
+        location_override = location_override_for(stop, user_tags, plan["date"])
+        if waypoint_override.get("name") and location_override.get("_match") == "proximity":
+            location_override = {}
+        explicit_override = merge_stop_overrides([location_override, stop_override_for(stop, stop_overrides)])
         override = merge_stop_overrides(
             [
-                waypoint_override_for(stop, events or []),
-                location_override_for(stop, user_tags, plan["date"]),
+                waypoint_override,
+                location_override,
                 stop_override_for(stop, stop_overrides),
             ]
         )
         if override.get("name"):
             stop["reviewed_name"] = override["name"]
+            if explicit_override.get("name"):
+                stop["user_reviewed"] = True
         if override.get("tags"):
             stop["user_tags"] = override["tags"]
+            stop["user_reviewed"] = True
             plan["recommended_tags"] = sorted(set(plan["recommended_tags"] + override["tags"]))
         if override.get("note"):
             stop["user_note"] = override["note"]
+            stop["user_reviewed"] = True
+        media = override.get("media")
+        if isinstance(media, list):
+            stop["media"] = [item for item in media if isinstance(item, dict)]
+            if stop["media"]:
+                stop["user_reviewed"] = True
+        apply_visit_timing_override(stop, override, plan["date"], local_tz)
     return plan
+
+
+def stop_is_ignored(stop: dict, stop_overrides: dict) -> bool:
+    return bool(stop_override_for(stop, stop_overrides).get("ignored"))
 
 
 def stop_override_for(stop: dict, stop_overrides: dict) -> dict:
@@ -1236,9 +2507,40 @@ def stop_override_for(stop: dict, stop_overrides: dict) -> dict:
     for saved_id, override in stop_overrides.items():
         if old_range_re.fullmatch(saved_id):
             matches.append(override)
+    current_range = stop_line_range(stop)
+    if current_range is not None:
+        for saved_id, override in stop_overrides.items():
+            if saved_id == stop_id or saved_id in fallback_stop_ids(stop_id):
+                continue
+            saved_range = stop_id_line_range(str(saved_id))
+            if saved_range is None:
+                continue
+            if ranges_overlap(current_range, saved_range):
+                matches.append(override)
     if stop_id in stop_overrides:
         matches.append(stop_overrides[stop_id])
     return merge_stop_overrides(matches)
+
+
+def stop_line_range(stop: dict) -> tuple[int, int] | None:
+    start_line = stop.get("start_line")
+    end_line = stop.get("end_line")
+    if not isinstance(start_line, int) or not isinstance(end_line, int):
+        return None
+    return (min(start_line, end_line), max(start_line, end_line))
+
+
+def stop_id_line_range(stop_id: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"unnamed-stop-\d+-(\d+)(?:-(\d+))?", stop_id)
+    if not match:
+        return None
+    start_line = int(match.group(1))
+    end_line = int(match.group(2) or match.group(1))
+    return (min(start_line, end_line), max(start_line, end_line))
+
+
+def ranges_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] <= right[1] and right[0] <= left[1]
 
 
 def merge_stop_overrides(overrides: list[dict]) -> dict:
@@ -1249,8 +2551,17 @@ def merge_stop_overrides(overrides: list[dict]) -> dict:
             continue
         if override.get("name"):
             merged["name"] = override["name"]
+        if override.get("ignored"):
+            merged["ignored"] = True
         if override.get("note"):
             merged["note"] = override["note"]
+        if "place" in override:
+            merged["place"] = bool(override.get("place"))
+        for key in ("entry_time", "entry_timestamp", "exit_time", "exit_timestamp", "radius_m"):
+            if override.get(key) not in (None, ""):
+                merged[key] = override[key]
+        if isinstance(override.get("media"), list):
+            merged["media"] = [item for item in override["media"] if isinstance(item, dict)]
         raw_tags = override.get("tags") or []
         tags = raw_tags if isinstance(raw_tags, list) else [raw_tags]
         for tag in tags:
@@ -1381,6 +2692,21 @@ OWNTRACKS_NAV_CSS = """
     .ot-nav a:hover {
       border-color: #6b7280;
     }
+    @media (max-width: 700px) {
+      .ot-nav {
+        flex-wrap: nowrap;
+        margin-top: 8px;
+        overflow-x: auto;
+        padding-bottom: 2px;
+        scrollbar-width: thin;
+      }
+      .ot-nav a {
+        flex: 0 0 auto;
+        min-height: 30px;
+        padding: 5px 8px;
+        white-space: nowrap;
+      }
+    }
 """
 
 
@@ -1430,6 +2756,7 @@ def owntracks_nav_html(
     range_suffix = f"?{range_query}" if range_query else ""
     links = [
         ("day", "Day map", day_href),
+        ("trips", "Trips", f"/owntracks/trips?{urlencode({'date': date_value})}" if date_value else "/owntracks/trips"),
         ("heat", "Heat map", heat_href),
         ("stops", "Stops", f"/owntracks/stops{range_suffix}"),
         ("dashboard", "Dashboard", f"/owntracks/dashboard{range_suffix}"),
@@ -1462,15 +2789,21 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             "alias": stop.get("alias", ""),
             "name": stop.get("reviewed_name") or stop.get("name") or "unnamed stop",
             "id": stop.get("id", ""),
+            "start_line": stop.get("start_line"),
+            "end_line": stop.get("end_line"),
             "lat": stop.get("lat"),
             "lon": stop.get("lon"),
             "start": stop.get("start", ""),
             "end": stop.get("end", ""),
+            "start_timestamp": stop.get("start_timestamp"),
+            "end_timestamp": stop.get("end_timestamp"),
             "duration": stop.get("duration", ""),
             "points": stop.get("points", ""),
             "maps": stop.get("maps", ""),
             "tags": stop.get("user_tags", []),
             "note": stop.get("user_note", ""),
+            "previous_travel": stop.get("previous_travel"),
+            "next_travel": stop.get("next_travel"),
         }
         for stop in plan.get("candidate_stops", [])
         if stop.get("lat") is not None and stop.get("lon") is not None
@@ -1479,9 +2812,11 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
         {
             "name": place.get("name", ""),
             "action": place.get("action", ""),
+            "id": place.get("id", ""),
             "lat": place.get("lat"),
             "lon": place.get("lon"),
             "time": place.get("time", ""),
+            "timestamp": place.get("timestamp"),
         }
         for place in plan.get("named_places", [])
         if place.get("lat") is not None and place.get("lon") is not None
@@ -1646,7 +2981,9 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
             "track": track,
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
+            "possibleMissedStops": plan.get("possible_missed_stops", []),
             "namedPlaces": named_places,
+            "travelSegments": plan.get("travel_segments", []),
             "motionSummary": plan.get("motion_summary") or {},
         },
         ensure_ascii=False,
@@ -1804,6 +3141,22 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     .stop-head input {{
       width: auto;
     }}
+    .inline-check {{
+      align-items: center;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      color: #374151;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 750;
+      gap: 6px;
+      margin: 0;
+      min-height: 34px;
+      padding: 6px 8px;
+    }}
+    .inline-check input {{
+      width: auto;
+    }}
     .alias {{
       background: #111827;
       border-radius: 4px;
@@ -1875,6 +3228,22 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     .route-arrow-marker {{
       background: transparent;
       border: 0;
+    }}
+    .travel-time-marker {{
+      background: transparent;
+      border: 0;
+    }}
+    .travel-time-label {{
+      background: rgb(17 24 39 / 0.88);
+      border: 1px solid rgb(255 255 255 / 0.85);
+      border-radius: 6px;
+      box-shadow: 0 1px 6px rgb(15 23 42 / 0.25);
+      color: white;
+      font-size: 12px;
+      font-weight: 850;
+      line-height: 1;
+      padding: 5px 7px;
+      white-space: nowrap;
     }}
     .route-arrow {{
       color: rgba(15, 23, 42, 0.92);
@@ -2109,6 +3478,10 @@ def render_map_html(plan: dict, tile_cache_dir: Path | None = None) -> str:
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
     const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
     const originalNotes = new Map(data.stops.map((stop) => [stop.alias, stop.note || ""]));
+    const originalEntryTimes = new Map(data.stops.map((stop) => [stop.alias, stop.entry_override || ""]));
+    const originalExitTimes = new Map(data.stops.map((stop) => [stop.alias, stop.exit_override || ""]));
+    const originalRadii = new Map(data.stops.map((stop) => [stop.alias, String(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})]));
+    const originalPlaces = new Map(data.stops.map((stop) => [stop.alias, Boolean(stop.place)]));
     const embeddedTiles = {str(embedded_tile_images).lower()};
     let viewBox = [0, 0, width, height];
     let dragStart = null;
@@ -2751,11 +4124,14 @@ def build_stop_index_summary(
         return {
             "title": "OwnTracks stop index",
             "scope": {"start": "", "end": "", "days": 0},
-            "stats": {"places": 0, "visits": 0, "reviewed_visits": 0, "total_minutes": 0},
+            "stats": {"places": 0, "visits": 0, "reviewed_visits": 0, "total_minutes": 0, "travel_pairs": 0},
             "places": [],
+            "travel_segments": [],
+            "travel_pairs": [],
         }
 
     grouped: dict[str, dict] = {}
+    all_travel_segments: list[dict] = []
 
     def add_visit(key: str, label: str, visit: dict) -> None:
         tags = [str(tag) for tag in (visit.get("tags") or []) if str(tag).strip()]
@@ -2793,6 +4169,8 @@ def build_stop_index_summary(
     current = start_date
     while current <= end_date:
         plan, _track_points = build_plan(events, current, user_tags or {}, home_filter, stop_jitter_filter)
+        for segment in plan.get("travel_segments", []):
+            all_travel_segments.append({**segment, "date": plan["date"], "map": f"/owntracks/map/{plan['date']}"})
         covered_names: set[str] = set()
         transition_visits = transition_index_events(events, current)
         for stop in plan.get("candidate_stops", []):
@@ -2808,12 +4186,12 @@ def build_stop_index_summary(
                 "id": stop.get("id", ""),
                 "name": label,
                 "raw_name": stop.get("name", ""),
-                "start": stop.get("start", ""),
-                "end": stop.get("end", ""),
-                "start_timestamp": stop.get("start_timestamp"),
-                "end_timestamp": stop.get("end_timestamp"),
-                "duration": stop.get("duration", ""),
-                "duration_minutes": duration_minutes,
+                "start": stop.get("entry_display") or stop.get("start", ""),
+                "end": stop.get("exit_display") or stop.get("end", ""),
+                "start_timestamp": stop.get("visit_start_timestamp", stop.get("start_timestamp")),
+                "end_timestamp": stop.get("visit_end_timestamp", stop.get("end_timestamp")),
+                "duration": stop.get("visit_duration") or stop.get("duration", ""),
+                "duration_minutes": int(stop.get("visit_duration_minutes", duration_minutes) or 0),
                 "lat": lat,
                 "lon": lon,
                 "points": stop.get("points", 0),
@@ -2821,10 +4199,16 @@ def build_stop_index_summary(
                 "motion_mode": stop.get("motion_mode", "unknown"),
                 "tags": tags,
                 "note": stop.get("user_note", ""),
+                "media": [item for item in stop.get("media", []) if isinstance(item, dict)],
                 "maps": stop.get("maps", ""),
-                "reviewed": bool(stop.get("reviewed_name") or stop.get("user_tags") or stop.get("user_note")),
+                "reviewed": bool(stop.get("reviewed_name") or stop.get("user_tags") or stop.get("user_note") or stop.get("media")),
                 "manual": bool(stop.get("manual")),
                 "source": "stop",
+                "confidence": stop.get("confidence"),
+                "entry_status": stop.get("entry_status"),
+                "exit_status": stop.get("exit_status"),
+                "entry_window": stop.get("entry_window"),
+                "exit_window": stop.get("exit_window"),
             }
             add_visit(key, label, visit)
         for transition in transition_visits:
@@ -2833,13 +4217,18 @@ def build_stop_index_summary(
             add_visit(transition_key, str(transition.get("name") or "Transition"), transition)
         for waypoint in waypoint_index_events(events, current, covered_names):
             waypoint_key = f"name:{str(waypoint.get('name') or '').casefold()}"
+            covered_names.add(str(waypoint.get("name") or "").casefold())
             add_visit(waypoint_key, str(waypoint.get("name") or "Waypoint"), waypoint)
+        for saved_place in saved_place_index_events(events, current, user_tags or {}, covered_names):
+            saved_place_key = f"name:{str(saved_place.get('name') or '').casefold()}"
+            add_visit(saved_place_key, str(saved_place.get("name") or "Saved place"), saved_place)
         current += timedelta(days=1)
 
     places = list(grouped.values())
     for place in places:
         place["visits"].sort(key=lambda item: (item["date"], item.get("start_timestamp") or 0), reverse=True)
     places.sort(key=lambda item: (str(item["name"]).casefold(), -int(item["visit_count"])))
+    travel_pairs = travel_pair_summaries(all_travel_segments)
     return {
         "title": "OwnTracks stop index",
         "scope": {
@@ -2852,8 +4241,11 @@ def build_stop_index_summary(
             "visits": sum(int(place["visit_count"]) for place in places),
             "reviewed_visits": sum(int(place["reviewed_visits"]) for place in places),
             "total_minutes": sum(int(place["total_minutes"]) for place in places),
+            "travel_pairs": len(travel_pairs),
         },
         "places": places,
+        "travel_segments": all_travel_segments,
+        "travel_pairs": travel_pairs,
     }
 
 
@@ -2935,6 +4327,9 @@ def build_activity_dashboard_summary(
     travel_days = [day for day in observed_days if day["travel_day"]]
     current_out_streak = current_activity_streak_days(daily, "out_of_home")
     current_home_streak = current_activity_streak_days(daily, "home_only")
+    longest_out_streak = longest_activity_streak_days(daily, "out_of_home")
+    longest_home_streak = longest_activity_streak_days(daily, "home_only")
+    longest_travel_streak = longest_activity_streak_days(daily, "travel_day")
     total_distance = round(sum(float(day["distance_km"]) for day in observed_days), 2)
     outside_distance = round(sum(float(day["outside_distance_km"]) for day in observed_days), 2)
     outside_minutes_total = sum(int(day["outside_minutes"]) for day in observed_days)
@@ -2962,11 +4357,15 @@ def build_activity_dashboard_summary(
             "visits": sum(int(place.get("visit_count") or 0) for place in stop_index.get("places", [])),
             "current_out_of_home_streak_days": current_out_streak,
             "current_home_only_streak_days": current_home_streak,
+            "longest_out_of_home_streak_days": longest_out_streak,
+            "longest_home_only_streak_days": longest_home_streak,
+            "longest_travel_streak_days": longest_travel_streak,
         },
         "daily": daily,
         "streaks": {
             "out_of_home": activity_streaks(daily, "out_of_home"),
             "home_only": activity_streaks(daily, "home_only"),
+            "travel": activity_streaks(daily, "travel_day"),
         },
         "top_places": top_places,
     }
@@ -2983,6 +4382,16 @@ def current_activity_streak_days(daily: list[dict], key: str) -> int:
             break
         count += 1
     return count
+
+
+def longest_activity_streak_days(daily: list[dict], key: str) -> int:
+    streak = longest_activity_streak(daily, key)
+    return int(streak.get("days") or 0) if streak else 0
+
+
+def longest_activity_streak(daily: list[dict], key: str) -> dict | None:
+    streaks = activity_streaks(daily, key, min_days=1)
+    return streaks[0] if streaks else None
 
 
 def activity_streaks(daily: list[dict], key: str, min_days: int = 2) -> list[dict]:
@@ -3049,12 +4458,14 @@ def render_activity_dashboard_html(summary: dict) -> str:
     h1 {{ font-size: 20px; margin: 0 0 8px; }}
     .subtle {{ color: #4b5563; font-size: 13px; line-height: 1.4; }}
 {OWNTRACKS_NAV_CSS}
+    .mobile-filter-toggle {{ display: none; margin-top: 10px; width: 100%; }}
     .filters {{ align-items: end; display: grid; gap: 10px; grid-template-columns: minmax(160px, 210px) repeat(2, minmax(140px, 180px)) auto minmax(180px, 1fr) auto; margin-top: 12px; }}
     label {{ color: #374151; display: grid; font-size: 12px; font-weight: 800; gap: 4px; }}
     input, select {{ border: 1px solid #d1d5db; border-radius: 6px; font: inherit; min-height: 36px; padding: 7px 9px; width: 100%; }}
     input[type="checkbox"] {{ min-height: 0; width: auto; }}
     .toggle {{ align-items: center; border: 1px solid #d1d5db; border-radius: 6px; display: inline-flex; gap: 7px; min-height: 36px; padding: 7px 9px; white-space: nowrap; }}
     button, .button {{ background: #111827; border: 0; border-radius: 6px; color: white; cursor: pointer; display: inline-flex; font: inherit; font-size: 13px; font-weight: 800; justify-content: center; min-height: 36px; padding: 7px 11px; text-decoration: none; }}
+    button.secondary, .button.secondary {{ background: #e5e7eb; color: #111827; }}
     main {{ display: grid; gap: 14px; padding: 14px; }}
     .cards {{ display: grid; gap: 10px; grid-template-columns: repeat(4, minmax(0, 1fr)); }}
     .card, .panel {{ background: white; border: 1px solid #d1d5db; border-radius: 8px; }}
@@ -3099,7 +4510,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     .place {{ border: 1px solid #e5e7eb; border-radius: 7px; padding: 9px; }}
     .place strong {{ display: block; font-size: 13px; }}
     .place span {{ color: #4b5563; display: block; font-size: 12px; margin-top: 3px; }}
-    @media (max-width: 850px) {{ .filters, .grid {{ grid-template-columns: 1fr; }} .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .calendar {{ gap: 4px; overflow-x: auto; }} .weekday {{ font-size: 10px; padding-inline: 3px; }} .day {{ min-height: 68px; min-width: 74px; padding: 5px; }} .day.connect-prev::before, .day.connect-next::after {{ width: 5px; }} .day.connect-prev::before {{ left: -5px; }} .day.connect-next::after {{ right: -5px; }} .day.week-prev::before, .day.week-next::after {{ height: 5px; }} .day.week-prev::before {{ top: -5px; }} .day.week-next::after {{ bottom: -5px; }} }}
+    @media (max-width: 850px) {{ header {{ max-height: 46vh; overflow-y: auto; padding: 10px 12px; }} h1 {{ font-size: 18px; margin-bottom: 4px; }} .subtle {{ font-size: 12px; }} .mobile-filter-toggle {{ display: inline-flex; }} header:not(.filters-open) .filters {{ display: none; }} .filters, .grid {{ grid-template-columns: 1fr; }} .filters {{ margin-top: 10px; }} .toggle {{ justify-content: center; white-space: normal; }} main {{ padding: 10px; }} .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .card {{ padding: 9px; }} .card strong {{ font-size: 17px; }} .panel {{ overflow-x: auto; }} .calendar {{ gap: 4px; min-width: 560px; }} .weekday {{ font-size: 10px; padding-inline: 3px; }} .day {{ min-height: 68px; min-width: 74px; padding: 5px; }} table {{ min-width: 680px; }} .day.connect-prev::before, .day.connect-next::after {{ width: 5px; }} .day.connect-prev::before {{ left: -5px; }} .day.connect-next::after {{ right: -5px; }} .day.week-prev::before, .day.week-next::after {{ height: 5px; }} .day.week-prev::before {{ top: -5px; }} .day.week-next::after {{ bottom: -5px; }} }}
   </style>
 </head>
 <body>
@@ -3107,6 +4518,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     <h1>{title}</h1>
     <div class="subtle">{escape(scope.get("start") or "")} to {escape(scope.get("end") or "")} · raw movement, home-area classification, and indexed place visits</div>
     {nav}
+    <button id="filterToggle" class="mobile-filter-toggle secondary" type="button" aria-controls="rangeForm" aria-expanded="false">Show filters</button>
     <form id="rangeForm" class="filters">
       <label>Preset <select id="rangePreset">
         <option value="">Custom dates</option>
@@ -3136,6 +4548,9 @@ def render_activity_dashboard_html(summary: dict) -> str:
       <div class="card"><span>Place visits</span><strong>{int(stats.get("visits") or 0)}</strong></div>
       <div class="card"><span>Current out streak</span><strong>{int(stats.get("current_out_of_home_streak_days") or 0)} days</strong></div>
       <div class="card"><span>Current home streak</span><strong>{int(stats.get("current_home_only_streak_days") or 0)} days</strong></div>
+      <div class="card"><span>Longest out streak</span><strong>{int(stats.get("longest_out_of_home_streak_days") or 0)} days</strong></div>
+      <div class="card"><span>Longest home streak</span><strong>{int(stats.get("longest_home_only_streak_days") or 0)} days</strong></div>
+      <div class="card"><span>Longest travel streak</span><strong>{int(stats.get("longest_travel_streak_days") or 0)} days</strong></div>
     </section>
     <section class="grid">
       <div class="panel">
@@ -3163,6 +4578,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     const rangePreset = document.getElementById("rangePreset");
     const travelSplit = document.getElementById("travelSplit");
     const travelLegend = document.getElementById("travelLegend");
+    const filterToggle = document.getElementById("filterToggle");
     const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }}[char]));
     const tokenQuery = () => {{
       const token = new URLSearchParams(window.location.search).get("token");
@@ -3308,6 +4724,13 @@ def render_activity_dashboard_html(summary: dict) -> str:
     document.getElementById("endDate").addEventListener("input", () => {{ rangePreset.value = ""; }});
     metric.addEventListener("change", renderCalendar);
     travelSplit.addEventListener("change", () => {{ renderCalendar(); renderDaily(); }});
+    filterToggle.addEventListener("click", () => {{
+      const header = filterToggle.closest("header");
+      const expanded = !header.classList.contains("filters-open");
+      header.classList.toggle("filters-open", expanded);
+      filterToggle.setAttribute("aria-expanded", String(expanded));
+      filterToggle.textContent = expanded ? "Hide filters" : "Show filters";
+    }});
 {OWNTRACKS_NAV_SCRIPT}
     renderCalendar();
     renderPlaces();
@@ -4141,6 +5564,11 @@ def render_stop_index_html(summary: dict) -> str:
       margin: 0 0 8px;
     }}
 {OWNTRACKS_NAV_CSS}
+    .mobile-filter-toggle {{
+      display: none;
+      margin-top: 10px;
+      width: 100%;
+    }}
     .subtle {{
       color: var(--muted);
       font-size: 13px;
@@ -4160,7 +5588,7 @@ def render_stop_index_html(summary: dict) -> str:
       font-weight: 800;
       gap: 4px;
     }}
-    input {{
+    input, select {{
       border: 1px solid var(--border);
       border-radius: 6px;
       color: var(--ink);
@@ -4338,6 +5766,71 @@ def render_stop_index_html(summary: dict) -> str:
       padding: 8px;
       white-space: pre-wrap;
     }}
+    .media-grid {{
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+      margin-top: 8px;
+    }}
+    .media-card {{
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      overflow: hidden;
+      background: #f9fafb;
+    }}
+    .media-card img {{
+      aspect-ratio: 4 / 3;
+      display: block;
+      object-fit: cover;
+      width: 100%;
+    }}
+    .media-file {{
+      align-items: center;
+      aspect-ratio: 4 / 3;
+      color: var(--muted);
+      display: flex;
+      font-size: 12px;
+      font-weight: 800;
+      justify-content: center;
+      padding: 8px;
+      text-align: center;
+    }}
+    .media-caption {{
+      color: #374151;
+      font-size: 12px;
+      line-height: 1.35;
+      padding: 6px;
+      overflow-wrap: anywhere;
+    }}
+    .media-actions {{
+      display: flex;
+      gap: 6px;
+      padding: 0 6px 6px;
+    }}
+    .media-actions button, .media-actions .button {{
+      flex: 1;
+      font-size: 11px;
+      min-height: 28px;
+      padding: 4px 6px;
+    }}
+    .media-upload {{
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 7px;
+      display: grid;
+      gap: 7px;
+      margin-top: 8px;
+      padding: 8px;
+    }}
+    .media-upload input[type="file"] {{
+      min-height: 0;
+      padding: 5px;
+    }}
+    .media-status {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }}
     .empty {{
       color: var(--muted);
       font-size: 14px;
@@ -4345,10 +5838,26 @@ def render_stop_index_html(summary: dict) -> str:
     }}
     @media (max-width: 800px) {{
       header {{
-        position: static;
+        max-height: 52vh;
+        overflow-y: auto;
+        padding: 10px 12px;
+      }}
+      h1 {{
+        font-size: 18px;
+        margin-bottom: 4px;
+      }}
+      .subtle {{
+        font-size: 12px;
+      }}
+      .mobile-filter-toggle {{
+        display: inline-flex;
+      }}
+      header:not(.filters-open) .filters {{
+        display: none;
       }}
       .filters {{
         grid-template-columns: 1fr;
+        margin-top: 10px;
       }}
       .stats {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4374,6 +5883,7 @@ def render_stop_index_html(summary: dict) -> str:
     <h1>{title}</h1>
     <div class="subtle">{escape(scope.get("start") or "no data")} to {escape(scope.get("end") or "no data")} · built from raw OwnTracks logs and saved stop reviews</div>
     {nav}
+    <button id="filterToggle" class="mobile-filter-toggle secondary" type="button" aria-controls="rangeForm" aria-expanded="false">Show filters</button>
     <form id="rangeForm" class="filters">
       <label>Search
         <input id="search" name="q" placeholder="doctor, dentist, office, tag, note, date">
@@ -4409,6 +5919,7 @@ def render_stop_index_html(summary: dict) -> str:
     const rangeForm = document.getElementById("rangeForm");
     const refreshAliases = document.getElementById("refreshAliases");
     const aliasStatus = document.getElementById("aliasStatus");
+    const filterToggle = document.getElementById("filterToggle");
     const searchAliases = data.search_aliases || {{}};
     let activeKey = "";
     const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{
@@ -4424,6 +5935,11 @@ def render_stop_index_html(summary: dict) -> str:
       return token ? `?token=${{encodeURIComponent(token)}}` : "";
     }};
     const mapHref = (visit) => `/owntracks/map/${{encodeURIComponent(visit.date)}}${{tokenQuery()}}`;
+    const mediaHref = (visit, media) => {{
+      if (!media || !media.filename) return "#";
+      const token = tokenQuery();
+      return `/owntracks/media/${{encodeURIComponent(visit.date)}}/${{encodeURIComponent(media.filename)}}${{token}}`;
+    }};
 {OWNTRACKS_NAV_SCRIPT}
     const termsForText = (value) => normalize(value).split(/[^a-z0-9:_-]+/).filter(Boolean);
     const expandTerms = (parts) => {{
@@ -4454,6 +5970,7 @@ def render_stop_index_html(summary: dict) -> str:
         visit.motion,
         visit.motion_mode,
         visit.source,
+        ...(visit.media || []).flatMap((media) => [media.caption, media.original_name, media.content_type]),
         ...(visit.tags || []),
       ]),
     ];
@@ -4512,6 +6029,69 @@ def render_stop_index_html(summary: dict) -> str:
     const renderTags = (tags) => (tags || []).length
       ? `<div class="tags">${{tags.map((tag) => `<span class="tag">${{escapeHtml(tag)}}</span>`).join("")}}</div>`
       : "";
+    const visitMediaKey = (visit) => `${{visit.date || ""}}-${{visit.id || ""}}`;
+    const renderMedia = (visit) => {{
+      const media = visit.media || [];
+      if (!media.length) return "";
+      return `<div class="media-grid">${{media.map((item) => {{
+        const href = mediaHref(visit, item);
+        const preview = item.kind === "image" || String(item.content_type || "").startsWith("image/")
+          ? `<a href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer"><img src="${{escapeHtml(href)}}" alt="${{escapeHtml(item.caption || item.original_name || "attachment")}}"></a>`
+          : `<a class="media-file" href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer">${{escapeHtml(item.original_name || "Attachment")}}</a>`;
+        return `<div class="media-card">
+          ${{preview}}
+          ${{item.caption ? `<div class="media-caption">${{escapeHtml(item.caption)}}</div>` : ""}}
+          <div class="media-actions">
+            <a class="button secondary" href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer">Open</a>
+            <button type="button" class="secondary" data-delete-media="${{escapeHtml(item.id || "")}}" data-visit-id="${{escapeHtml(visit.id || "")}}" data-visit-date="${{escapeHtml(visit.date || "")}}">Delete</button>
+          </div>
+        </div>`;
+      }}).join("")}}</div>`;
+    }};
+    const uploadEndpoint = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/media${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    const deleteMediaEndpoint = uploadEndpoint;
+    const uploadVisitMedia = async (visit) => {{
+      const key = visitMediaKey(visit);
+      const fileInput = details.querySelector(`[data-media-file="${{CSS.escape(key)}}"]`);
+      const captionInput = details.querySelector(`[data-media-caption="${{CSS.escape(key)}}"]`);
+      const status = details.querySelector(`[data-media-status="${{CSS.escape(key)}}"]`);
+      const file = fileInput?.files?.[0];
+      if (!file) {{
+        if (status) status.textContent = "Choose a file first.";
+        return;
+      }}
+      const form = new FormData();
+      form.append("date", visit.date || "");
+      form.append("id", visit.id || "");
+      form.append("lat", visit.lat ?? "");
+      form.append("lon", visit.lon ?? "");
+      form.append("caption", captionInput?.value || "");
+      form.append("file", file);
+      if (status) status.textContent = "Uploading...";
+      const response = await fetch(uploadEndpoint(), {{ method: "POST", body: form }});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+      visit.media = [...(visit.media || []), payload.media];
+      if (fileInput) fileInput.value = "";
+      if (captionInput) captionInput.value = "";
+      if (status) status.textContent = "Uploaded.";
+      renderDetails((data.places || []).find((place) => place.key === activeKey));
+    }};
+    const deleteVisitMedia = async (visit, mediaId) => {{
+      if (!window.confirm("Delete this attachment?")) return;
+      const response = await fetch(deleteMediaEndpoint(), {{
+        method: "DELETE",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ date: visit.date, id: visit.id, media_id: mediaId }}),
+      }});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+      visit.media = (visit.media || []).filter((item) => item.id !== mediaId);
+      renderDetails((data.places || []).find((place) => place.key === activeKey));
+    }};
     const setActive = (key) => {{
       activeKey = key;
       renderPlaces();
@@ -4559,6 +6139,7 @@ def render_stop_index_html(summary: dict) -> str:
                 <div>
                   <div class="visit-date">${{escapeHtml(visit.date)}} · ${{escapeHtml(visit.duration || formatMinutes(visit.duration_minutes))}}</div>
                   <div class="subtle">${{escapeHtml(visit.start)}} to ${{escapeHtml(visit.end)}} · ${{escapeHtml(visit.motion_mode || "unknown")}} · ${{escapeHtml(visit.points || 0)}} points</div>
+                  <div class="subtle">${{escapeHtml(visit.source || "visit")}} · confidence ${{escapeHtml(visit.confidence || "unknown")}} · entry ${{escapeHtml(visit.entry_status || "sample")}} · exit ${{escapeHtml(visit.exit_status || "sample")}}</div>
                 </div>
                 <div class="visit-actions">
                   <a class="button secondary" href="${{escapeHtml(mapHref(visit))}}">Day map</a>
@@ -4567,10 +6148,46 @@ def render_stop_index_html(summary: dict) -> str:
               </div>
               ${{renderTags(visit.tags || [])}}
               ${{visit.note ? `<div class="note">${{escapeHtml(visit.note)}}</div>` : ""}}
+              ${{renderMedia(visit)}}
+              <div class="media-upload">
+                <input type="file" data-media-file="${{escapeHtml(visitMediaKey(visit))}}" accept="image/*,.pdf">
+                <input type="text" data-media-caption="${{escapeHtml(visitMediaKey(visit))}}" placeholder="Caption">
+                <button type="button" class="secondary" data-upload-media="${{escapeHtml(visitMediaKey(visit))}}">Attach media</button>
+                <div class="media-status" data-media-status="${{escapeHtml(visitMediaKey(visit))}}"></div>
+              </div>
             </article>
           `).join("")}}
         </div>
       `;
+      details.querySelectorAll("[data-upload-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const visit = (place.visits || []).find((item) => visitMediaKey(item) === button.dataset.uploadMedia);
+          if (!visit) return;
+          button.disabled = true;
+          try {{
+            await uploadVisitMedia(visit);
+          }} catch (error) {{
+            const status = details.querySelector(`[data-media-status="${{CSS.escape(visitMediaKey(visit))}}"]`);
+            if (status) status.textContent = `Upload failed: ${{error.message || error}}`;
+          }} finally {{
+            button.disabled = false;
+          }}
+        }});
+      }});
+      details.querySelectorAll("[data-delete-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const visit = (place.visits || []).find((item) => item.id === button.dataset.visitId && item.date === button.dataset.visitDate);
+          if (!visit) return;
+          button.disabled = true;
+          try {{
+            await deleteVisitMedia(visit, button.dataset.deleteMedia || "");
+          }} catch (error) {{
+            button.textContent = `Failed`;
+            button.title = String(error.message || error);
+            button.disabled = false;
+          }}
+        }});
+      }});
     }};
     rangeForm.addEventListener("submit", (event) => {{
       event.preventDefault();
@@ -4581,6 +6198,13 @@ def render_stop_index_html(summary: dict) -> str:
       if (end) params.set("end", end); else params.delete("end");
       if (search.value.trim()) params.set("q", search.value.trim()); else params.delete("q");
       window.location.href = `/owntracks/stops${{params.toString() ? "?" + params.toString() : ""}}`;
+    }});
+    filterToggle.addEventListener("click", () => {{
+      const header = filterToggle.closest("header");
+      const expanded = !header.classList.contains("filters-open");
+      header.classList.toggle("filters-open", expanded);
+      filterToggle.setAttribute("aria-expanded", String(expanded));
+      filterToggle.textContent = expanded ? "Hide filters" : "Show filters";
     }});
     const aliasEndpoint = () => {{
       const token = new URLSearchParams(window.location.search).get("token");
@@ -4618,6 +6242,229 @@ def render_stop_index_html(summary: dict) -> str:
 </html>"""
 
 
+def render_trip_html(summary: dict) -> str:
+    title = escape(summary["title"])
+    payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
+    nav = owntracks_nav_html("trips", date_text=str(summary.get("date") or ""))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: light; --border:#d1d5db; --ink:#111827; --muted:#4b5563; --panel:#fff; --soft:#f3f4f6; --accent:#0f766e; }}
+    * {{ box-sizing: border-box; }}
+    body {{ background:#f8fafc; color:var(--ink); font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; margin:0; }}
+    header {{ background:var(--panel); border-bottom:1px solid var(--border); padding:14px 18px; position:sticky; top:0; z-index:10; }}
+    h1 {{ font-size:20px; line-height:1.2; margin:0 0 8px; }}
+{OWNTRACKS_NAV_CSS}
+    .subtle {{ color:var(--muted); font-size:13px; line-height:1.4; }}
+    .controls {{ align-items:end; display:grid; gap:10px; grid-template-columns:minmax(135px,160px) minmax(180px,1fr) minmax(180px,1fr) auto; margin-top:12px; }}
+    label {{ color:#374151; display:grid; font-size:12px; font-weight:800; gap:4px; }}
+    input, select {{ border:1px solid var(--border); border-radius:6px; color:var(--ink); font:inherit; min-height:36px; padding:7px 9px; width:100%; }}
+    button, .button {{ align-items:center; background:var(--ink); border:0; border-radius:6px; color:white; cursor:pointer; display:inline-flex; font:inherit; font-size:13px; font-weight:800; justify-content:center; min-height:36px; padding:7px 11px; text-decoration:none; }}
+    main {{ display:grid; gap:14px; padding:14px; }}
+    .answer, .timeline {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}
+    .answer {{ display:grid; gap:10px; grid-template-columns:repeat(4,minmax(0,1fr)); padding:14px; }}
+    .metric {{ background:var(--soft); border:1px solid #e5e7eb; border-radius:7px; padding:10px; }}
+    .metric span {{ color:var(--muted); display:block; font-size:11px; font-weight:850; text-transform:uppercase; }}
+    .metric strong {{ display:block; font-size:18px; margin-top:3px; overflow-wrap:anywhere; }}
+    .wide {{ grid-column:span 2; }}
+    .places-panel {{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:8px;
+      overflow:hidden;
+    }}
+    .places-panel-head {{
+      border-bottom:1px solid var(--border);
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      padding:12px 14px;
+    }}
+    .places-panel-head h2 {{
+      font-size:16px;
+      margin:0;
+    }}
+    .place-grid {{
+      display:grid;
+      gap:8px;
+      grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+      padding:14px;
+    }}
+    .place-card {{
+      background:var(--soft);
+      border:1px solid #e5e7eb;
+      border-radius:7px;
+      padding:10px;
+    }}
+    .place-card strong {{
+      display:block;
+      font-size:13px;
+      overflow-wrap:anywhere;
+    }}
+    .place-card .meta {{
+      color:var(--muted);
+      font-size:11px;
+      line-height:1.35;
+      margin-top:4px;
+    }}
+    .tag-row {{
+      display:flex;
+      flex-wrap:wrap;
+      gap:4px;
+      margin-top:6px;
+    }}
+    .tag {{
+      background:#e0f2fe;
+      border-radius:999px;
+      color:#075985;
+      font-size:11px;
+      font-weight:800;
+      padding:2px 6px;
+    }}
+    .timeline-head {{ align-items:center; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; padding:12px 14px; }}
+    .timeline-head h2 {{ font-size:16px; margin:0; }}
+    table {{ border-collapse:collapse; width:100%; }}
+    th, td {{ border-bottom:1px solid #e5e7eb; font-size:13px; padding:8px 10px; text-align:left; vertical-align:top; }}
+    th {{ background:#f9fafb; color:#374151; font-size:11px; font-weight:850; text-transform:uppercase; }}
+    tr.hit {{ background:#ecfdf5; }}
+    tr.depart {{ background:#eff6ff; }}
+    tr.arrive {{ background:#fef3c7; }}
+    code {{ background:#f3f4f6; border-radius:4px; padding:1px 4px; }}
+    @media (max-width:800px) {{ header {{ max-height:52vh; overflow:auto; padding:10px 12px; }} .controls {{ grid-template-columns:1fr; }} .answer {{ grid-template-columns:1fr; }} .wide {{ grid-column:auto; }} .timeline {{ overflow-x:auto; }} table {{ min-width:780px; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{title}</h1>
+    <div class="subtle">Deterministic route timing from raw OwnTracks samples, waypoint radii, and saved occurrence reviews.</div>
+    {nav}
+    <form id="tripForm" class="controls">
+      <label>Date <input id="tripDate" type="date"></label>
+      <label>From <select id="origin"></select></label>
+      <label>To <select id="destination"></select></label>
+      <button type="submit">Run</button>
+    </form>
+  </header>
+  <main>
+    <section id="answer" class="answer"></section>
+    <section class="places-panel">
+      <div class="places-panel-head">
+        <h2>Trip Places</h2>
+        <span class="subtle" id="placeCount"></span>
+      </div>
+      <div id="placeGrid" class="place-grid"></div>
+    </section>
+    <section class="timeline">
+      <div class="timeline-head">
+        <h2>Raw Timeline</h2>
+        <span id="timelineCount" class="subtle"></span>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>Line</th><th>Mode</th><th>Flag</th><th>Nearest place</th><th>Distance</th></tr></thead>
+        <tbody id="timeline"></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const data = {payload};
+{OWNTRACKS_NAV_SCRIPT}
+    const origin = document.getElementById("origin");
+    const destination = document.getElementById("destination");
+    const tripDate = document.getElementById("tripDate");
+    const answer = document.getElementById("answer");
+    const placeGrid = document.getElementById("placeGrid");
+    const placeCount = document.getElementById("placeCount");
+    const timeline = document.getElementById("timeline");
+    const timelineCount = document.getElementById("timelineCount");
+    const escapeHtml = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[char]));
+    const placeSourceLabel = (place) => {{
+      const sources = Array.isArray(place.sources) ? place.sources : [];
+      if (!sources.length) return "place";
+      if (sources.includes("review")) return "saved trip place";
+      return sources.join(", ");
+    }};
+    const placeDisplayName = (place) => place.display_name || place.name || "";
+    const optionHtml = () => (data.places || []).map((place) => `<option value="${{escapeHtml(place.key)}}">${{escapeHtml(placeDisplayName(place))}} · ${{escapeHtml(place.radius_m)}}m · ${{escapeHtml(placeSourceLabel(place))}}</option>`).join("");
+    const renderPlaces = () => {{
+      const places = data.places || [];
+      placeCount.textContent = `${{places.length}} places`;
+      if (!places.length) {{
+        placeGrid.innerHTML = '<div class="place-card"><strong>No trip places</strong><div class="meta">Only waypoint, transition, and explicit saved trip places appear here.</div></div>';
+        return;
+      }}
+      placeGrid.innerHTML = places.map((place) => `
+        <div class="place-card">
+          <strong>${{escapeHtml(placeDisplayName(place))}}</strong>
+          <div class="meta">${{escapeHtml(place.radius_m)}} m radius · ${{escapeHtml(placeSourceLabel(place))}}</div>
+          <div class="tag-row">${{(Array.isArray(place.sources) ? place.sources : []).map((source) => `<span class="tag">${{escapeHtml(source)}}</span>`).join("")}}</div>
+        </div>
+      `).join("");
+    }};
+    const tokenQuery = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return token ? `&token=${{encodeURIComponent(token)}}` : "";
+    }};
+    const mapLink = () => `/owntracks/map/${{encodeURIComponent(data.date)}}${{window.location.search.includes("token=") ? "?" + new URLSearchParams(window.location.search).toString() : ""}}`;
+    const renderAnswer = () => {{
+      const query = data.query || {{}};
+      if (!query.ok) {{
+        answer.innerHTML = `<div class="metric wide"><span>No result</span><strong>${{escapeHtml(query.reason || "Select places and run.")}}</strong></div>`;
+        return;
+      }}
+      const last = query.last_origin;
+      answer.innerHTML = `
+        <div class="metric"><span>Preferred duration</span><strong>${{escapeHtml(query.duration)}}</strong></div>
+        <div class="metric"><span>Departure${{query.departure.corrected ? " corrected" : query.departure.estimated ? " estimate" : ""}}</span><strong>${{escapeHtml(query.departure.time)}}<br><code>line ${{escapeHtml(query.departure.line)}}</code><br>${{escapeHtml(query.departure.source || "sample")}}</strong></div>
+        <div class="metric"><span>Arrival${{query.arrival.corrected ? " corrected" : query.arrival.estimated ? " estimate" : ""}}</span><strong>${{escapeHtml(query.arrival.time)}}<br><code>line ${{escapeHtml(query.arrival.line)}}</code><br>${{escapeHtml(query.arrival.source || "sample")}}</strong></div>
+        <div class="metric"><span>Arrival distance</span><strong>${{escapeHtml(query.arrival.distance_to_destination_m)}} m</strong></div>
+        <div class="metric wide"><span>Rule</span><strong>${{escapeHtml(query.heuristic)}}</strong></div>
+        <div class="metric"><span>Last origin sample</span><strong>${{last ? escapeHtml(last.time) + "<br>" + escapeHtml(last.duration) : "none"}}</strong></div>
+        <div class="metric"><span>Map</span><strong><a href="${{escapeHtml(mapLink())}}">Open day map</a></strong></div>
+      `;
+    }};
+    const renderTimeline = () => {{
+      const departLine = data.query?.departure?.line;
+      const arriveLine = data.query?.arrival?.line;
+      timelineCount.textContent = `${{(data.timeline || []).length}} samples`;
+      timeline.innerHTML = (data.timeline || []).map((row) => {{
+        const cls = row.line === departLine ? "depart" : row.line === arriveLine ? "arrive" : "";
+        return `<tr class="${{cls}}">
+          <td>${{escapeHtml(row.time)}}</td>
+          <td><code>${{escapeHtml(row.line)}}</code></td>
+          <td>${{escapeHtml(row.motion_mode)}}</td>
+          <td>${{escapeHtml(row.t || "")}}</td>
+          <td>${{escapeHtml(row.nearest_place || "")}}</td>
+          <td>${{row.nearest_distance_m == null ? "" : escapeHtml(row.nearest_distance_m + " m")}}</td>
+        </tr>`;
+      }}).join("");
+    }};
+    origin.innerHTML = optionHtml();
+    destination.innerHTML = optionHtml();
+    origin.value = data.selected?.origin_key || "";
+    destination.value = data.selected?.destination_key || "";
+    tripDate.value = data.date || "";
+    document.getElementById("tripForm").addEventListener("submit", (event) => {{
+      event.preventDefault();
+      const params = new URLSearchParams();
+      if (tripDate.value) params.set("date", tripDate.value);
+      if (origin.value) params.set("from", origin.value);
+      if (destination.value) params.set("to", destination.value);
+      const token = new URLSearchParams(window.location.search).get("token");
+      if (token) params.set("token", token);
+      window.location.href = `/owntracks/trips?${{params.toString()}}`;
+    }});
+    renderAnswer();
+    renderPlaces();
+    renderTimeline();
+  </script>
+</body>
+</html>"""
+
+
 def render_leaflet_map_html(plan: dict) -> str:
     title = f"OwnTracks map - {plan['date']}"
     track = [
@@ -4630,15 +6477,43 @@ def render_leaflet_map_html(plan: dict) -> str:
             "alias": stop.get("alias", ""),
             "name": stop.get("reviewed_name") or stop.get("name") or "unnamed stop",
             "id": stop.get("id", ""),
+            "start_line": stop.get("start_line"),
+            "end_line": stop.get("end_line"),
             "lat": stop.get("lat"),
             "lon": stop.get("lon"),
             "start": stop.get("start", ""),
             "end": stop.get("end", ""),
+            "start_timestamp": stop.get("start_timestamp"),
+            "end_timestamp": stop.get("end_timestamp"),
+            "visit_start_timestamp": stop.get("visit_start_timestamp", stop.get("start_timestamp")),
+            "visit_end_timestamp": stop.get("visit_end_timestamp", stop.get("end_timestamp")),
+            "entry_display": stop.get("entry_display") or stop.get("start", ""),
+            "exit_display": stop.get("exit_display") or stop.get("end", ""),
+            "entry_status": stop.get("entry_status"),
+            "exit_status": stop.get("exit_status"),
+            "entry_override": stop.get("entry_override", ""),
+            "exit_override": stop.get("exit_override", ""),
+            "entry_window": stop.get("entry_window"),
+            "exit_window": stop.get("exit_window"),
+            "raw_start": stop.get("raw_start", stop.get("start", "")),
+            "raw_end": stop.get("raw_end", stop.get("end", "")),
+            "raw_start_timestamp": stop.get("raw_start_timestamp"),
+            "raw_end_timestamp": stop.get("raw_end_timestamp"),
+            "visit_duration": stop.get("visit_duration") or stop.get("duration", ""),
+            "visit_duration_minutes": stop.get("visit_duration_minutes", stop.get("duration_minutes")),
+            "visit_source": stop.get("visit_source") or "detected-stop",
+            "confidence": stop.get("confidence") or "unknown",
+            "evidence": stop.get("evidence") or {},
+            "radius_m": stop.get("radius_m") or DEFAULT_VISIT_RADIUS_M,
+            "place": bool(stop.get("place")),
             "duration": stop.get("duration", ""),
             "points": stop.get("points", ""),
             "maps": stop.get("maps", ""),
             "tags": stop.get("user_tags", []),
             "note": stop.get("user_note", ""),
+            "media": [item for item in stop.get("media", []) if isinstance(item, dict)],
+            "previous_travel": stop.get("previous_travel"),
+            "next_travel": stop.get("next_travel"),
         }
         for stop in plan.get("candidate_stops", [])
         if stop.get("lat") is not None and stop.get("lon") is not None
@@ -4671,7 +6546,9 @@ def render_leaflet_map_html(plan: dict) -> str:
             "rawSampledTrack": plan.get("raw_sampled_track", plan.get("sampled_track", [])),
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
+            "possibleMissedStops": plan.get("possible_missed_stops", []),
             "namedPlaces": named_places,
+            "travelSegments": plan.get("travel_segments", []),
             "rideSegments": plan.get("ride_segments", []),
             "motionSummary": motion_summary,
         },
@@ -4787,6 +6664,27 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-size: 12px;
       font-weight: 700;
       margin-top: 7px;
+    }}
+    .selected-duration {{
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      color: #334155;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-top: 8px;
+      padding: 8px;
+    }}
+    .selected-duration strong {{
+      color: #111827;
+      display: block;
+      font-size: 13px;
+      margin-bottom: 3px;
+    }}
+    .selected-duration button {{
+      margin-top: 6px;
+      min-height: 28px;
+      padding: 4px 8px;
     }}
     .stop-list {{
       margin-top: 8px;
@@ -5044,6 +6942,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-weight: 750;
       padding: 3px 5px;
     }}
+    .possible-stop-label {{
+      background: #f59e0b;
+      border: 1px solid #92400e;
+      border-radius: 4px;
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+      padding: 3px 5px;
+    }}
     .empty {{
       background: white;
       border-radius: 8px;
@@ -5096,10 +7003,96 @@ def render_leaflet_map_html(plan: dict) -> str:
       min-height: 62px;
       resize: vertical;
     }}
+    .stop-popup .checkbox-row {{
+      align-items: center;
+      display: flex;
+      gap: 6px;
+    }}
+    .stop-popup .checkbox-row input {{
+      width: auto;
+    }}
     .popup-meta {{
       color: #4b5563;
       font-size: 12px;
       line-height: 1.4;
+    }}
+    .media-grid {{
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+      margin-top: 8px;
+    }}
+    .media-card {{
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      overflow: hidden;
+    }}
+    .media-card img {{
+      aspect-ratio: 4 / 3;
+      display: block;
+      object-fit: cover;
+      width: 100%;
+    }}
+    .media-file {{
+      align-items: center;
+      aspect-ratio: 4 / 3;
+      color: #4b5563;
+      display: flex;
+      font-size: 11px;
+      font-weight: 800;
+      justify-content: center;
+      padding: 6px;
+      text-align: center;
+    }}
+    .media-caption {{
+      color: #374151;
+      font-size: 11px;
+      line-height: 1.25;
+      padding: 5px;
+      overflow-wrap: anywhere;
+    }}
+    .media-actions {{
+      display: flex;
+      gap: 5px;
+      padding: 0 5px 5px;
+    }}
+    .media-actions button, .media-actions a {{
+      align-items: center;
+      background: #e5e7eb;
+      border-radius: 5px;
+      color: #111827;
+      display: inline-flex;
+      flex: 1;
+      font-size: 10px;
+      font-weight: 800;
+      justify-content: center;
+      min-height: 24px;
+      padding: 3px 5px;
+      text-decoration: none;
+    }}
+    .media-upload {{
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 7px;
+      display: grid;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 7px;
+    }}
+    .media-upload input[type="file"] {{
+      background: white;
+      font-size: 11px;
+      padding: 5px;
+    }}
+    .media-upload input[type="text"] {{
+      font-size: 12px;
+    }}
+    .media-status {{
+      color: #4b5563;
+      font-size: 11px;
+      font-weight: 750;
+      min-height: 14px;
     }}
     .segment-popup {{
       min-width: 210px;
@@ -5111,6 +7104,34 @@ def render_leaflet_map_html(plan: dict) -> str:
     }}
     .segment-popup .popup-meta div {{
       margin-top: 2px;
+    }}
+    .segment-popup label {{
+      color: #374151;
+      display: block;
+      font-size: 11px;
+      font-weight: 800;
+      margin: 8px 0 3px;
+    }}
+    .segment-popup input,
+    .segment-popup textarea {{
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      box-sizing: border-box;
+      font: inherit;
+      padding: 6px;
+      width: 100%;
+    }}
+    .segment-popup textarea {{
+      min-height: 62px;
+      resize: vertical;
+    }}
+    .segment-popup .checkbox-row {{
+      align-items: center;
+      display: flex;
+      gap: 6px;
+    }}
+    .segment-popup .checkbox-row input {{
+      width: auto;
     }}
     @media (max-width: 700px) {{
       .tools {{
@@ -5148,15 +7169,19 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="nextDay" type="button" class="secondary">Next day</button>
       </div>
       <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
+      <div id="selectedDuration" class="selected-duration">Open a point popup and use Set start / Set end to calculate elapsed time.</div>
       <div class="row" style="margin-top: 8px">
         <button id="toggleEdges" type="button" class="secondary">Hide edges</button>
         <button id="toggleArrows" type="button" class="secondary">Hide arrows</button>
       </div>
+      <button id="toggleTravelTimes" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show travel times</button>
       <div class="row" style="margin-top: 8px">
         <button id="toggleStopLabels" type="button" class="secondary">Hide stop labels</button>
-        <button id="togglePlaceLabels" type="button" class="secondary">Hide point labels</button>
+        <button id="togglePlaceLabels" type="button" class="secondary">Show transition points</button>
       </div>
       <button id="toggleFilteredPoints" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show filtered points</button>
+      <button id="togglePossibleStops" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show possible missed stops</button>
+      <div id="possibleStopList" class="stop-list"></div>
       <div class="profile">
         <div class="profile-title">Route animation</div>
         <div class="row">
@@ -5202,13 +7227,14 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="selectNearby" type="button">Select nearby</button>
         <button id="groupSelected" type="button">Group selected</button>
       </div>
-      <label for="bulkName">Name for selected stops</label>
-      <input id="bulkName" placeholder="Name selected stops">
+      <label for="bulkName">Name for selected visits</label>
+      <input id="bulkName" placeholder="Name selected visits">
       <div class="row">
         <button id="applyName" type="button">Apply</button>
       </div>
+      <div class="profile-title" style="margin-top: 10px">Visits</div>
       <div id="stopList" class="stop-list"></div>
-      <button id="saveChanges" type="button" style="margin-top: 8px; width: 100%">Save stop changes</button>
+      <button id="saveChanges" type="button" style="margin-top: 8px; width: 100%">Save visit changes</button>
       <div id="saveFeedback" class="status"></div>
       <label id="commandsLabel" for="commands">Telegram fallback</label>
       <textarea id="commands" readonly></textarea>
@@ -5221,9 +7247,17 @@ def render_leaflet_map_html(plan: dict) -> str:
     const data = {payload};
 {OWNTRACKS_NAV_SCRIPT}
     const selected = new Set();
+    const selectedAnchors = new Map();
+    const durationAnchors = new Map();
+    let durationStartKey = null;
+    let durationEndKey = null;
     const originalNames = new Map(data.stops.map((stop) => [stop.alias, stop.name]));
     const originalTags = new Map(data.stops.map((stop) => [stop.alias, (stop.tags || []).join(" ")]));
     const originalNotes = new Map(data.stops.map((stop) => [stop.alias, stop.note || ""]));
+    const originalEntryTimes = new Map(data.stops.map((stop) => [stop.alias, stop.entry_override || ""]));
+    const originalExitTimes = new Map(data.stops.map((stop) => [stop.alias, stop.exit_override || ""]));
+    const originalRadii = new Map(data.stops.map((stop) => [stop.alias, String(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})]));
+    const originalPlaces = new Map(data.stops.map((stop) => [stop.alias, Boolean(stop.place)]));
     const tools = document.getElementById("tools");
     const toggleToolsButton = document.getElementById("toggleTools");
     const commands = document.getElementById("commands");
@@ -5254,15 +7288,20 @@ def render_leaflet_map_html(plan: dict) -> str:
     routePointRenderer.addTo(map);
     const edgeLayer = L.layerGroup().addTo(map);
     const arrowLayer = L.layerGroup().addTo(map);
+    const travelTimeLayer = L.layerGroup();
+    const placeLayer = L.layerGroup();
     const routeLayer = L.layerGroup().addTo(map);
     const filteredPointLayer = L.layerGroup();
+    const possibleStopLayer = L.layerGroup();
     const animationLayer = L.layerGroup().addTo(map);
     let activeMotionMode = "all";
     let edgesVisible = true;
     let arrowsVisible = true;
+    let travelTimesVisible = false;
     let stopLabelsVisible = true;
-    let placeLabelsVisible = true;
+    let placeLabelsVisible = false;
     let filteredPointsVisible = false;
+    let possibleStopsVisible = false;
     let routeColorMode = "speed";
     let profileAxis = "distance";
     let routeAnimationFrame = null;
@@ -5330,7 +7369,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       document.getElementById("nextDay").disabled = !canNavigate;
     }};
     const updateStatus = () => {{
-      status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · stops ${{data.stops.length}}${{clipboardStatus}}`;
+      status.textContent = `leaflet z${{map.getZoom()}} · selected ${{selected.size}} · visits ${{data.stops.length}}${{clipboardStatus}}`;
     }};
     const distanceMeters = (a, b) => {{
       const radius = 6371008.8;
@@ -5410,24 +7449,115 @@ def render_leaflet_map_html(plan: dict) -> str:
       stop.name !== originalNames.get(stop.alias)
       || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
       || (stop.note || "") !== originalNotes.get(stop.alias)
+      || (stop.entry_override || "") !== originalEntryTimes.get(stop.alias)
+      || (stop.exit_override || "") !== originalExitTimes.get(stop.alias)
+      || String(stop.radius_m || {DEFAULT_VISIT_RADIUS_M}) !== originalRadii.get(stop.alias)
+      || Boolean(stop.place) !== originalPlaces.get(stop.alias)
     );
     const owntracksStopsEndpoint = () => {{
       const token = new URLSearchParams(window.location.search).get("token");
       return `/owntracks/stops${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    const owntracksMediaEndpoint = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/media${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    const mediaHref = (media) => {{
+      if (!media || !media.filename) return "#";
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/media/${{encodeURIComponent(data.date)}}/${{encodeURIComponent(media.filename)}}${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
+    const mediaKey = (stop) => `${{stop.alias}}-${{stop.id}}`;
+    const renderMediaGallery = (stop) => {{
+      const media = stop.media || [];
+      if (!media.length) return "";
+      return `<div class="media-grid">${{media.map((item) => {{
+        const href = mediaHref(item);
+        const preview = item.kind === "image" || String(item.content_type || "").startsWith("image/")
+          ? `<a href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer"><img src="${{escapeHtml(href)}}" alt="${{escapeHtml(item.caption || item.original_name || "attachment")}}"></a>`
+          : `<a class="media-file" href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer">${{escapeHtml(item.original_name || "Attachment")}}</a>`;
+        return `<div class="media-card">
+          ${{preview}}
+          ${{item.caption ? `<div class="media-caption">${{escapeHtml(item.caption)}}</div>` : ""}}
+          <div class="media-actions">
+            <a href="${{escapeHtml(href)}}" target="_blank" rel="noreferrer">Open</a>
+            <button type="button" data-delete-media="${{escapeHtml(item.id || "")}}" data-media-stop="${{escapeHtml(stop.alias)}}">Delete</button>
+          </div>
+        </div>`;
+      }}).join("")}}</div>`;
+    }};
+    const renderMediaUpload = (stop, scope) => {{
+      const key = `${{scope}}-${{mediaKey(stop)}}`;
+      return `<div class="media-upload">
+        <input type="file" data-media-file="${{escapeHtml(key)}}" accept="image/*,.pdf">
+        <input type="text" data-media-caption="${{escapeHtml(key)}}" placeholder="Caption">
+        <button type="button" class="secondary" data-upload-media="${{escapeHtml(stop.alias)}}" data-media-key="${{escapeHtml(key)}}">Attach media</button>
+        <div class="media-status" data-media-status="${{escapeHtml(key)}}"></div>
+      </div>`;
+    }};
+    const uploadStopMedia = async (stop, key) => {{
+      const fileInput = document.querySelector(`[data-media-file="${{CSS.escape(key)}}"]`);
+      const captionInput = document.querySelector(`[data-media-caption="${{CSS.escape(key)}}"]`);
+      const statusEl = document.querySelector(`[data-media-status="${{CSS.escape(key)}}"]`);
+      const file = fileInput?.files?.[0];
+      if (!file) {{
+        if (statusEl) statusEl.textContent = "Choose a file first.";
+        return false;
+      }}
+      const form = new FormData();
+      form.append("date", data.date);
+      form.append("id", stop.id);
+      form.append("lat", stop.lat);
+      form.append("lon", stop.lon);
+      form.append("caption", captionInput?.value || "");
+      form.append("file", file);
+      if (statusEl) statusEl.textContent = "Uploading...";
+      const response = await fetch(owntracksMediaEndpoint(), {{ method: "POST", body: form }});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+      stop.media = [...(stop.media || []), payload.media];
+      if (fileInput) fileInput.value = "";
+      if (captionInput) captionInput.value = "";
+      if (statusEl) statusEl.textContent = "Uploaded.";
+      refreshStop(stop);
+      renderList();
+      attachPopupHandlers(stop);
+      return true;
+    }};
+    const deleteStopMedia = async (stop, mediaId) => {{
+      const response = await fetch(owntracksMediaEndpoint(), {{
+        method: "DELETE",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ date: data.date, id: stop.id, media_id: mediaId }}),
+      }});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+      stop.media = (stop.media || []).filter((item) => item.id !== mediaId);
+      refreshStop(stop);
+      renderList();
+      attachPopupHandlers(stop);
     }};
     const syncStopFromEditors = (stop, popupOnly = false) => {{
       const fields = [
         ["name", popupOnly ? `[data-popup-name="${{stop.alias}}"]` : `[data-name="${{stop.alias}}"]`],
         ["tags", popupOnly ? `[data-popup-tags="${{stop.alias}}"]` : `[data-tags="${{stop.alias}}"]`],
         ["note", popupOnly ? `[data-popup-note="${{stop.alias}}"]` : `[data-note="${{stop.alias}}"]`],
+        ["entry_override", popupOnly ? `[data-popup-entry="${{stop.alias}}"]` : `[data-entry="${{stop.alias}}"]`],
+        ["exit_override", popupOnly ? `[data-popup-exit="${{stop.alias}}"]` : `[data-exit="${{stop.alias}}"]`],
+        ["radius_m", popupOnly ? `[data-popup-radius="${{stop.alias}}"]` : `[data-radius="${{stop.alias}}"]`],
       ];
       for (const [field, selector] of fields) {{
         const editors = document.querySelectorAll(selector);
         const editor = editors.length ? editors[editors.length - 1] : null;
         if (!editor) continue;
         if (field === "tags") stop.tags = parseTags(editor.value);
+        else if (field === "radius_m") stop[field] = Number(editor.value) || {DEFAULT_VISIT_RADIUS_M};
         else stop[field] = editor.value.trim();
       }}
+      const placeSelector = popupOnly ? `[data-popup-place="${{stop.alias}}"]` : `[data-place="${{stop.alias}}"]`;
+      const placeEditors = document.querySelectorAll(placeSelector);
+      const placeEditor = placeEditors.length ? placeEditors[placeEditors.length - 1] : null;
+      if (placeEditor) stop.place = Boolean(placeEditor.checked);
     }};
     const setSaveFeedback = (message, failed = false) => {{
       const feedback = document.getElementById("saveFeedback");
@@ -5456,8 +7586,8 @@ def render_leaflet_map_html(plan: dict) -> str:
         saveButton.disabled = true;
         saveButton.textContent = "Saving...";
       }}
-      setSaveFeedback(`Saving ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}...`);
-      clipboardStatus = ` · saving ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}...`;
+      setSaveFeedback(`Saving ${{stops.length}} visit${{stops.length === 1 ? "" : "s"}}...`);
+      clipboardStatus = ` · saving ${{stops.length}} visit${{stops.length === 1 ? "" : "s"}}...`;
       updateStatus();
       try {{
         for (const stop of stops) {{
@@ -5472,6 +7602,10 @@ def render_leaflet_map_html(plan: dict) -> str:
               name: stop.name,
               tags: stop.tags || [],
               note: stop.note || "",
+              entry_time: stop.entry_override || "",
+              exit_time: stop.exit_override || "",
+              radius_m: stop.radius_m || {DEFAULT_VISIT_RADIUS_M},
+              place: Boolean(stop.place),
             }}),
           }});
           const payload = await response.json();
@@ -5479,9 +7613,13 @@ def render_leaflet_map_html(plan: dict) -> str:
           originalNames.set(stop.alias, stop.name);
           originalTags.set(stop.alias, (stop.tags || []).join(" "));
           originalNotes.set(stop.alias, stop.note || "");
+          originalEntryTimes.set(stop.alias, stop.entry_override || "");
+          originalExitTimes.set(stop.alias, stop.exit_override || "");
+          originalRadii.set(stop.alias, String(stop.radius_m || {DEFAULT_VISIT_RADIUS_M}));
+          originalPlaces.set(stop.alias, Boolean(stop.place));
         }}
-        clipboardStatus = ` · saved ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}`;
-        setSaveFeedback(`Saved ${{stops.length}} stop${{stops.length === 1 ? "" : "s"}}.`);
+        clipboardStatus = ` · saved ${{stops.length}} visit${{stops.length === 1 ? "" : "s"}}`;
+        setSaveFeedback(`Saved ${{stops.length}} visit${{stops.length === 1 ? "" : "s"}}.`);
         updateCommands(false);
         return true;
       }} catch (error) {{
@@ -5492,7 +7630,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       }} finally {{
         if (saveButton) {{
           saveButton.disabled = false;
-          saveButton.textContent = "Save stop changes";
+          saveButton.textContent = "Save visit changes";
         }}
       }}
     }};
@@ -5517,7 +7655,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       }}
     }};
     const updateCommands = (autoCopy = false) => {{
-      const changed = changedStops();
+      const changed = changedStops().filter((stop) =>
+        stop.name !== originalNames.get(stop.alias)
+        || (stop.tags || []).join(" ") !== originalTags.get(stop.alias)
+        || (stop.note || "") !== originalNotes.get(stop.alias)
+      );
       commands.value = changed.length
         ? [
             "/otb " + data.date,
@@ -5536,9 +7678,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (autoCopy && commands.value) copyCommandsToClipboard(true);
     }};
     const selectedStops = () => data.stops.filter((stop) => selected.has(stop.alias));
+    const selectedDurationEl = document.getElementById("selectedDuration");
     const rawTrackPoints = data.sampledTrack || [];
     const rawUnfilteredTrackPoints = data.rawSampledTrack || rawTrackPoints;
     const rideSegments = data.rideSegments || [];
+    const travelSegments = data.travelSegments || [];
     const trackPoints = [];
     const visibleTrackLineNumbers = new Set(rawTrackPoints.map((point) => Number(point.line)).filter(Number.isFinite));
     const filteredTrackPoints = rawUnfilteredTrackPoints.filter((point) => {{
@@ -5667,6 +7811,40 @@ def render_leaflet_map_html(plan: dict) -> str:
     const formatTime = (timestamp) => Number.isFinite(Number(timestamp))
       ? new Date(Number(timestamp) * 1000).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }})
       : "unknown";
+    const registerDurationAnchor = (anchor) => {{
+      if (anchor && anchor.key) durationAnchors.set(anchor.key, anchor);
+      return anchor;
+    }};
+    const anchorLabelWithTime = (anchor, field = "entry_timestamp") => {{
+      if (!anchor) return "not set";
+      const timestamp = Number(anchor[field]);
+      return `${{anchor.label}}${{Number.isFinite(timestamp) ? " · " + formatTime(timestamp) : ""}}`;
+    }};
+    const clearDurationAnchors = () => {{
+      durationStartKey = null;
+      durationEndKey = null;
+      refreshSelectedDuration();
+    }};
+    const durationAnchorButtons = (anchor) => {{
+      if (!anchor || !anchor.key) return "";
+      registerDurationAnchor(anchor);
+      const anchorMeta = anchor.kind === "visit"
+        ? `Visit entry: ${{formatTime(anchor.entry_timestamp)}} · visit exit: ${{formatTime(anchor.exit_timestamp)}}`
+        : `Anchor: ${{anchorLabelWithTime(anchor)}}`;
+      return `
+        <div class="row" style="margin-top: 8px">
+          <button type="button" class="secondary" data-duration-start="${{escapeHtml(anchor.key)}}">Set start</button>
+          <button type="button" class="secondary" data-duration-end="${{escapeHtml(anchor.key)}}">Set end</button>
+        </div>
+        <div class="popup-meta">${{escapeHtml(anchorMeta)}}</div>
+      `;
+    }};
+    const setDurationAnchor = (key, role) => {{
+      if (!durationAnchors.has(key)) return;
+      if (role === "start") durationStartKey = key;
+      else durationEndKey = key;
+      refreshSelectedDuration();
+    }};
     const formatSpeedPlain = (value) => Number.isFinite(Number(value)) ? `${{Number(value).toFixed(1)}} km/h` : "unknown";
     const speedSourceLabel = (point) => {{
       const speed = Number(point.speed_kmh);
@@ -5724,6 +7902,7 @@ def render_leaflet_map_html(plan: dict) -> str:
           <div>Speed: ${{formatSpeed(point.speed_kmh)}} · Accuracy: ${{Number.isFinite(Number(point.accuracy_m)) ? Number(point.accuracy_m).toFixed(0) + " m" : "unknown"}}</div>
           ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
         </div>
+        ${{durationAnchorButtons(anchorForRoutePoint(point))}}
       </div>
     `;
     const canSaveManualStops = () => window.location.protocol === "http:" || window.location.protocol === "https:";
@@ -5735,14 +7914,30 @@ def render_leaflet_map_html(plan: dict) -> str:
           <div>Motion: ${{escapeHtml(point.motion_mode || "unknown")}} · Speed: ${{formatSpeed(point.speed_kmh)}}</div>
           ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
         </div>
-        ${{canSaveManualStops() && point.line ? '<button type="button" data-mark-manual-stop>Mark as stop</button>' : '<div class="popup-meta">Open the hosted map to mark this point as a stop.</div>'}}
+        ${{durationAnchorButtons(anchorForRoutePoint(point))}}
+        ${{canSaveManualStops() && point.line ? `
+          <label>Name</label>
+          <input data-manual-stop-name value="${{escapeHtml(point.place_name || "")}}">
+          <label>Tags</label>
+          <input data-manual-stop-tags placeholder="tags">
+          <label>Note</label>
+          <textarea data-manual-stop-note placeholder="note"></textarea>
+          <label class="checkbox-row">
+            <input type="checkbox" data-manual-stop-place>
+            <span>Use as trip place</span>
+          </label>
+          <button type="button" data-mark-manual-stop>Save visit</button>
+        ` : '<div class="popup-meta">Open the hosted map to mark this point as a stop.</div>'}}
         <div class="popup-meta" data-manual-stop-status></div>
       </div>
     `;
     const saveManualStop = async (point, popupElement) => {{
       const button = popupElement.querySelector("[data-mark-manual-stop]");
       const result = popupElement.querySelector("[data-manual-stop-status]");
-      const name = window.prompt("Optional name for this stop:", point.place_name || "") || "";
+      const name = popupElement.querySelector("[data-manual-stop-name]")?.value.trim() || "";
+      const tags = parseTags(popupElement.querySelector("[data-manual-stop-tags]")?.value || "");
+      const note = popupElement.querySelector("[data-manual-stop-note]")?.value.trim() || "";
+      const place = Boolean(popupElement.querySelector("[data-manual-stop-place]")?.checked);
       if (button) button.disabled = true;
       if (result) result.textContent = "Saving...";
       try {{
@@ -5761,6 +7956,9 @@ def render_leaflet_map_html(plan: dict) -> str:
             time: point.time || formatTime(point.timestamp),
             motion_mode: point.motion_mode || "unknown",
             name,
+            tags,
+            note,
+            place,
           }}),
         }});
         const payload = await response.json();
@@ -5804,6 +8002,63 @@ def render_leaflet_map_html(plan: dict) -> str:
           if (segment) fitRideSegment(segment);
         }});
       }});
+    }};
+    const travelSegmentPopupHtml = (segment) => `
+      <div class="segment-popup">
+        <strong>${{escapeHtml(segment.label || "Travel time")}}</strong>
+        <div class="popup-meta">
+          <div>Travel time: ${{escapeHtml(segment.duration || formatDuration(segment.duration_seconds))}}</div>
+          <div>${{escapeHtml(segment.start_time || "")}} to ${{escapeHtml(segment.end_time || "")}}</div>
+          <div>Distance: ${{Number(segment.distance_km || 0).toFixed(2)}} km · Points: ${{escapeHtml(segment.point_count || 0)}}</div>
+          <div>${{escapeHtml(segment.start_kind || "")}} to ${{escapeHtml(segment.end_kind || "")}}</div>
+        </div>
+      </div>
+    `;
+    const travelLineEndpoints = (segment) => {{
+      const startLat = Number(segment.start_lat);
+      const startLon = Number(segment.start_lon);
+      const endLat = Number(segment.end_lat);
+      const endLon = Number(segment.end_lon);
+      if (![startLat, startLon, endLat, endLon].every(Number.isFinite)) return null;
+      return {{ startLat, startLon, endLat, endLon }};
+    }};
+    const renderTravelTimes = () => {{
+      travelTimeLayer.clearLayers();
+      if (!travelTimesVisible) {{
+        travelTimeLayer.remove();
+        syncTravelTimesButton();
+        return;
+      }}
+      for (const segment of travelSegments) {{
+        const endpoints = travelLineEndpoints(segment);
+        if (!endpoints) continue;
+        const midLat = (endpoints.startLat + endpoints.endLat) / 2;
+        const midLon = (endpoints.startLon + endpoints.endLon) / 2;
+        L.polyline(
+          [[endpoints.startLat, endpoints.startLon], [endpoints.endLat, endpoints.endLon]],
+          {{ color: "#111827", weight: 2, opacity: 0.5, dashArray: "4 6", interactive: true }}
+        ).bindPopup(travelSegmentPopupHtml(segment)).addTo(travelTimeLayer);
+        L.marker([midLat, midLon], {{
+          interactive: true,
+          icon: L.divIcon({{
+            className: "travel-time-marker",
+            html: `<div class="travel-time-label">${{escapeHtml(segment.duration || formatDuration(segment.duration_seconds))}}</div>`,
+          }}),
+        }}).bindPopup(travelSegmentPopupHtml(segment)).addTo(travelTimeLayer);
+      }}
+      travelTimeLayer.addTo(map);
+      syncTravelTimesButton();
+    }};
+    const syncTravelTimesButton = () => {{
+      const button = document.getElementById("toggleTravelTimes");
+      if (!button) return;
+      button.textContent = travelTimesVisible ? `Hide travel times (${{travelSegments.length}})` : `Show travel times (${{travelSegments.length}})`;
+      button.classList.toggle("active", travelTimesVisible);
+      button.disabled = !travelSegments.length;
+    }};
+    const setTravelTimesVisible = (visible) => {{
+      travelTimesVisible = visible;
+      renderTravelTimes();
     }};
     const routePointRadius = () => {{
       const zoom = map.getZoom();
@@ -6217,7 +8472,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       }}
       const placeButton = document.getElementById("togglePlaceLabels");
       if (placeButton) {{
-        placeButton.textContent = placeLabelsVisible ? "Hide point labels" : "Show point labels";
+        placeButton.textContent = placeLabelsVisible ? "Hide transition points" : "Show transition points";
         placeButton.classList.toggle("active", placeLabelsVisible);
       }}
     }};
@@ -6229,6 +8484,37 @@ def render_leaflet_map_html(plan: dict) -> str:
       button.classList.toggle("active", filteredPointsVisible);
       button.disabled = count === 0;
     }};
+    const possibleStops = data.possibleMissedStops || [];
+    const syncPossibleStopsButton = () => {{
+      const button = document.getElementById("togglePossibleStops");
+      if (!button) return;
+      button.textContent = possibleStopsVisible ? `Hide possible missed stops (${{possibleStops.length}})` : `Show possible missed stops (${{possibleStops.length}})`;
+      button.classList.toggle("active", possibleStopsVisible);
+      button.disabled = possibleStops.length === 0;
+    }};
+    const possibleStopPoint = (item) => ({{
+      line: item.line,
+      lat: item.lat,
+      lon: item.lon,
+      timestamp: item.timestamp,
+      time: item.time,
+      motion_mode: item.motion_mode || "unknown",
+      place_name: item.name || "",
+      possible_stop: true,
+    }});
+    const possibleStopPopupHtml = (item) => `
+      <div class="segment-popup">
+        <strong>Possible missed stop</strong>
+        <div class="popup-meta">
+          <div>${{escapeHtml(item.time || "unknown")}} · Line ${{escapeHtml(item.line || "")}}</div>
+          <div>${{escapeHtml(item.reason || "Sparse buffered track point")}}</div>
+          <div>Motion: ${{escapeHtml(item.motion_mode || "unknown")}} · Accuracy: ${{Number.isFinite(Number(item.accuracy_m)) ? Math.round(Number(item.accuracy_m)) + " m" : "unknown"}}</div>
+          <div>Previous gap: ${{Number.isFinite(Number(item.previous_gap_minutes)) ? Math.round(Number(item.previous_gap_minutes)) + " min" : "unknown"}} · Next gap: ${{Number.isFinite(Number(item.next_gap_minutes)) ? Math.round(Number(item.next_gap_minutes)) + " min" : "unknown"}}</div>
+          ${{item.maps ? `<div><a href="${{escapeHtml(item.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
+        </div>
+        ${{routePointPopupHtml(possibleStopPoint(item))}}
+      </div>
+    `;
     const renderFilteredPoints = () => {{
       filteredPointLayer.clearLayers();
       const points = filteredTrackPointsForMode();
@@ -6258,6 +8544,70 @@ def render_leaflet_map_html(plan: dict) -> str:
       filteredPointsVisible = visible;
       renderFilteredPoints();
     }};
+    const renderPossibleStops = () => {{
+      possibleStopLayer.clearLayers();
+      const list = document.getElementById("possibleStopList");
+      if (list) {{
+        list.style.display = possibleStopsVisible && possibleStops.length ? "block" : "none";
+        list.innerHTML = possibleStopsVisible ? possibleStops.map((item, index) => `
+          <div class="stop-row">
+            <div class="stop-head">
+              <span class="alias">p${{index + 1}}</span>
+              <button type="button" class="secondary" data-possible-stop="${{index}}">Open</button>
+              ${{item.maps ? `<a href="${{escapeHtml(item.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>` : ""}}
+            </div>
+            <div class="meta">${{escapeHtml(item.time || "unknown")}} · line ${{escapeHtml(item.line || "")}} · ${{escapeHtml(item.confidence || "low")}} confidence</div>
+            <div class="meta">${{escapeHtml(item.reason || "Sparse buffered track point")}}</div>
+          </div>
+        `).join("") : "";
+        list.querySelectorAll("[data-possible-stop]").forEach((button) => {{
+          button.addEventListener("click", () => {{
+            const item = possibleStops[Number(button.dataset.possibleStop)];
+            if (!item) return;
+            possibleStopsVisible = true;
+            renderPossibleStops();
+            map.setView([item.lat, item.lon], zoomAtLeast(16), {{ animate: true }});
+          }});
+        }});
+      }}
+      if (!possibleStopsVisible || !possibleStops.length) {{
+        possibleStopLayer.remove();
+        syncPossibleStopsButton();
+        return;
+      }}
+      possibleStops.forEach((item, index) => {{
+        const lat = Number(item.lat);
+        const lon = Number(item.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const marker = L.circleMarker([lat, lon], {{
+          radius: 8,
+          color: "#92400e",
+          fillColor: "#f59e0b",
+          fillOpacity: 0.9,
+          opacity: 1,
+          weight: 2,
+          dashArray: "4 3",
+        }}).bindTooltip(`p${{index + 1}}`, {{
+          permanent: true,
+          direction: "top",
+          className: "possible-stop-label",
+        }}).bindPopup(possibleStopPopupHtml(item), {{ maxWidth: 340 }});
+        marker.on("popupopen", () => {{
+          const element = marker.getPopup() && marker.getPopup().getElement();
+          if (!element) return;
+          L.DomEvent.disableClickPropagation(element);
+          const button = element.querySelector("[data-mark-manual-stop]");
+          if (button) button.addEventListener("click", () => saveManualStop(possibleStopPoint(item), element), {{ once: true }});
+        }});
+        marker.addTo(possibleStopLayer);
+      }});
+      possibleStopLayer.addTo(map);
+      syncPossibleStopsButton();
+    }};
+    const setPossibleStopsVisible = (visible) => {{
+      possibleStopsVisible = visible;
+      renderPossibleStops();
+    }};
     const applyLabelVisibility = () => {{
       for (const stop of data.stops) {{
         const marker = markers.get(stop.alias);
@@ -6280,6 +8630,8 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const setPlaceLabelsVisible = (visible) => {{
       placeLabelsVisible = visible;
+      if (placeLabelsVisible) placeLayer.addTo(map);
+      else placeLayer.remove();
       drawRoute();
       applyLabelVisibility();
     }};
@@ -6416,24 +8768,176 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const labelFor = (stop) => `${{stop.alias}}: ${{stop.name}}`;
     const shortLabelFor = (stop) => `${{stop.alias}}: ${{shorten(stop.name)}}`;
+    const stopReference = (stop) => {{
+      const lines = stop.start_line && stop.end_line ? `lines ${{stop.start_line}}-${{stop.end_line}}` : "lines unknown";
+      return `${{data.date}} ${{stop.alias}} ${{stop.id || "unknown-id"}} ${{lines}}`;
+    }};
+    const stopAnchorKey = (stop) => `stop:${{stop.alias}}`;
+    const placeAnchorKey = (place, index) => `place:${{place.id || index}}`;
+    const anchorForStop = (stop) => ({{
+      key: stopAnchorKey(stop),
+      label: labelFor(stop),
+      kind: "visit",
+      entry_timestamp: Number(stop.visit_start_timestamp || stop.start_timestamp),
+      exit_timestamp: Number(stop.visit_end_timestamp || stop.end_timestamp),
+      lat: Number(stop.lat),
+      lon: Number(stop.lon),
+    }});
+    const routePointAnchorKey = (point) => `route:${{point.line || point.timestamp || `${{point.lat}},${{point.lon}}`}}`;
+    const anchorForRoutePoint = (point) => ({{
+      key: routePointAnchorKey(point),
+      label: point.place_name || `Route point${{point.line ? " line " + point.line : ""}}`,
+      kind: "route",
+      entry_timestamp: Number(point.timestamp),
+      exit_timestamp: Number(point.timestamp),
+      lat: Number(point.lat),
+      lon: Number(point.lon),
+    }});
+    const anchorForPlace = (place, index) => {{
+      const label = `${{place.action || ""}} ${{place.name || "place"}}`.trim();
+      return {{
+        key: placeAnchorKey(place, index),
+        label,
+        kind: "place",
+        entry_timestamp: Number(place.timestamp),
+        exit_timestamp: Number(place.timestamp),
+        lat: Number(place.lat),
+        lon: Number(place.lon),
+      }};
+    }};
+    const selectedAnchorList = () => [...selectedAnchors.values()].sort((left, right) => Number(left.entry_timestamp) - Number(right.entry_timestamp));
+    const refreshSelectedDuration = () => {{
+      if (!selectedDurationEl) return;
+      if (durationStartKey || durationEndKey) {{
+        const first = durationAnchors.get(durationStartKey);
+        const second = durationAnchors.get(durationEndKey);
+        if (!first || !second) {{
+          selectedDurationEl.innerHTML = `
+            <strong>Selected duration</strong>
+            <span>Start: ${{escapeHtml(anchorLabelWithTime(first, "entry_timestamp"))}}</span><br>
+            <span>End: ${{escapeHtml(anchorLabelWithTime(second, "entry_timestamp"))}}</span><br>
+            <button type="button" class="secondary" data-duration-clear>Clear</button>
+          `;
+          return;
+        }}
+        const selectedStart = Number(first.entry_timestamp);
+        const selectedEnd = Number(second.entry_timestamp);
+        const start = Math.min(selectedStart, selectedEnd);
+        const end = Math.max(selectedStart, selectedEnd);
+        if (!Number.isFinite(selectedStart) || !Number.isFinite(selectedEnd)) {{
+          selectedDurationEl.innerHTML = `
+            <strong>${{escapeHtml(anchorLabelWithTime(first, "entry_timestamp"))}} to ${{escapeHtml(anchorLabelWithTime(second, "entry_timestamp"))}}</strong>
+            <span>Duration unavailable for one of these selected points.</span><br>
+            <button type="button" class="secondary" data-duration-clear>Clear</button>
+          `;
+          return;
+        }}
+        const seconds = end - start;
+        const pointsBetween = rawUnfilteredTrackPoints.filter((point) => {{
+          const timestamp = Number(point.timestamp);
+          return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end;
+        }});
+        let distanceKm = 0;
+        for (let index = 1; index < pointsBetween.length; index += 1) {{
+          distanceKm += distanceMeters(pointsBetween[index - 1], pointsBetween[index]) / 1000;
+        }}
+        const reversed = selectedEnd < selectedStart;
+        selectedDurationEl.innerHTML = `
+          <strong>${{escapeHtml(anchorLabelWithTime(first, "entry_timestamp"))}} to ${{escapeHtml(anchorLabelWithTime(second, "entry_timestamp"))}}</strong>
+          <span>${{formatDuration(seconds)}} elapsed · ${{distanceKm.toFixed(2)}} km raw track · ${{pointsBetween.length}} point${{pointsBetween.length === 1 ? "" : "s"}}</span><br>
+          ${{reversed ? '<span>Selected order was later-to-earlier; showing chronological span.</span><br>' : ""}}
+          <button type="button" class="secondary" data-duration-clear>Clear</button>
+        `;
+        return;
+      }}
+      selectedDurationEl.innerHTML = `Open a point popup and use Set start / Set end to calculate elapsed time.`;
+    }};
+    const stopTravelLine = (label, segment, placeField) => {{
+      if (!segment) return "";
+      return `<div>${{label}}: ${{escapeHtml(segment[placeField] || "")}}, ${{escapeHtml(segment.duration || formatDuration(segment.duration_seconds))}}</div>`;
+    }};
+    const stopTravelHtml = (stop) => {{
+      const lines = [
+        stopTravelLine("From previous", stop.previous_travel, "start_name"),
+        stopTravelLine("To next", stop.next_travel, "end_name"),
+      ].filter(Boolean);
+      return lines.length ? `<div class="popup-meta" style="margin-top: 6px">${{lines.join("")}}</div>` : "";
+    }};
+    const visitTimingHtml = (stop) => {{
+      const entry = stop.entry_display || stop.start || "";
+      const exit = stop.exit_display || stop.end || "";
+      return `
+        <div class="popup-meta">
+          <div>${{escapeHtml(entry)}} -> ${{escapeHtml(exit)}}</div>
+          <div>${{escapeHtml(stop.visit_duration || stop.duration || "")}} · ${{escapeHtml(stop.points || 0)}} sample${{Number(stop.points) === 1 ? "" : "s"}}</div>
+        </div>
+      `;
+    }};
     const popupFor = (stop) => `
       <div class="stop-popup">
         <strong>${{escapeHtml(labelFor(stop))}}</strong>
-        <div class="popup-meta">
-          ${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}}<br>
-          ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points<br>
-          <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
-        </div>
+        ${{visitTimingHtml(stop)}}
+        <div class="popup-meta"><a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>
         <label for="popup-name-${{escapeHtml(stop.alias)}}">Name</label>
         <input id="popup-name-${{escapeHtml(stop.alias)}}" data-popup-name="${{escapeHtml(stop.alias)}}" value="${{escapeHtml(stop.name)}}">
         <label for="popup-tags-${{escapeHtml(stop.alias)}}">Tags</label>
         <input id="popup-tags-${{escapeHtml(stop.alias)}}" data-popup-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
         <label for="popup-note-${{escapeHtml(stop.alias)}}">Note</label>
         <textarea id="popup-note-${{escapeHtml(stop.alias)}}" data-popup-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
-        ${{canSaveManualStops() ? `<button type="button" data-save-stop="${{escapeHtml(stop.alias)}}">Save changes</button>` : ""}}
+        <label for="popup-entry-${{escapeHtml(stop.alias)}}">Entry override</label>
+        <input id="popup-entry-${{escapeHtml(stop.alias)}}" data-popup-entry="${{escapeHtml(stop.alias)}}" placeholder="HH:MM or YYYY-MM-DDTHH:MM" value="${{escapeHtml(stop.entry_override || "")}}">
+        <label for="popup-exit-${{escapeHtml(stop.alias)}}">Exit override</label>
+        <input id="popup-exit-${{escapeHtml(stop.alias)}}" data-popup-exit="${{escapeHtml(stop.alias)}}" placeholder="HH:MM or YYYY-MM-DDTHH:MM" value="${{escapeHtml(stop.exit_override || "")}}">
+        <label for="popup-radius-${{escapeHtml(stop.alias)}}">Grouping radius, meters</label>
+        <input id="popup-radius-${{escapeHtml(stop.alias)}}" data-popup-radius="${{escapeHtml(stop.alias)}}" type="number" min="10" max="5000" step="10" value="${{escapeHtml(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})}}">
+        <label class="checkbox-row">
+          <input type="checkbox" data-popup-place="${{escapeHtml(stop.alias)}}" ${{stop.place ? "checked" : ""}}>
+          <span>Save as trip place</span>
+        </label>
+        ${{renderMediaGallery(stop)}}
+        ${{canSaveManualStops() ? renderMediaUpload(stop, "popup") : ""}}
+        ${{canSaveManualStops() ? `
+          <div class="row" style="margin-top: 8px">
+            <button type="button" data-save-stop="${{escapeHtml(stop.alias)}}">Save changes</button>
+            <button type="button" class="secondary" data-dismiss-stop="${{escapeHtml(stop.alias)}}">Dismiss visit</button>
+          </div>
+        ` : ""}}
         <div class="popup-meta" data-save-stop-feedback></div>
       </div>
     `;
+    const dismissStop = async (stop, element) => {{
+      if (!window.confirm(`Dismiss ${{stop.alias}} as a visit? The route samples stay on the map.`)) return;
+      const feedback = element.querySelector("[data-save-stop-feedback]");
+      const button = element.querySelector("[data-dismiss-stop]");
+      if (button) {{
+        button.disabled = true;
+        button.textContent = "Dismissing...";
+      }}
+      if (feedback) feedback.textContent = "Dismissing visit...";
+      try {{
+        const response = await fetch(owntracksStopsEndpoint(), {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            date: data.date,
+            id: stop.id,
+            lat: stop.lat,
+            lon: stop.lon,
+            ignored: true,
+          }}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        if (feedback) feedback.textContent = "Dismissed. Reloading map...";
+        window.location.reload();
+      }} catch (error) {{
+        if (feedback) feedback.textContent = `Dismiss failed: ${{error.message || error}}`;
+        if (button) {{
+          button.disabled = false;
+          button.textContent = "Dismiss visit";
+        }}
+      }}
+    }};
     const attachPopupHandlers = (stop) => {{
       const marker = markers.get(stop.alias);
       const popup = marker && marker.getPopup ? marker.getPopup() : null;
@@ -6451,6 +8955,39 @@ def render_leaflet_map_html(plan: dict) -> str:
         saveButton.disabled = false;
         saveButton.textContent = "Save changes";
       }});
+      const dismissButton = element.querySelector("[data-dismiss-stop]");
+      if (dismissButton) dismissButton.addEventListener("click", () => dismissStop(stop, element));
+      element.querySelectorAll("[data-upload-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const targetStop = data.stops.find((item) => item.alias === button.dataset.uploadMedia);
+          if (!targetStop) return;
+          button.disabled = true;
+          button.textContent = "Uploading...";
+          const feedback = element.querySelector(`[data-media-status="${{CSS.escape(button.dataset.mediaKey || "")}}"]`);
+          try {{
+            await uploadStopMedia(targetStop, button.dataset.mediaKey || "");
+          }} catch (error) {{
+            if (feedback) feedback.textContent = `Upload failed: ${{error.message || error}}`;
+          }} finally {{
+            button.disabled = false;
+            button.textContent = "Attach media";
+          }}
+        }});
+      }});
+      element.querySelectorAll("[data-delete-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const targetStop = data.stops.find((item) => item.alias === button.dataset.mediaStop);
+          if (!targetStop || !window.confirm("Delete this attachment?")) return;
+          button.disabled = true;
+          try {{
+            await deleteStopMedia(targetStop, button.dataset.deleteMedia || "");
+          }} catch (error) {{
+            button.textContent = "Failed";
+            button.title = String(error.message || error);
+            button.disabled = false;
+          }}
+        }});
+      }});
     }};
     const refreshStop = (stop, refreshPopup = true) => {{
       const marker = markers.get(stop.alias);
@@ -6464,7 +9001,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (refreshPopup) marker.setPopupContent(popupFor(stop));
     }};
     const applyPopupEdit = (target) => {{
-      const alias = target.dataset.popupName || target.dataset.popupTags || target.dataset.popupNote;
+      const alias = target.dataset.popupName || target.dataset.popupTags || target.dataset.popupNote || target.dataset.popupEntry || target.dataset.popupExit || target.dataset.popupRadius || target.dataset.popupPlace;
       if (!alias) return;
       const stop = data.stops.find((item) => item.alias === alias);
       if (!stop) return;
@@ -6475,15 +9012,32 @@ def render_leaflet_map_html(plan: dict) -> str:
         stop.tags = parseTags(target.value);
       }} else if (target.dataset.popupNote) {{
         stop.note = target.value.trim();
+      }} else if (target.dataset.popupEntry) {{
+        stop.entry_override = target.value.trim();
+      }} else if (target.dataset.popupExit) {{
+        stop.exit_override = target.value.trim();
+      }} else if (target.dataset.popupRadius) {{
+        stop.radius_m = Number(target.value) || {DEFAULT_VISIT_RADIUS_M};
+      }} else if (target.dataset.popupPlace) {{
+        stop.place = Boolean(target.checked);
       }}
       updateCommands();
     }};
     const handlePopupEditEvent = (event) => {{
       const target = event.target;
       if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
-      if (!target.matches("[data-popup-name], [data-popup-tags], [data-popup-note]")) return;
+      if (!target.matches("[data-popup-name], [data-popup-tags], [data-popup-note], [data-popup-entry], [data-popup-exit], [data-popup-radius], [data-popup-place]")) return;
       applyPopupEdit(target);
     }};
+    document.addEventListener("click", (event) => {{
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const startKey = target.dataset.durationStart;
+      const endKey = target.dataset.durationEnd;
+      if (target.dataset.durationClear != null) clearDurationAnchors();
+      if (startKey) setDurationAnchor(startKey, "start");
+      if (endKey) setDurationAnchor(endKey, "end");
+    }});
     document.addEventListener("input", handlePopupEditEvent);
     document.addEventListener("change", handlePopupEditEvent);
     const renderList = () => {{
@@ -6495,10 +9049,22 @@ def render_leaflet_map_html(plan: dict) -> str:
             <span class="alias">${{escapeHtml(stop.alias)}}</span>
             <a href="${{escapeHtml(stop.maps)}}" target="_blank" rel="noreferrer">Google Maps</a>
           </div>
+          <div class="meta">${{escapeHtml(stop.entry_display || stop.start)}} -> ${{escapeHtml(stop.exit_display || stop.end)}} · ${{escapeHtml(stop.visit_duration || stop.duration)}} · ${{escapeHtml(stop.visit_source || "detected-stop")}} · ${{escapeHtml(stop.confidence || "unknown")}}</div>
+          <div class="meta">${{escapeHtml(stop.points || 0)}} raw sample${{Number(stop.points) === 1 ? "" : "s"}} · entry ${{escapeHtml(stop.entry_status || "sample")}} · exit ${{escapeHtml(stop.exit_status || "sample")}}</div>
           <input data-name="${{escapeHtml(stop.alias)}}" value="${{escapeHtml(stop.name)}}">
           <input data-tags="${{escapeHtml(stop.alias)}}" value="${{escapeHtml((stop.tags || []).join(" "))}}" placeholder="tags">
           <textarea data-note="${{escapeHtml(stop.alias)}}" placeholder="note">${{escapeHtml(stop.note || "")}}</textarea>
-          <div class="meta">${{escapeHtml(stop.start)}} to ${{escapeHtml(stop.end)}} · ${{escapeHtml(stop.duration)}} · ${{escapeHtml(stop.points)}} points</div>
+          <div class="row">
+            <input data-entry="${{escapeHtml(stop.alias)}}" placeholder="Entry HH:MM" value="${{escapeHtml(stop.entry_override || "")}}">
+            <input data-exit="${{escapeHtml(stop.alias)}}" placeholder="Exit HH:MM" value="${{escapeHtml(stop.exit_override || "")}}">
+          </div>
+          <div class="row">
+            <input data-radius="${{escapeHtml(stop.alias)}}" type="number" min="10" max="5000" step="10" value="${{escapeHtml(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})}}">
+            <label class="inline-check"><input data-place="${{escapeHtml(stop.alias)}}" type="checkbox" ${{stop.place ? "checked" : ""}}> Trip place</label>
+          </div>
+          ${{renderMediaGallery(stop)}}
+          ${{canSaveManualStops() ? renderMediaUpload(stop, "list") : ""}}
+          <div class="meta">${{escapeHtml(stopReference(stop))}}</div>
         </div>
       `).join("");
       stopList.querySelectorAll("[data-check]").forEach((input) => {{
@@ -6529,11 +9095,79 @@ def render_leaflet_map_html(plan: dict) -> str:
           updateCommands();
         }});
       }});
+      stopList.querySelectorAll("[data-entry]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.entry);
+          if (!stop) return;
+          stop.entry_override = input.value.trim();
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-exit]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.exit);
+          if (!stop) return;
+          stop.exit_override = input.value.trim();
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-radius]").forEach((input) => {{
+        input.addEventListener("input", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.radius);
+          if (!stop) return;
+          stop.radius_m = Number(input.value) || {DEFAULT_VISIT_RADIUS_M};
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-place]").forEach((input) => {{
+        input.addEventListener("change", () => {{
+          const stop = data.stops.find((item) => item.alias === input.dataset.place);
+          if (!stop) return;
+          stop.place = Boolean(input.checked);
+          updateCommands();
+        }});
+      }});
+      stopList.querySelectorAll("[data-upload-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const stop = data.stops.find((item) => item.alias === button.dataset.uploadMedia);
+          if (!stop) return;
+          button.disabled = true;
+          button.textContent = "Uploading...";
+          try {{
+            await uploadStopMedia(stop, button.dataset.mediaKey || "");
+          }} catch (error) {{
+            const statusEl = document.querySelector(`[data-media-status="${{CSS.escape(button.dataset.mediaKey || "")}}"]`);
+            if (statusEl) statusEl.textContent = `Upload failed: ${{error.message || error}}`;
+          }} finally {{
+            button.disabled = false;
+            button.textContent = "Attach media";
+          }}
+        }});
+      }});
+      stopList.querySelectorAll("[data-delete-media]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const stop = data.stops.find((item) => item.alias === button.dataset.mediaStop);
+          if (!stop || !window.confirm("Delete this attachment?")) return;
+          button.disabled = true;
+          try {{
+            await deleteStopMedia(stop, button.dataset.deleteMedia || "");
+          }} catch (error) {{
+            button.textContent = "Failed";
+            button.title = String(error.message || error);
+            button.disabled = false;
+          }}
+        }});
+      }});
     }};
     const refreshSelectedStops = () => {{
+      for (const stop of data.stops) {{
+        if (selected.has(stop.alias)) selectedAnchors.set(stopAnchorKey(stop), anchorForStop(stop));
+        else selectedAnchors.delete(stopAnchorKey(stop));
+      }}
       for (const stop of data.stops) refreshStop(stop);
       renderList();
       updateCommands();
+      refreshSelectedDuration();
     }};
     const centerStop = (stop) => {{
       map.panTo([stop.lat, stop.lon]);
@@ -6552,11 +9186,17 @@ def render_leaflet_map_html(plan: dict) -> str:
     const setSelected = (alias, isSelected, center = false) => {{
       const stop = data.stops.find((item) => item.alias === alias);
       if (!stop) return;
-      if (isSelected) selected.add(alias);
-      else selected.delete(alias);
+      if (isSelected) {{
+        selected.add(alias);
+        selectedAnchors.set(stopAnchorKey(stop), anchorForStop(stop));
+      }} else {{
+        selected.delete(alias);
+        selectedAnchors.delete(stopAnchorKey(stop));
+      }}
       refreshStop(stop);
       renderList();
       updateCommands();
+      refreshSelectedDuration();
       if (isSelected && center) centerStop(stop);
     }};
     const toggleStop = (stop) => {{
@@ -6567,14 +9207,26 @@ def render_leaflet_map_html(plan: dict) -> str:
       renderRideSegments();
       data.track.forEach((point) => addFitPoint(point[0], point[1]));
     }}
-    for (const place of data.namedPlaces) {{
+    data.namedPlaces.forEach((place, index) => {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
-      const marker = L.circleMarker([place.lat, place.lon], {{ radius: placeMarkerRadius(), color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(map);
+      const placeAnchor = anchorForPlace(place, index);
+      const marker = L.circleMarker([place.lat, place.lon], {{ radius: placeMarkerRadius(), color: "#2563eb", fillColor: "#2563eb", fillOpacity: 1, weight: 2 }}).addTo(placeLayer);
       placeMarkers.push(marker);
       marker.bindTooltip(escapeHtml(label), {{ permanent: true, direction: "right", className: "place-label" }});
-      marker.bindPopup(`<strong>${{escapeHtml(label)}}</strong><br>${{escapeHtml(place.time)}}`);
-      addFitPoint(place.lat, place.lon);
-    }}
+      marker.bindPopup(`
+        <div class="segment-popup">
+          <strong>${{escapeHtml(label)}}</strong>
+          <div class="popup-meta">${{escapeHtml(place.time)}}</div>
+          ${{durationAnchorButtons(placeAnchor)}}
+        </div>
+      `);
+      marker.on("click", () => {{
+        const anchor = placeAnchor;
+        if (selectedAnchors.has(anchor.key)) selectedAnchors.delete(anchor.key);
+        else selectedAnchors.set(anchor.key, anchor);
+        refreshSelectedDuration();
+      }});
+    }});
     for (const stop of data.stops) {{
       const marker = L.marker([stop.lat, stop.lon], {{ icon: iconFor(stop) }}).addTo(map);
       markers.set(stop.alias, marker);
@@ -6620,6 +9272,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     document.getElementById("clearSelection").addEventListener("click", () => {{
       selected.clear();
+      selectedAnchors.clear();
       refreshSelectedStops();
     }});
     document.getElementById("prevDay").addEventListener("click", () => {{
@@ -6638,6 +9291,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("toggleArrows").addEventListener("click", () => {{
       setArrowsVisible(!arrowsVisible);
     }});
+    document.getElementById("toggleTravelTimes").addEventListener("click", () => {{
+      setTravelTimesVisible(!travelTimesVisible);
+    }});
     document.getElementById("toggleStopLabels").addEventListener("click", () => {{
       setStopLabelsVisible(!stopLabelsVisible);
     }});
@@ -6646,6 +9302,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     }});
     document.getElementById("toggleFilteredPoints").addEventListener("click", () => {{
       setFilteredPointsVisible(!filteredPointsVisible);
+    }});
+    document.getElementById("togglePossibleStops").addEventListener("click", () => {{
+      setPossibleStopsVisible(!possibleStopsVisible);
     }});
     document.getElementById("routeAnimPlay").addEventListener("click", () => {{
       playRouteAnimation();
@@ -6687,14 +9346,17 @@ def render_leaflet_map_html(plan: dict) -> str:
     map.on("zoomend", () => {{
       drawRoute();
       renderFilteredPoints();
+      renderPossibleStops();
       refreshZoomSensitiveMarkers();
       if (!routeAnimationRunning && routeAnimationElapsedMs > 0) renderRouteAnimation(routeAnimationElapsedMs);
     }});
     syncEdgeButton();
     syncArrowButton();
+    syncTravelTimesButton();
     syncDayNavigationButtons();
     syncLabelButtons();
     syncFilteredPointsButton();
+    syncPossibleStopsButton();
     applyLabelVisibility();
     syncRouteColorButtons();
     syncProfileAxisButtons();
@@ -6704,13 +9366,16 @@ def render_leaflet_map_html(plan: dict) -> str:
     setActiveMotionMode("all");
     setEdgesVisible(true);
     setArrowsVisible(true);
+    setTravelTimesVisible(false);
     setFilteredPointsVisible(false);
+    setPossibleStopsVisible(false);
     renderElevationProfile();
     document.getElementById("selectNearby").addEventListener("click", () => {{
       const picked = selectedStops()[0] || data.stops[0];
       const threshold = Number(document.getElementById("groupDistance").value) || 150;
       if (!picked) return;
       selected.clear();
+      selectedAnchors.clear();
       data.stops.filter((stop) => distanceMeters(picked, stop) <= threshold).forEach((stop) => selected.add(stop.alias));
       refreshSelectedStops();
       centerStop(picked);
@@ -6776,21 +9441,22 @@ def build_plan(
     track_points = [event for event in window_events if event.is_location]
     ride_points = [event for event in track_points if is_moving_ride_point(event)]
     places = named_place_events(window_events)
+    covered_place_names = {str(place.get("name") or "").casefold() for place in places}
+    places.extend(proximity_named_place_events(events, target_date, user_tags or {}, covered_place_names))
     stops = candidate_stops(window_events)
+    home_anchor_points = home_anchors(events, home_filter)
+    stops.extend(boundary_home_stops(window_events, stops, home_filter, home_anchor_points))
     detected_stop_ids = {stop["id"] for stop in stops}
-    detected_stop_lines = {
-        line
-        for stop in stops
-        for line in range(int(stop["start_line"]), int(stop["end_line"]) + 1)
-    }
     stops.extend(
         stop
         for stop in manual_stops_for_date(user_tags or {}, target_date.isoformat())
         if stop["id"] not in detected_stop_ids
-        and int(stop.get("start_line") or 0) not in detected_stop_lines
     )
+    stop_overrides = ((user_tags or {}).get(target_date.isoformat(), {}) or {}).get("stops", {})
+    stops = [stop for stop in stops if not stop_is_ignored(stop, stop_overrides)]
     stops.sort(key=lambda stop: (int(stop.get("start_line") or 0), int(stop.get("end_line") or 0)))
-    home_anchor_points = home_anchors(events, home_filter)
+    annotate_visit_boundaries(stops, track_points)
+    missed_stop_suggestions = possible_missed_stops(window_events, stops)
     stop_jitter_anchor_points = stop_jitter_anchors(events, stops, stop_jitter_filter)
     if stop_jitter_filter and stop_jitter_filter.enabled:
         preserve_lines = {
@@ -6840,6 +9506,7 @@ def build_plan(
         "recommended_tags": sorted(set(recommended_tags)),
         "named_places": places,
         "candidate_stops": stops,
+        "possible_missed_stops": missed_stop_suggestions,
         "raw_sampled_track": point_dicts(track_points, events),
         "sampled_track": point_dicts(visual_track_points, events),
         "home_filter": {
@@ -6863,6 +9530,9 @@ def build_plan(
     plan = apply_user_tags(plan, user_tags or {}, events)
     for index, stop in enumerate(plan["candidate_stops"], start=1):
         stop["alias"] = f"s{index}"
+    apply_stop_labels_to_point_dicts(plan)
+    plan["travel_segments"] = build_stop_travel_segments(track_points, plan["candidate_stops"], places)
+    attach_stop_travel_context(plan["candidate_stops"], plan["travel_segments"])
     plan["ride_segments"] = build_ride_segments(track_points, plan["candidate_stops"], places)
     return plan, track_points
 

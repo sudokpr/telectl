@@ -23,6 +23,7 @@ from .tagger import (
     build_stop_index_summary,
     build_sample_heatmap_summary,
     build_stop_jitter_filter_config,
+    build_trip_summary,
     load_user_tags,
     parse_log,
     render_digest,
@@ -31,6 +32,7 @@ from .tagger import (
     render_leaflet_map_html,
     render_map_html,
     render_stop_index_html,
+    render_trip_html,
     target_date_from_text,
     target_scope_from_text,
 )
@@ -164,6 +166,27 @@ def generate_activity_dashboard(start_text: str | None = None, end_text: str | N
         stop_jitter_filter=stop_jitter_filter,
     )
     return summary, render_activity_dashboard_html(summary)
+
+
+def generate_trips(date_text: str | None = None, origin_key: str | None = None, destination_key: str | None = None) -> tuple[dict, str]:
+    env = load_env()
+    local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
+    home_filter = build_home_filter_config(env)
+    log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
+    tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
+    target_date = target_date_from_text(date_text, local_tz) if date_text else datetime.now(local_tz).date()
+
+    events = parse_log(log_path, local_tz)
+    user_tags = load_user_tags(tags_path)
+    summary = build_trip_summary(
+        events,
+        user_tags,
+        target_date=target_date,
+        origin_key=origin_key,
+        destination_key=destination_key,
+        home_filter=home_filter,
+    )
+    return summary, render_trip_html(summary)
 
 
 def generate_search_aliases(start_text: str | None = None, end_text: str | None = None) -> tuple[dict, Path]:
