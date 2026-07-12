@@ -2503,7 +2503,7 @@ def waypoint_override_for(stop: dict, events: list[Event], radius_m: int = 150) 
     stop_lat = as_float(stop.get("lat"))
     stop_lon = as_float(stop.get("lon"))
     best_name = waypoint_name_for(stop_lat, stop_lon, events, radius_m)
-    return {"name": best_name} if best_name else {}
+    return {"name": best_name, "place": True} if best_name else {}
 
 
 def apply_user_tags(plan: dict, user_tags: dict, events: list[Event] | None = None) -> dict:
@@ -2536,6 +2536,8 @@ def apply_user_tags(plan: dict, user_tags: dict, events: list[Event] | None = No
         if override.get("note"):
             stop["user_note"] = override["note"]
             stop["user_reviewed"] = True
+        if "place" in override:
+            stop["place"] = bool(override.get("place"))
         media = override.get("media")
         if isinstance(media, list):
             stop["media"] = [item for item in media if isinstance(item, dict)]

@@ -215,6 +215,7 @@ def test_automotive_dwell_stops_and_filtered_overlay_payload_render(fixture_even
 
     assert stop_line_ranges(plan) == [(27, 29), (30, 31)]
     assert plan["candidate_stops"][1]["reviewed_name"] == "Known family waypoint"
+    assert plan["candidate_stops"][1]["place"] is True
     assert line_numbers(plan, "raw_sampled_track") == line_numbers(plan, "sampled_track")
 
     html = render_leaflet_map_html(plan)
