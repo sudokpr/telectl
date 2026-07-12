@@ -37,7 +37,10 @@ from owntracks.digest import (
     generate_stop_index,
     generate_trips,
 )
+from owntracks.env import load_env
+from owntracks.place_resolver import DEFAULT_OVERPASS_ENDPOINT, resolve_overpass
 from owntracks.tagger import load_user_tags, save_user_tags
+from spending_index import SpendingConfig, index_result_dict, index_scope, query_spending, recent_events
 
 
 _OWNTRACKS_TAGS_LOCK = threading.Lock()
@@ -182,6 +185,7 @@ def make_handler(
     cfg: ImageSummaryConfig,
     http_cfg: HttpIntakeConfig,
     metrics_cfg: MetricsConfig,
+    spending_cfg: SpendingConfig,
     loop: asyncio.AbstractEventLoop,
 ) -> type[BaseHTTPRequestHandler]:
     class IntakeHandler(BaseHTTPRequestHandler):
@@ -271,6 +275,18 @@ def make_handler(
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+                if parsed.path == "/spending/events":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
+                        write_json(self, HTTPStatus.OK, {"ok": True, "events": recent_events(spending_cfg, limit)})
+                    except Exception as exc:
+                        observe_handler_error("http_spending_events", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                     return
                 if parsed.path in {"/owntracks/stops", "/owntracks/stops.html"}:
                     if not authorized(self, http_cfg.token):
@@ -427,6 +443,40 @@ def make_handler(
                         write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                     except Exception as exc:
                         observe_handler_error("http_owntracks_search_aliases", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                if parsed.path == "/spending/index":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        data = read_json(self)
+                        scope = str(data.get("scope") or "").strip() or None
+                        result = index_scope(spending_cfg, cfg, scope)
+                        write_json(self, HTTPStatus.OK, {"ok": True, **index_result_dict(result)})
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    except Exception as exc:
+                        observe_handler_error("http_spending_index", exc)
+                        write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    return
+                if parsed.path == "/spending/query":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        data = read_json(self)
+                        question = str(data.get("question") or "").strip()
+                        if not question:
+                            raise ValueError("missing question")
+                        answer = query_spending(spending_cfg, question)
+                        write_json(self, HTTPStatus.OK, {"ok": True, "answer": answer})
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    except Exception as exc:
+                        observe_handler_error("http_spending_query", exc)
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                     return
                 if parsed.path == "/owntracks/media":
@@ -633,6 +683,44 @@ def make_handler(
                         observe_handler_error("http_owntracks_manual_stop", exc)
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                     return
+                if parsed.path == "/owntracks/resolve-place":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    try:
+                        data = read_json(self)
+                        lat = float(data.get("lat"))
+                        lon = float(data.get("lon"))
+                        radius_m = int(data.get("radius_m") or 120)
+                        env = load_env()
+                        if env.get("OWNTRACKS_PLACE_RESOLVER", "overpass").strip().lower() in {"0", "false", "off", "none", "disabled"}:
+                            raise ValueError("place resolver is disabled")
+                        endpoint = env.get("OWNTRACKS_OVERPASS_ENDPOINT", DEFAULT_OVERPASS_ENDPOINT)
+                        timeout_seconds = int(env.get("OWNTRACKS_OVERPASS_TIMEOUT_SECONDS") or "25")
+                        candidates = resolve_overpass(
+                            lat,
+                            lon,
+                            radius_m=radius_m,
+                            endpoint=endpoint,
+                            timeout_seconds=timeout_seconds,
+                        )
+                        write_json(
+                            self,
+                            HTTPStatus.OK,
+                            {
+                                "ok": True,
+                                "provider": "overpass",
+                                "radius_m": max(20, min(radius_m, 1000)),
+                                "candidates": candidates,
+                            },
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    except Exception as exc:
+                        observe_handler_error("http_owntracks_place_resolve", exc)
+                        write_json(self, HTTPStatus.BAD_GATEWAY, {"ok": False, "error": str(exc)})
+                    return
                 if parsed.path != "/memory":
                     write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                     return
@@ -748,13 +836,14 @@ def start_http_intake(
     cfg: ImageSummaryConfig,
     http_cfg: HttpIntakeConfig,
     metrics_cfg: MetricsConfig,
+    spending_cfg: SpendingConfig,
     loop: asyncio.AbstractEventLoop,
 ) -> ThreadingHTTPServer | None:
     if not http_cfg.enabled:
         return None
     server = ThreadingHTTPServer(
         (http_cfg.host, http_cfg.port),
-        make_handler(application, cfg, http_cfg, metrics_cfg, loop),
+        make_handler(application, cfg, http_cfg, metrics_cfg, spending_cfg, loop),
     )
     thread = threading.Thread(target=server.serve_forever, name="http-intake", daemon=True)
     thread.start()

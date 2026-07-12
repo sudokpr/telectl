@@ -67,7 +67,7 @@ def event_at(line_no: int, iso_time: str, kind: str, lat: float, lon: float, **p
 @pytest.mark.parametrize(
     ("target_date", "expected_stop_ranges", "expected_hidden"),
     [
-        (date(2026, 6, 12), [(3, 4), (6, 7), (10, 11)], [9]),
+        (date(2026, 6, 12), [(3, 4), (6, 7), (10, 11)], []),
         (date(2026, 6, 13), [(18, 20)], [19]),
     ],
 )
@@ -95,9 +95,9 @@ def test_repeated_stop_visits_remain_separate_after_jitter_filtering(fixture_eve
     plan, _ = build_plan(fixture_events, date(2026, 6, 12), stop_jitter_filter=jitter_config())
 
     assert plan["stats"]["track_points"] == 12
-    assert plan["stats"]["visual_track_points"] == 11
+    assert plan["stats"]["visual_track_points"] == 12
     assert stop_line_ranges(plan) == [(3, 4), (6, 7), (10, 11)]
-    assert line_numbers(plan, "sampled_track") == [1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13]
+    assert line_numbers(plan, "sampled_track") == [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
 
 def test_stop_travel_segments_use_stop_boundaries_and_raw_points(fixture_events) -> None:
@@ -111,7 +111,7 @@ def test_stop_travel_segments_use_stop_boundaries_and_raw_points(fixture_events)
     }
     plan, _ = build_plan(fixture_events, date(2026, 6, 12), user_tags=user_tags, stop_jitter_filter=jitter_config())
 
-    assert hidden_lines(plan) == [9]
+    assert hidden_lines(plan) == []
     assert [(segment["start_name"], segment["end_name"], segment["duration_minutes"]) for segment in plan["travel_segments"]] == [
         ("Office", "Lunch", 165),
         ("Lunch", "Office", 9),
@@ -262,6 +262,48 @@ def test_manual_route_point_is_restored_as_stop(fixture_events) -> None:
     assert 'routePointRenderer = L.svg({ pane: "routePointsPane"' in html
     assert "renderer: routePointRenderer" in html
     assert "weight: 10" in html
+    assert "World_Imagery" in html
+    assert '"Satellite": satelliteTiles' in html
+
+
+def test_day_map_renders_poi_locations_with_embedded_media() -> None:
+    events = [
+        Event(
+            1,
+            datetime.fromisoformat("2026-07-06T19:48:18+05:30"),
+            "owntracks/test/device",
+            {
+                "_type": "location",
+                "lat": 12.956929,
+                "lon": 77.518039,
+                "tst": 1783347499,
+                "poi": "test media",
+                "image": "/9j/test",
+                "imagename": "IMG_4081",
+                "motionactivities": ["stationary"],
+                "acc": 14,
+            },
+            TZ,
+        )
+    ]
+
+    plan, _ = build_plan(events, date(2026, 7, 6))
+
+    assert plan["poi_events"][0]["name"] == "test media"
+    assert plan["poi_events"][0]["imagename"] == "IMG_4081"
+    assert plan["poi_events"][0]["image_data_url"] == "data:image/jpeg;base64,/9j/test"
+    assert plan["sampled_track"][0]["poi"] == "test media"
+    assert plan["sampled_track"][0]["has_image"] is True
+
+    html = render_leaflet_map_html(plan)
+
+    assert "poiEvents" in html
+    assert "togglePois" in html
+    assert "POI:" in html
+    assert "test media" in html
+    assert "data:image/jpeg;base64,/9j/test" in html
+    assert "IMG_4081" in html
+    assert "renderPois" in html
 
 
 def test_stop_index_groups_reviewed_places_and_renders_visit_details(fixture_events) -> None:

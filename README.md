@@ -181,6 +181,9 @@ The bot registers these Telegram menu commands:
 - `/cxs` - show whether the tracked process is running
 - `/cxq` - stop the tracked process
 - `/memq` - ask saved memories
+- `/spq` - ask the OwnTracks POI spending/price index
+- `/spi` - index OwnTracks spending POIs for a date/month/year scope
+- `/sph` - show spending command help
 - `/otd` - show an OwnTracks daily activity digest
 - `/otm` - send an interactive labeled OwnTracks stop map
 - `/otme` - send an embedded OwnTracks stop map attachment
@@ -204,23 +207,30 @@ use it for cycle rides, errands, saloon visits, government office visits,
 tax payments, work visits, or any other activity inferred from location
 stops.
 
+The OwnTracks MQTT listener also sends an immediate Telegram message to
+`OWNTRACKS_TOPIC_ID` when a newly received location payload contains a `poi`
+field. Set `OWNTRACKS_POI_NOTIFY_TELEGRAM=false` to keep logging POIs without
+Telegram notifications.
+
 The digest lists named geofence events and candidate stops with Google Maps
 links, motion, duration, and point count. File delivery writes a self-contained
 HTML map attachment. Hosted delivery serves a dynamic Leaflet map from
-`/owntracks/map/YYYY-MM-DD`, which gives normal browser tile loading and zoom.
+`/owntracks/map/YYYY-MM-DD`, which gives normal browser tile loading, zoom, and
+an OpenStreetMap/Satellite layer picker.
 Month and year scopes such as `/owntracks/map/YYYY-MM` and
 `/owntracks/map/YYYY` render heatmaps instead of the daily stop map. Background
-map tiles are loaded from OpenStreetMap when the hosted map is opened. The
-heatmap panel can filter locations by motion mode. `/owntracks/sample` serves a
-synthetic heatmap with points across countries, cities, and city areas for
-visual testing without OwnTracks logs. `/owntracks/stops` serves a searchable
+map tiles are loaded from OpenStreetMap or Esri World Imagery when the hosted
+daily map is opened. The heatmap panel can filter locations by motion mode.
+`/owntracks/sample` serves a synthetic heatmap with points across countries,
+cities, and city areas for visual testing without OwnTracks logs.
+`/owntracks/stops` serves a searchable
 stop/place index with visit details and links back to each daily map.
 `/owntracks/dashboard` serves an activity dashboard for a date range with
 home-only days, out-of-home days, travel days, distance, outside-home time, a
 daily activity calendar, and most visited places. For
 Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
 review visits chronologically, click a visit for a popup editor, rename it,
-add tags/notes, adjust entry or exit time, promote it as a reusable trip place,
+add tags/notes, adjust entry or exit time, keep it reusable for future nearby visits,
 attach local media such as outing photos or running certificates, or dismiss
 traffic-like visits while keeping raw route samples visible. Long
 silent gaps are shown as editable arrival/departure windows instead of precise
@@ -228,13 +238,22 @@ interpolated times. Transition/geofence markers are hidden by default behind
 the **Show transition points** toggle. Each visit gets a short alias such as
 `s1`, `s2`, etc.
 
+Hosted daily maps also include an on-demand **Resolve place** action in visit
+popups. It queries Overpass (`OWNTRACKS_PLACE_RESOLVER=overpass`) around the
+stop coordinate and shows nearby OpenStreetMap names as suggestions. Suggestions
+are not saved automatically; choosing **Use suggestion** writes a normal saved
+stop review to `OWNTRACKS_USER_TAGS_PATH`. Set `OWNTRACKS_PLACE_RESOLVER=disabled`
+to avoid sending coordinates to the public Overpass endpoint.
+
 On a hosted daily map, every visible route point is clickable. Use **Save
 visit** in its popup to persist a short visit that automatic dwell detection
 missed. The point becomes a normal visit after the map reloads and can then be
 named, tagged, adjusted, and reviewed like detected visits. Hosted maps can
-save these edits directly over the authenticated HTTP intake; Telegram command
-export remains available for name/tag/note fallback. Attached HTML maps are
-view-only for these actions because they cannot write back to the local service.
+save these edits directly over the authenticated HTTP intake. Saved visits are
+reusable for future proximity naming by default; check **Single-use visit only**
+when a visit should apply only to that date. Telegram command export remains
+available for name/tag/note fallback. Attached HTML maps are view-only for these
+actions because they cannot write back to the local service.
 
 Hosted OwnTracks media is HTTP-only. The daily map popup and `/owntracks/stops`
 visit cards let you choose an image or PDF, add a caption, upload it, view the
@@ -382,6 +401,49 @@ a fast fallback model such as `gemma4:31b-cloud` for interactive Q&A, while
 keeping `MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
 `MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
 for aggregate questions that need multiple memories.
+
+## OwnTracks Spending POI Index
+
+OwnTracks POIs can be used as spending evidence when iOS automation pushes bank
+SMS text or receipt text/images into the POI field. The bot keeps the raw
+OwnTracks MQTT log unchanged, then a background indexer scans new POIs into a
+local SQLite database:
+
+```env
+SPENDING_INDEX_ENABLED=true
+SPENDING_DB_PATH=./data/spending/spending.sqlite
+SPENDING_INDEX_POLL_SECONDS=60
+SPENDING_INDEX_IMAGES=true
+```
+
+The index stores unreviewed extracted transactions, receipt line items, evidence
+paths, OwnTracks line numbers, and nearest location context. Embedded POI images
+are decoded under `SPENDING_EVIDENCE_DIR`; OCR runs only when
+`IMAGE_SUMMARY_OCR_ENABLED=true`.
+
+Use `/spi` for manual backfills or retries:
+
+```text
+/spi today
+/spi 2026-07-07
+/spi 2026-07
+```
+
+Ask indexed spending and price questions with `/spq`:
+
+```text
+/spq Where was Rs.450 spent on 7th July 2026?
+/spq what is the last price of apples per kg?
+/spq what is the avg price of pizza I paid in 2026?
+```
+
+When HTTP intake is enabled, the same feature is available locally:
+
+```text
+POST /spending/index
+POST /spending/query
+GET /spending/events
+```
 
 ## Codex SDK LLM POC
 

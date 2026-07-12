@@ -349,6 +349,26 @@ def is_stop_jitter_point(
     )
 
 
+def stop_jitter_anchor_key(
+    event: Event,
+    config: StopJitterFilterConfig | None,
+    anchors: list[StopJitterAnchor],
+) -> tuple[str, str, float, float] | None:
+    if not config or not config.enabled or not event.is_location or event.lat is None or event.lon is None:
+        return None
+    nearest: tuple[float, StopJitterAnchor] | None = None
+    for anchor in anchors:
+        distance_m = haversine_km(event.lat, event.lon, anchor.lat, anchor.lon) * 1000
+        if distance_m > config.radius_m:
+            continue
+        if nearest is None or distance_m < nearest[0]:
+            nearest = (distance_m, anchor)
+    if nearest is None:
+        return None
+    anchor = nearest[1]
+    return (anchor.kind, anchor.label.casefold(), round(anchor.lat, 5), round(anchor.lon, 5))
+
+
 def filter_stop_jitter_points(
     points: list[Event],
     config: StopJitterFilterConfig | None,
@@ -358,7 +378,8 @@ def filter_stop_jitter_points(
     if not config or not config.enabled:
         return points, 0
     preserve_lines = preserve_lines or set()
-    jitter_flags = [is_stop_jitter_point(event, config, anchors) for event in points]
+    jitter_anchor_keys = [stop_jitter_anchor_key(event, config, anchors) for event in points]
+    jitter_flags = [key is not None for key in jitter_anchor_keys]
     keep_indices = {index for index, is_jitter in enumerate(jitter_flags) if not is_jitter}
     if len(points) > 1:
         keep_indices.add(0)
@@ -379,6 +400,10 @@ def filter_stop_jitter_points(
             keep_indices.add(start)
         if has_next_route:
             keep_indices.add(end)
+        for boundary_index in range(start + 1, end + 1):
+            if jitter_anchor_keys[boundary_index] != jitter_anchor_keys[boundary_index - 1]:
+                keep_indices.add(boundary_index - 1)
+                keep_indices.add(boundary_index)
         for preserve_index in range(start, end + 1):
             event = points[preserve_index]
             if event.line_no in preserve_lines or event.payload.get("t") == "c":
@@ -439,7 +464,7 @@ def point_dict(event: Event) -> dict:
     altitude = event.payload.get("alt")
     if altitude is None:
         altitude = event.payload.get("ele")
-    return {
+    point = {
         "line": event.line_no,
         "time": fmt_dt(dt),
         "timestamp": recorded_timestamp,
@@ -461,6 +486,33 @@ def point_dict(event: Event) -> dict:
         "regions": event.payload.get("inregions") or [],
         "maps": maps_url(event.lat, event.lon) if event.lat is not None and event.lon is not None else None,
     }
+    poi = str(event.payload.get("poi") or "").strip()
+    if poi:
+        point["poi"] = poi
+    if event.payload.get("imagename"):
+        point["imagename"] = str(event.payload.get("imagename") or "")
+    if event.payload.get("image"):
+        point["has_image"] = True
+    return point
+
+
+def poi_event_dict(event: Event) -> dict | None:
+    poi = str(event.payload.get("poi") or "").strip()
+    if not poi or not event.is_location:
+        return None
+    point = point_dict(event)
+    point["name"] = poi
+    image = str(event.payload.get("image") or "").strip()
+    if image:
+        point["has_image"] = True
+        point["image_data_url"] = f"data:image/jpeg;base64,{image}"
+    if event.payload.get("imagename"):
+        point["imagename"] = str(event.payload.get("imagename") or "")
+    return point
+
+
+def poi_event_dicts(events: list[Event]) -> list[dict]:
+    return [item for event in events if (item := poi_event_dict(event)) is not None]
 
 
 def point_dicts(events: list[Event], all_events: list[Event]) -> list[dict]:
@@ -6546,6 +6598,7 @@ def render_leaflet_map_html(plan: dict) -> str:
             "rawSampledTrack": plan.get("raw_sampled_track", plan.get("sampled_track", [])),
             "sampledTrack": plan.get("sampled_track", []),
             "stops": stops,
+            "poiEvents": plan.get("poi_events", []),
             "possibleMissedStops": plan.get("possible_missed_stops", []),
             "namedPlaces": named_places,
             "travelSegments": plan.get("travel_segments", []),
@@ -6951,6 +7004,23 @@ def render_leaflet_map_html(plan: dict) -> str:
       font-weight: 800;
       padding: 3px 5px;
     }}
+    .poi-label {{
+      background: #0f766e;
+      border: 1px solid #134e4a;
+      border-radius: 4px;
+      color: white;
+      font-size: 12px;
+      font-weight: 800;
+      padding: 3px 5px;
+    }}
+    .poi-image {{
+      border-radius: 7px;
+      display: block;
+      margin-top: 8px;
+      max-height: 190px;
+      object-fit: contain;
+      width: 100%;
+    }}
     .empty {{
       background: white;
       border-radius: 8px;
@@ -7180,6 +7250,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         <button id="togglePlaceLabels" type="button" class="secondary">Show transition points</button>
       </div>
       <button id="toggleFilteredPoints" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show filtered points</button>
+      <button id="togglePois" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show POIs</button>
       <button id="togglePossibleStops" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show possible missed stops</button>
       <div id="possibleStopList" class="stop-list"></div>
       <div class="profile">
@@ -7266,9 +7337,18 @@ def render_leaflet_map_html(plan: dict) -> str:
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     map.createPane("routePointsPane");
     map.getPane("routePointsPane").style.zIndex = "450";
-    const tiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+    const osmTiles = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
+    }});
+    const satelliteTiles = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}", {{
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri"
+    }});
+    osmTiles.addTo(map);
+    L.control.layers({{ "OpenStreetMap": osmTiles, "Satellite": satelliteTiles }}, null, {{
+      collapsed: true,
+      position: "topright"
     }}).addTo(map);
     L.control.zoom({{ position: "bottomright" }}).addTo(map);
     L.control.scale({{ position: "bottomright", metric: true, imperial: false, maxWidth: 160 }}).addTo(map);
@@ -7290,6 +7370,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     const arrowLayer = L.layerGroup().addTo(map);
     const travelTimeLayer = L.layerGroup();
     const placeLayer = L.layerGroup();
+    const poiLayer = L.layerGroup();
     const routeLayer = L.layerGroup().addTo(map);
     const filteredPointLayer = L.layerGroup();
     const possibleStopLayer = L.layerGroup();
@@ -7300,6 +7381,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let travelTimesVisible = false;
     let stopLabelsVisible = true;
     let placeLabelsVisible = false;
+    let poisVisible = true;
     let filteredPointsVisible = false;
     let possibleStopsVisible = false;
     let routeColorMode = "speed";
@@ -7462,6 +7544,10 @@ def render_leaflet_map_html(plan: dict) -> str:
       const token = new URLSearchParams(window.location.search).get("token");
       return `/owntracks/media${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
     }};
+    const owntracksPlaceResolveEndpoint = () => {{
+      const token = new URLSearchParams(window.location.search).get("token");
+      return `/owntracks/resolve-place${{token ? `?token=${{encodeURIComponent(token)}}` : ""}}`;
+    }};
     const mediaHref = (media) => {{
       if (!media || !media.filename) return "#";
       const token = new URLSearchParams(window.location.search).get("token");
@@ -7557,7 +7643,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const placeSelector = popupOnly ? `[data-popup-place="${{stop.alias}}"]` : `[data-place="${{stop.alias}}"]`;
       const placeEditors = document.querySelectorAll(placeSelector);
       const placeEditor = placeEditors.length ? placeEditors[placeEditors.length - 1] : null;
-      if (placeEditor) stop.place = Boolean(placeEditor.checked);
+      if (placeEditor) stop.place = !Boolean(placeEditor.checked);
     }};
     const setSaveFeedback = (message, failed = false) => {{
       const feedback = document.getElementById("saveFeedback");
@@ -7633,6 +7719,59 @@ def render_leaflet_map_html(plan: dict) -> str:
           saveButton.textContent = "Save visit changes";
         }}
       }}
+    }};
+    const renderPlaceCandidates = (stop, candidates) => {{
+      if (!candidates.length) return '<div>No Overpass candidates found nearby.</div>';
+      return candidates.map((candidate, index) => `
+        <div style="border-top: 1px solid #e5e7eb; margin-top: 6px; padding-top: 6px">
+          <strong>${{escapeHtml(candidate.name || "")}}</strong>
+          <div>${{escapeHtml(candidate.category || "place")}} · ${{escapeHtml(candidate.distance_m || 0)}} m · score ${{escapeHtml(candidate.score || 0)}}</div>
+          <button type="button" class="secondary" data-use-place-candidate="${{escapeHtml(stop.alias)}}" data-candidate-index="${{index}}">Use suggestion</button>
+        </div>
+      `).join("");
+    }};
+    const resolveStopPlace = async (stop, container, button) => {{
+      if (!canSaveManualStops()) {{
+        if (container) container.innerHTML = "Open the hosted map to resolve and save places.";
+        return;
+      }}
+      if (button) {{
+        button.disabled = true;
+        button.textContent = "Resolving...";
+      }}
+      if (container) container.innerHTML = "Querying Overpass...";
+      try {{
+        const response = await fetch(owntracksPlaceResolveEndpoint(), {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ lat: stop.lat, lon: stop.lon, radius_m: stop.radius_m || {DEFAULT_VISIT_RADIUS_M} }}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        stop.place_candidates = payload.candidates || [];
+        if (container) container.innerHTML = renderPlaceCandidates(stop, stop.place_candidates);
+      }} catch (error) {{
+        if (container) container.innerHTML = `Resolve failed: ${{escapeHtml(error.message || error)}}`;
+      }} finally {{
+        if (button) {{
+          button.disabled = false;
+          button.textContent = "Resolve place";
+        }}
+      }}
+    }};
+    const usePlaceCandidate = async (stop, candidate, container) => {{
+      if (!candidate) return;
+      stop.name = candidate.name || stop.name;
+      const candidateTags = Array.isArray(candidate.tags) ? candidate.tags : [];
+      stop.tags = [...new Set([...(stop.tags || []), ...candidateTags])];
+      stop.place = true;
+      refreshStop(stop);
+      attachPopupHandlers(stop);
+      renderList();
+      const saved = await saveStopReviews([stop]);
+      if (container) container.innerHTML = saved
+        ? `Saved place: ${{escapeHtml(candidate.name || "")}}`
+        : "Filled suggestion but save failed.";
     }};
     const copyCommandsToClipboard = async (automatic = false) => {{
       if (!commands.value) return false;
@@ -7715,7 +7854,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const currentTrackPoint = {{ lat, lon, timestamp }};
       const segmentSpeedKmh = derivedSpeedKmh(previousTrackPoint, currentTrackPoint);
       if (previousTrackPoint) cumulativeTrackDistanceKm += distanceMeters(previousTrackPoint, currentTrackPoint) / 1000;
-        trackPoints.push({{
+      trackPoints.push({{
         lat,
         lon,
         alt_m: Number.isFinite(alt) ? alt : null,
@@ -7723,11 +7862,14 @@ def render_leaflet_map_html(plan: dict) -> str:
         speed_kmh: bestSpeedKmh(speedKmh, segmentSpeedKmh),
         reported_speed_kmh: Number.isFinite(speedKmh) ? speedKmh : null,
         derived_speed_kmh: segmentSpeedKmh,
-          place_name: point.place_name || null,
-          line: point.line || null,
-          time: point.time || "",
-          maps: point.maps || "",
-          timestamp,
+        place_name: point.place_name || null,
+        poi: point.poi || "",
+        imagename: point.imagename || "",
+        has_image: Boolean(point.has_image),
+        line: point.line || null,
+        time: point.time || "",
+        maps: point.maps || "",
+        timestamp,
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
       previousTrackPoint = currentTrackPoint;
@@ -7892,6 +8034,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     }};
     const visibleTrackPoints = () => trackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
     const filteredTrackPointsForMode = () => filteredTrackPoints.filter((point) => activeMotionMode === "all" || (point.motion_mode || "moving") === activeMotionMode);
+    const poiEvents = data.poiEvents || [];
     const filteredPointPopupHtml = (point) => `
       <div class="segment-popup">
         <strong>Filtered point</strong>
@@ -7906,12 +8049,19 @@ def render_leaflet_map_html(plan: dict) -> str:
       </div>
     `;
     const canSaveManualStops = () => window.location.protocol === "http:" || window.location.protocol === "https:";
+    const routePointTitle = (point) => {{
+      if (point.poi) return `POI: ${{point.poi}}`;
+      if (point.place_name) return point.place_name;
+      return "Route point";
+    }};
     const routePointPopupHtml = (point) => `
       <div class="segment-popup">
-        <strong>${{point.place_name ? escapeHtml(point.place_name) : "Route point"}}</strong>
+        <strong>${{escapeHtml(routePointTitle(point))}}</strong>
         <div class="popup-meta">
           <div>${{formatTime(point.timestamp)}} · Line ${{escapeHtml(point.line || "")}}</div>
           <div>Motion: ${{escapeHtml(point.motion_mode || "unknown")}} · Speed: ${{formatSpeed(point.speed_kmh)}}</div>
+          ${{point.imagename ? `<div>Image: ${{escapeHtml(point.imagename)}}</div>` : ""}}
+          ${{point.has_image ? `<div>Embedded image available in POI marker</div>` : ""}}
           ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
         </div>
         ${{durationAnchorButtons(anchorForRoutePoint(point))}}
@@ -7923,8 +8073,8 @@ def render_leaflet_map_html(plan: dict) -> str:
           <label>Note</label>
           <textarea data-manual-stop-note placeholder="note"></textarea>
           <label class="checkbox-row">
-            <input type="checkbox" data-manual-stop-place>
-            <span>Use as trip place</span>
+            <input type="checkbox" data-manual-stop-single-use>
+            <span>Single-use visit only</span>
           </label>
           <button type="button" data-mark-manual-stop>Save visit</button>
         ` : '<div class="popup-meta">Open the hosted map to mark this point as a stop.</div>'}}
@@ -7937,7 +8087,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       const name = popupElement.querySelector("[data-manual-stop-name]")?.value.trim() || "";
       const tags = parseTags(popupElement.querySelector("[data-manual-stop-tags]")?.value || "");
       const note = popupElement.querySelector("[data-manual-stop-note]")?.value.trim() || "";
-      const place = Boolean(popupElement.querySelector("[data-manual-stop-place]")?.checked);
+      const place = !Boolean(popupElement.querySelector("[data-manual-stop-single-use]")?.checked);
       if (button) button.disabled = true;
       if (result) result.textContent = "Saving...";
       try {{
@@ -8492,6 +8642,78 @@ def render_leaflet_map_html(plan: dict) -> str:
       button.classList.toggle("active", possibleStopsVisible);
       button.disabled = possibleStops.length === 0;
     }};
+    const syncPoisButton = () => {{
+      const button = document.getElementById("togglePois");
+      if (!button) return;
+      button.textContent = poisVisible ? `Hide POIs (${{poiEvents.length}})` : `Show POIs (${{poiEvents.length}})`;
+      button.classList.toggle("active", poisVisible);
+      button.disabled = poiEvents.length === 0;
+    }};
+    const poiPoint = (item) => ({{
+      line: item.line,
+      lat: item.lat,
+      lon: item.lon,
+      timestamp: item.timestamp,
+      time: item.time,
+      motion_mode: item.motion_mode || "unknown",
+      place_name: item.name || item.poi || "",
+      poi: item.name || item.poi || "",
+      imagename: item.imagename || "",
+      has_image: Boolean(item.image_data_url || item.has_image),
+      maps: item.maps || "",
+    }});
+    const poiPopupHtml = (item) => `
+      <div class="segment-popup">
+        <strong>POI: ${{escapeHtml(item.name || item.poi || "untitled")}}</strong>
+        <div class="popup-meta">
+          <div>${{escapeHtml(item.time || formatTime(item.timestamp))}} · Line ${{escapeHtml(item.line || "")}}</div>
+          <div>Motion: ${{escapeHtml(item.motion_mode || "unknown")}} · Accuracy: ${{Number.isFinite(Number(item.accuracy_m)) ? Math.round(Number(item.accuracy_m)) + " m" : "unknown"}}</div>
+          ${{item.imagename ? `<div>Image: ${{escapeHtml(item.imagename)}}</div>` : ""}}
+          ${{item.maps ? `<div><a href="${{escapeHtml(item.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
+        </div>
+        ${{item.image_data_url ? `<a href="${{escapeHtml(item.image_data_url)}}" target="_blank" rel="noreferrer"><img class="poi-image" src="${{escapeHtml(item.image_data_url)}}" alt="${{escapeHtml(item.imagename || item.name || "POI image")}}"></a>` : ""}}
+        ${{routePointPopupHtml(poiPoint(item))}}
+      </div>
+    `;
+    const renderPois = () => {{
+      poiLayer.clearLayers();
+      if (!poisVisible || !poiEvents.length) {{
+        poiLayer.remove();
+        syncPoisButton();
+        return;
+      }}
+      poiEvents.forEach((item, index) => {{
+        const lat = Number(item.lat);
+        const lon = Number(item.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const marker = L.marker([lat, lon], {{
+          icon: L.divIcon({{
+            className: "poi-marker",
+            html: `<div class="poi-label">POI${{item.image_data_url ? " + image" : ""}}</div>`,
+            iconSize: [74, 24],
+            iconAnchor: [10, 20],
+          }}),
+        }}).bindTooltip(escapeHtml(item.name || item.poi || `POI ${{index + 1}}`), {{
+          permanent: true,
+          direction: "right",
+          className: "poi-label",
+        }}).bindPopup(poiPopupHtml(item), {{ maxWidth: 360 }});
+        marker.on("popupopen", () => {{
+          const element = marker.getPopup() && marker.getPopup().getElement();
+          if (!element) return;
+          L.DomEvent.disableClickPropagation(element);
+          const button = element.querySelector("[data-mark-manual-stop]");
+          if (button) button.addEventListener("click", () => saveManualStop(poiPoint(item), element), {{ once: true }});
+        }});
+        marker.addTo(poiLayer);
+      }});
+      poiLayer.addTo(map);
+      syncPoisButton();
+    }};
+    const setPoisVisible = (visible) => {{
+      poisVisible = visible;
+      renderPois();
+    }};
     const possibleStopPoint = (item) => ({{
       line: item.line,
       lat: item.lat,
@@ -8891,12 +9113,16 @@ def render_leaflet_map_html(plan: dict) -> str:
         <label for="popup-radius-${{escapeHtml(stop.alias)}}">Grouping radius, meters</label>
         <input id="popup-radius-${{escapeHtml(stop.alias)}}" data-popup-radius="${{escapeHtml(stop.alias)}}" type="number" min="10" max="5000" step="10" value="${{escapeHtml(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})}}">
         <label class="checkbox-row">
-          <input type="checkbox" data-popup-place="${{escapeHtml(stop.alias)}}" ${{stop.place ? "checked" : ""}}>
-          <span>Save as trip place</span>
+          <input type="checkbox" data-popup-place="${{escapeHtml(stop.alias)}}" ${{stop.place ? "" : "checked"}}>
+          <span>Single-use visit only</span>
         </label>
         ${{renderMediaGallery(stop)}}
         ${{canSaveManualStops() ? renderMediaUpload(stop, "popup") : ""}}
         ${{canSaveManualStops() ? `
+          <div class="row" style="margin-top: 8px">
+            <button type="button" class="secondary" data-resolve-stop="${{escapeHtml(stop.alias)}}">Resolve place</button>
+          </div>
+          <div class="popup-meta" data-place-resolve-results="${{escapeHtml(stop.alias)}}"></div>
           <div class="row" style="margin-top: 8px">
             <button type="button" data-save-stop="${{escapeHtml(stop.alias)}}">Save changes</button>
             <button type="button" class="secondary" data-dismiss-stop="${{escapeHtml(stop.alias)}}">Dismiss visit</button>
@@ -8957,6 +9183,20 @@ def render_leaflet_map_html(plan: dict) -> str:
       }});
       const dismissButton = element.querySelector("[data-dismiss-stop]");
       if (dismissButton) dismissButton.addEventListener("click", () => dismissStop(stop, element));
+      const resolveButton = element.querySelector("[data-resolve-stop]");
+      if (resolveButton) resolveButton.addEventListener("click", () => {{
+        const container = element.querySelector(`[data-place-resolve-results="${{CSS.escape(stop.alias)}}"]`);
+        resolveStopPlace(stop, container, resolveButton);
+      }});
+      element.querySelectorAll("[data-use-place-candidate]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const targetStop = data.stops.find((item) => item.alias === button.dataset.usePlaceCandidate);
+          if (!targetStop) return;
+          const candidate = (targetStop.place_candidates || [])[Number(button.dataset.candidateIndex)];
+          const container = element.querySelector(`[data-place-resolve-results="${{CSS.escape(targetStop.alias)}}"]`);
+          usePlaceCandidate(targetStop, candidate, container);
+        }});
+      }});
       element.querySelectorAll("[data-upload-media]").forEach((button) => {{
         button.addEventListener("click", async () => {{
           const targetStop = data.stops.find((item) => item.alias === button.dataset.uploadMedia);
@@ -9019,7 +9259,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       }} else if (target.dataset.popupRadius) {{
         stop.radius_m = Number(target.value) || {DEFAULT_VISIT_RADIUS_M};
       }} else if (target.dataset.popupPlace) {{
-        stop.place = Boolean(target.checked);
+        stop.place = !Boolean(target.checked);
       }}
       updateCommands();
     }};
@@ -9037,6 +9277,15 @@ def render_leaflet_map_html(plan: dict) -> str:
       if (target.dataset.durationClear != null) clearDurationAnchors();
       if (startKey) setDurationAnchor(startKey, "start");
       if (endKey) setDurationAnchor(endKey, "end");
+      const candidateAlias = target.dataset.usePlaceCandidate;
+      if (candidateAlias) {{
+        const stop = data.stops.find((item) => item.alias === candidateAlias);
+        if (!stop) return;
+        const candidate = (stop.place_candidates || [])[Number(target.dataset.candidateIndex)];
+        const popup = target.closest(".stop-popup");
+        const container = popup ? popup.querySelector(`[data-place-resolve-results="${{CSS.escape(stop.alias)}}"]`) : null;
+        usePlaceCandidate(stop, candidate, container);
+      }}
     }});
     document.addEventListener("input", handlePopupEditEvent);
     document.addEventListener("change", handlePopupEditEvent);
@@ -9060,7 +9309,7 @@ def render_leaflet_map_html(plan: dict) -> str:
           </div>
           <div class="row">
             <input data-radius="${{escapeHtml(stop.alias)}}" type="number" min="10" max="5000" step="10" value="${{escapeHtml(stop.radius_m || {DEFAULT_VISIT_RADIUS_M})}}">
-            <label class="inline-check"><input data-place="${{escapeHtml(stop.alias)}}" type="checkbox" ${{stop.place ? "checked" : ""}}> Trip place</label>
+            <label class="inline-check"><input data-place="${{escapeHtml(stop.alias)}}" type="checkbox" ${{stop.place ? "" : "checked"}}> Single-use only</label>
           </div>
           ${{renderMediaGallery(stop)}}
           ${{canSaveManualStops() ? renderMediaUpload(stop, "list") : ""}}
@@ -9123,7 +9372,7 @@ def render_leaflet_map_html(plan: dict) -> str:
         input.addEventListener("change", () => {{
           const stop = data.stops.find((item) => item.alias === input.dataset.place);
           if (!stop) return;
-          stop.place = Boolean(input.checked);
+          stop.place = !Boolean(input.checked);
           updateCommands();
         }});
       }});
@@ -9207,6 +9456,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       renderRideSegments();
       data.track.forEach((point) => addFitPoint(point[0], point[1]));
     }}
+    poiEvents.forEach((item) => addFitPoint(item.lat, item.lon));
     data.namedPlaces.forEach((place, index) => {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
       const placeAnchor = anchorForPlace(place, index);
@@ -9303,6 +9553,9 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("toggleFilteredPoints").addEventListener("click", () => {{
       setFilteredPointsVisible(!filteredPointsVisible);
     }});
+    document.getElementById("togglePois").addEventListener("click", () => {{
+      setPoisVisible(!poisVisible);
+    }});
     document.getElementById("togglePossibleStops").addEventListener("click", () => {{
       setPossibleStopsVisible(!possibleStopsVisible);
     }});
@@ -9355,6 +9608,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     syncTravelTimesButton();
     syncDayNavigationButtons();
     syncLabelButtons();
+    syncPoisButton();
     syncFilteredPointsButton();
     syncPossibleStopsButton();
     applyLabelVisibility();
@@ -9367,6 +9621,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     setEdgesVisible(true);
     setArrowsVisible(true);
     setTravelTimesVisible(false);
+    setPoisVisible(true);
     setFilteredPointsVisible(false);
     setPossibleStopsVisible(false);
     renderElevationProfile();
@@ -9406,7 +9661,9 @@ def render_leaflet_map_html(plan: dict) -> str:
       }}
     }});
     map.on("zoomend moveend", updateStatus);
-    tiles.on("tileloadstart tileload tileerror", updateStatus);
+    [osmTiles, satelliteTiles].forEach((tileLayer) => {{
+      tileLayer.on("tileloadstart tileload tileerror", updateStatus);
+    }});
     toggleToolsButton.addEventListener("click", () => {{
       tools.classList.toggle("collapsed");
       toggleToolsButton.textContent = tools.classList.contains("collapsed") ? "Tools" : "Hide";
@@ -9507,6 +9764,7 @@ def build_plan(
         "named_places": places,
         "candidate_stops": stops,
         "possible_missed_stops": missed_stop_suggestions,
+        "poi_events": poi_event_dicts(window_events),
         "raw_sampled_track": point_dicts(track_points, events),
         "sampled_track": point_dicts(visual_track_points, events),
         "home_filter": {

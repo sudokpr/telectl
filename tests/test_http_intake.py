@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 
 from http_intake import HttpIntakeConfig, make_handler
 from metrics import MetricsConfig, http_route
+from spending_index import SpendingConfig
 
 
 def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) -> None:
@@ -50,7 +51,19 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
         owntracks_user_tags_path=str(tmp_path / "user_tags.json"),
         owntracks_media_dir=str(tmp_path / "media"),
     )
-    handler = make_handler(SimpleNamespace(), cfg, http_cfg, MetricsConfig(False, "127.0.0.1", 0), None)
+    spending_cfg = SpendingConfig(
+        enabled=True,
+        db_path=tmp_path / "spending.sqlite",
+        evidence_dir=tmp_path / "evidence",
+        owntracks_log_path=tmp_path / "mqtt.log",
+        user_tags_path=tmp_path / "user_tags.json",
+        poll_seconds=60,
+        index_images=False,
+        max_image_bytes=1024,
+        nearest_stop_radius_m=300,
+        nearest_stop_time_window_minutes=180,
+    )
+    handler = make_handler(SimpleNamespace(), cfg, http_cfg, MetricsConfig(False, "127.0.0.1", 0), spending_cfg, None)
 
     from http.server import ThreadingHTTPServer
 

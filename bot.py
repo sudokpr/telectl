@@ -75,6 +75,7 @@ from owntracks.env import project_path as owntracks_project_path
 from owntracks.tagger import load_user_tags as load_owntracks_user_tags
 from owntracks.tagger import save_user_tags as save_owntracks_user_tags
 from owntracks.tagger import target_scope_from_text as owntracks_target_scope_from_text
+from spending_index import SpendingConfig, build_spending_config, index_scope, query_spending, spending_index_loop
 
 RUN_DIR = BASE_DIR / "run"
 LOG_DIR = BASE_DIR / "logs"
@@ -91,6 +92,9 @@ COMMAND_SHORTCUTS: tuple[tuple[str, str], ...] = (
     ("cxs", "show Codex remote-control status"),
     ("cxq", "stop Codex remote control"),
     ("memq", "ask saved memories"),
+    ("spq", "ask spending/price index"),
+    ("spi", "index spending POIs"),
+    ("sph", "show spending help"),
     ("otd", "show OwnTracks activity digest"),
     ("otm", "send interactive OwnTracks map"),
     ("otme", "send embedded OwnTracks map"),
@@ -127,6 +131,7 @@ class Config:
     owntracks_user_tags_path: Path
     owntracks_map_delivery: str
     owntracks_map_base_url: str
+    spending: SpendingConfig
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -218,6 +223,7 @@ def load_config() -> Config:
         ),
         owntracks_map_delivery=(first_value(["OWNTRACKS_MAP_DELIVERY"], local_env) or "file").strip().lower(),
         owntracks_map_base_url=(first_value(["OWNTRACKS_MAP_BASE_URL", "HTTP_PUBLIC_BASE_URL"], local_env) or "").strip(),
+        spending=build_spending_config(image_summary_env),
     )
 
 
@@ -1201,6 +1207,84 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
         observe_handler("memory_query", handler_start, handler_result)
 
 
+async def spending_query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    if not await allowed_user_guard(update, config):
+        return
+
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await message.reply_text("Ask with `/spq Where was Rs.450 spent on 7th July 2026?`")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        return
+
+    handler_result = "success"
+    try:
+        answer = await asyncio.to_thread(query_spending, config.spending, question)
+        await reply_chunked(update, answer, config.image_summary.max_reply_chars)
+    except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("spending_query", exc)
+        raise
+    finally:
+        observe_handler("spending_query", handler_start, handler_result)
+
+
+async def spending_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    if not await allowed_user_guard(update, config):
+        return
+
+    scope = " ".join(context.args or []).strip() or "today"
+    await message.reply_text(f"Indexing spending POIs for `{scope}`.")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    handler_result = "success"
+    try:
+        result = await asyncio.to_thread(index_scope, config.spending, config.image_summary, scope)
+        await message.reply_text(
+            "Spending index complete: "
+            f"scanned={result.scanned}, indexed={result.indexed}, skipped={result.skipped}, errors={result.errors}."
+        )
+        REPLIES_TOTAL.labels(kind="text").inc()
+    except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("spending_index", exc)
+        raise
+    finally:
+        observe_handler("spending_index", handler_start, handler_result)
+
+
+async def spending_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if not await allowed_user_guard(update, config):
+        return
+    await message.reply_text(
+        "Spending commands:\n"
+        "/spq Where was Rs.450 spent on 7th July 2026?\n"
+        "/spq what is the last price of apples per kg?\n"
+        "/spq what is the avg price of pizza I paid in 2026?\n"
+        "/spi [today|yesterday|YYYY-MM-DD|YYYY-MM|YYYY]"
+    )
+    REPLIES_TOTAL.labels(kind="text").inc()
+
+
 async def command_shortcuts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Bot command shortcuts:"]
     lines.extend(f"/{name} - {description}" for name, description in COMMAND_SHORTCUTS)
@@ -1862,9 +1946,18 @@ async def post_init(application: Application) -> None:
         config.image_summary,
         config.http_intake,
         config.metrics,
+        config.spending,
         asyncio.get_running_loop(),
     )
     application.bot_data["http_intake_server"] = server
+    if config.spending.enabled:
+        application.bot_data["spending_index_task"] = asyncio.create_task(
+            spending_index_loop(config.spending, config.image_summary)
+        )
+        image_summary_log(
+            config.image_summary,
+            f"spending_index_started db={config.spending.db_path} poll_seconds={config.spending.poll_seconds}",
+        )
     if config.metrics.enabled and not config.http_intake.enabled:
         start_standalone_metrics_server(config.metrics)
         image_summary_log(
@@ -1900,6 +1993,7 @@ def run_without_telegram(config: Config) -> None:
         config.image_summary,
         config.http_intake,
         config.metrics,
+        config.spending,
         loop,
     )
     if config.metrics.enabled and not config.http_intake.enabled:
@@ -1950,6 +2044,9 @@ def main() -> None:
     application.add_handler(CommandHandler(["cxs", "codex_status"], codex_status))
     application.add_handler(CommandHandler(["cxq", "codex_stop"], codex_stop))
     application.add_handler(CommandHandler(["memq", "memory_query"], memory_query_command))
+    application.add_handler(CommandHandler(["spq", "spending_query"], spending_query_command))
+    application.add_handler(CommandHandler(["spi", "spending_index"], spending_index_command))
+    application.add_handler(CommandHandler(["sph", "spending_help"], spending_help_command))
     application.add_handler(CommandHandler(["oth", "owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
     application.add_handler(CommandHandler(["otd", "ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
     application.add_handler(CommandHandler(["otm", "ot_map", "owntracks_map"], owntracks_map_command))

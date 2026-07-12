@@ -97,7 +97,28 @@ def test_stop_jitter_preserves_transition_and_stop_boundary_connectors() -> None
         preserve_lines={5, 6},
     )
 
-    assert [event.line_no for event in filtered] == [1, 2, 4, 5, 6, 7, 8, 9]
+    assert [event.line_no for event in filtered] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert removed == 0
+
+
+def test_stop_jitter_keeps_connector_when_hidden_run_crosses_anchor_areas() -> None:
+    service = StopJitterAnchor(12.9230, 77.4965, "Service", "candidate_stop")
+    land = StopJitterAnchor(12.795737, 77.324158, "Sugganahalli Land", "geofence")
+    home = StopJitterAnchor(12.9570, 77.5181, "Home", "geofence")
+    points = [
+        location(1, 0, 12.9240, 77.4978, motionactivities=["automotive"]),
+        location(2, 2, 12.9234, 77.4974, motionactivities=["automotive"]),
+        location(3, 4, 12.9230, 77.4966, motionactivities=["automotive"]),
+        location(4, 6, 12.9231, 77.4965, motionactivities=["automotive"]),
+        location(5, 64, 12.7954, 77.3237, motionactivities=["moving"]),
+        location(6, 65, 12.7958, 77.3243, motionactivities=["stationary"]),
+        location(7, 125, 12.9570, 77.5181, motionactivities=["stationary"]),
+        location(8, 130, 12.9570, 77.5182, motionactivities=["stationary"]),
+    ]
+
+    filtered, removed = filter_stop_jitter_points(points, jitter_config(), [service, land, home])
+
+    assert [event.line_no for event in filtered] == [1, 2, 4, 5, 6, 7, 8]
     assert removed == 1
 
 
