@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import json
+import math
 import re
 import secrets
 import threading
@@ -41,6 +42,7 @@ from owntracks.env import load_env
 from owntracks.place_resolver import DEFAULT_OVERPASS_ENDPOINT, resolve_overpass
 from owntracks.tagger import load_user_tags, save_user_tags
 from spending_index import SpendingConfig, index_result_dict, index_scope, query_spending, recent_events
+from usage_analytics import UsageAnalytics, inject_usage_tracker, render_usage_html
 
 
 _OWNTRACKS_TAGS_LOCK = threading.Lock()
@@ -188,6 +190,19 @@ def make_handler(
     spending_cfg: SpendingConfig,
     loop: asyncio.AbstractEventLoop,
 ) -> type[BaseHTTPRequestHandler]:
+    analytics = getattr(application, "bot_data", {}).get("usage_analytics")
+    if not isinstance(analytics, UsageAnalytics):
+        analytics = None
+
+    def usage_record(feature: str, surface: str, action: str = "use") -> None:
+        if analytics is not None:
+            analytics.record(feature, surface, action)
+
+    def tracked_html(document: str, view: str) -> str:
+        if analytics is None or not analytics.config.enabled:
+            return document
+        return inject_usage_tracker(document, view)
+
     class IntakeHandler(BaseHTTPRequestHandler):
         server_version = "TelegramControlIntake/0.1"
 
@@ -216,6 +231,32 @@ def make_handler(
                     return
                 if parsed.path == "/health":
                     write_json(self, HTTPStatus.OK, {"ok": True})
+                    return
+                if parsed.path in {"/usage", "/usage.html", "/usage.json"}:
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    if analytics is None or not analytics.config.enabled:
+                        write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "feature usage analytics disabled"})
+                        return
+                    try:
+                        days = int((parse_qs(parsed.query).get("days") or ["30"])[0])
+                        usage_record("owntracks.view.usage", "owntracks", "view")
+                        summary = analytics.summary(days)
+                    except ValueError as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                        return
+                    if parsed.path == "/usage.json":
+                        write_json(self, HTTPStatus.OK, {"ok": True, **summary})
+                        return
+                    body = tracked_html(render_usage_html(summary), "usage").encode("utf-8")
+                    self.send_response(HTTPStatus.OK.value)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 if parsed.path == "/fuel.csv":
                     path = Path(http_cfg.fuel_csv_path)
@@ -268,7 +309,8 @@ def make_handler(
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                         return
                     observe_owntracks_ui_render("sample", render_start, "success")
-                    body = html.encode("utf-8")
+                    usage_record("owntracks.view.sample", "owntracks", "view")
+                    body = tracked_html(html, "sample").encode("utf-8")
                     self.send_response(HTTPStatus.OK.value)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -311,7 +353,8 @@ def make_handler(
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                         return
                     observe_owntracks_ui_render("stops", render_start, "success")
-                    body = html.encode("utf-8")
+                    usage_record("owntracks.view.stops", "owntracks", "view")
+                    body = tracked_html(html, "stops").encode("utf-8")
                     self.send_response(HTTPStatus.OK.value)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -342,7 +385,8 @@ def make_handler(
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                         return
                     observe_owntracks_ui_render("trips", render_start, "success")
-                    body = html.encode("utf-8")
+                    usage_record("owntracks.view.trips", "owntracks", "view")
+                    body = tracked_html(html, "trips").encode("utf-8")
                     self.send_response(HTTPStatus.OK.value)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -359,11 +403,24 @@ def make_handler(
                         query = parse_qs(parsed.query)
                         start_text = (query.get("start") or [""])[0].strip()
                         end_text = (query.get("end") or [""])[0].strip()
+                        home_radius_text = (query.get("home_radius_km") or [""])[0].strip()
                         for label, value in (("start", start_text), ("end", end_text)):
                             if value and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
                                 raise ValueError(f"invalid {label} date")
+                        home_radius_km = None
+                        if home_radius_text:
+                            try:
+                                home_radius_km = float(home_radius_text)
+                            except ValueError as exc:
+                                raise ValueError("invalid home radius") from exc
+                            if not math.isfinite(home_radius_km) or not 0.01 <= home_radius_km <= 1000:
+                                raise ValueError("home radius must be between 0.01 and 1000 km")
                         render_start = time.monotonic()
-                        _summary, html = generate_activity_dashboard(start_text or None, end_text or None)
+                        _summary, html = generate_activity_dashboard(
+                            start_text or None,
+                            end_text or None,
+                            home_radius_km,
+                        )
                     except ValueError as exc:
                         write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                         return
@@ -373,7 +430,8 @@ def make_handler(
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                         return
                     observe_owntracks_ui_render("dashboard", render_start, "success")
-                    body = html.encode("utf-8")
+                    usage_record("owntracks.view.dashboard", "owntracks", "view")
+                    body = tracked_html(html, "dashboard").encode("utf-8")
                     self.send_response(HTTPStatus.OK.value)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -400,7 +458,9 @@ def make_handler(
                         write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                         return
                     observe_owntracks_ui_render("map", render_start, "success")
-                    body = html.encode("utf-8")
+                    map_view = "heat" if len(match.split("-")) < 3 else "day"
+                    usage_record(f"owntracks.view.{map_view}_map", "owntracks", "view")
+                    body = tracked_html(html, map_view).encode("utf-8")
                     self.send_response(HTTPStatus.OK.value)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -416,6 +476,29 @@ def make_handler(
             start = time.monotonic()
             try:
                 parsed = urlparse(self.path)
+                if parsed.path == "/usage/events":
+                    if not authorized(self, http_cfg.token):
+                        observe_http_auth_failure(self.path)
+                        write_json(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                        return
+                    if analytics is None or not analytics.config.enabled:
+                        write_json(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "feature usage analytics disabled"})
+                        return
+                    try:
+                        data = read_json(self)
+                        feature = str(data.get("feature") or "")
+                        surface = str(data.get("surface") or "owntracks")
+                        action = str(data.get("action") or "click")
+                        if not feature.startswith("owntracks.ui."):
+                            raise ValueError("invalid feature")
+                        if surface != "owntracks" or action not in {"click", "input", "change"}:
+                            raise ValueError("invalid event")
+                        if not analytics.record(feature, surface, action):
+                            raise ValueError("invalid feature")
+                        write_json(self, HTTPStatus.ACCEPTED, {"ok": True})
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
                 if parsed.path == "/owntracks/search-aliases":
                     if not authorized(self, http_cfg.token):
                         observe_http_auth_failure(self.path)
@@ -454,6 +537,7 @@ def make_handler(
                         data = read_json(self)
                         scope = str(data.get("scope") or "").strip() or None
                         result = index_scope(spending_cfg, cfg, scope)
+                        usage_record("http.spending_index", "http")
                         write_json(self, HTTPStatus.OK, {"ok": True, **index_result_dict(result)})
                     except (TypeError, ValueError, json.JSONDecodeError) as exc:
                         write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
@@ -472,6 +556,7 @@ def make_handler(
                         if not question:
                             raise ValueError("missing question")
                         answer = query_spending(spending_cfg, question)
+                        usage_record("http.spending_query", "http")
                         write_json(self, HTTPStatus.OK, {"ok": True, "answer": answer})
                     except (TypeError, ValueError, json.JSONDecodeError) as exc:
                         write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
@@ -579,6 +664,19 @@ def make_handler(
                                 "tags": [str(tag).strip()[:100] for tag in raw_tags if str(tag).strip()][:50],
                                 "note": str(data.get("note") or "").strip()[:2000],
                             }
+                            if bool(data.get("manual")):
+                                line = int(data.get("line"))
+                                if line < 1:
+                                    raise ValueError("invalid line")
+                                saved_review.update(
+                                    {
+                                        "manual": True,
+                                        "line": line,
+                                        "timestamp": data.get("timestamp"),
+                                        "time": str(data.get("time") or ""),
+                                        "motion_mode": str(data.get("motion_mode") or "unknown"),
+                                    }
+                                )
                             name = str(data.get("name") or "").strip()
                             if name:
                                 saved_review["name"] = name[:200]
@@ -754,6 +852,7 @@ def make_handler(
                         future.result(timeout=30)
 
                     HTTP_MEMORY_POSTS_TOTAL.labels(result="success").inc()
+                    usage_record("http.memory_intake", "http")
                     write_json(
                         self,
                         HTTPStatus.OK,

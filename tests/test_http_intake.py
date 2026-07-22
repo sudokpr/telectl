@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from http_intake import HttpIntakeConfig, make_handler
 from metrics import MetricsConfig, http_route
 from spending_index import SpendingConfig
+from usage_analytics import UsageAnalytics, UsageConfig
 
 
 def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) -> None:
@@ -18,21 +19,21 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
         "http_intake.generate_stop_index",
         lambda start_text=None, end_text=None: (
             {"scope": {"start": start_text, "end": end_text}},
-            "<!doctype html><title>OwnTracks stop index</title>",
+            "<!doctype html><title>OwnTracks stop index</title><body></body>",
         ),
     )
     monkeypatch.setattr(
         "http_intake.generate_activity_dashboard",
-        lambda start_text=None, end_text=None: (
-            {"scope": {"start": start_text, "end": end_text}},
-            "<!doctype html><title>OwnTracks activity dashboard</title>",
+        lambda start_text=None, end_text=None, home_radius_km=None: (
+            {"scope": {"start": start_text, "end": end_text}, "home_radius_km": home_radius_km},
+            "<!doctype html><title>OwnTracks activity dashboard</title><body></body>",
         ),
     )
     monkeypatch.setattr(
         "http_intake.generate_trips",
         lambda date_text=None, origin_key=None, destination_key=None: (
             {"date": date_text, "origin": origin_key, "destination": destination_key},
-            "<!doctype html><title>OwnTracks trips</title>",
+            "<!doctype html><title>OwnTracks trips</title><body></body>",
         ),
     )
     monkeypatch.setattr(
@@ -63,7 +64,9 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
         nearest_stop_radius_m=300,
         nearest_stop_time_window_minutes=180,
     )
-    handler = make_handler(SimpleNamespace(), cfg, http_cfg, MetricsConfig(False, "127.0.0.1", 0), spending_cfg, None)
+    analytics = UsageAnalytics(UsageConfig(True, tmp_path / "usage.sqlite", 365))
+    application = SimpleNamespace(bot_data={"usage_analytics": analytics})
+    handler = make_handler(application, cfg, http_cfg, MetricsConfig(False, "127.0.0.1", 0), spending_cfg, None)
 
     from http.server import ThreadingHTTPServer
 
@@ -77,9 +80,27 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
 
         with urlopen(f"{base_url}/owntracks/stops?token=test-token&start=2026-06-01&end=2026-06-30") as response:
             assert response.status == 200
-            assert "OwnTracks stop index" in response.read().decode()
+            stops_html = response.read().decode()
+            assert "OwnTracks stop index" in stops_html
+            assert "data-feature-usage" in stops_html
 
-        with urlopen(f"{base_url}/owntracks/dashboard?token=test-token&start=2026-06-01&end=2026-06-30") as response:
+        usage_event = Request(
+            f"{base_url}/usage/events?token=test-token",
+            data=json.dumps({"feature": "owntracks.ui.stops.refresh_aliases", "surface": "owntracks", "action": "click"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(usage_event) as response:
+            assert response.status == 202
+
+        with urlopen(f"{base_url}/usage.json?token=test-token&days=30") as response:
+            usage = json.load(response)
+            by_key = {item["key"]: item for item in usage["features"]}
+            assert usage["ok"] is True
+            assert by_key["owntracks.view.stops"]["count"] == 1
+            assert by_key["owntracks.ui.stops.refresh_aliases"]["count"] == 1
+
+        with urlopen(f"{base_url}/owntracks/dashboard?token=test-token&start=2026-06-01&end=2026-06-30&home_radius_km=2.5") as response:
             assert response.status == 200
             assert "OwnTracks activity dashboard" in response.read().decode()
 
@@ -136,6 +157,33 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
             payload = json.load(response)
             assert response.status == 201
             assert payload["id"] == "manual-stop-42"
+
+        inferred_stop_request = Request(
+            f"{base_url}/owntracks/stops?token=test-token",
+            data=json.dumps(
+                {
+                    "date": "2026-06-19",
+                    "id": "manual-stop-43-1781885700",
+                    "manual": True,
+                    "lat": 12.9721,
+                    "lon": 77.5951,
+                    "line": 43,
+                    "timestamp": 1781885700,
+                    "time": "12:15",
+                    "motion_mode": "automotive",
+                    "name": "Inferred trajectory stop",
+                    "entry_time": "12:15",
+                    "exit_time": "12:25",
+                    "place": False,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(inferred_stop_request) as response:
+            payload = json.load(response)
+            assert response.status == 200
+            assert payload["id"] == "manual-stop-43-1781885700"
 
         review_request = Request(
             f"{base_url}/owntracks/stops?token=test-token",
@@ -227,6 +275,14 @@ def test_health_memory_and_manual_stop_endpoints(tmp_path: Path, monkeypatch) ->
         assert saved_stop["entry_time"] == "11:55"
         assert saved_stop["exit_time"] == "~12:30"
         assert saved_stop["radius_m"] == 250
+        inferred_stop = saved_tags["2026-06-19"]["stops"]["manual-stop-43-1781885700"]
+        assert inferred_stop["manual"] is True
+        assert inferred_stop["line"] == 43
+        assert inferred_stop["timestamp"] == 1781885700
+        assert inferred_stop["entry_time"] == "12:15"
+        assert inferred_stop["exit_time"] == "12:25"
+        assert inferred_stop["lat"] == 12.9721
+        assert inferred_stop["lon"] == 77.5951
         assert saved_tags["2026-06-19"]["stops"]["unnamed-stop-9-99"]["ignored"] is True
     finally:
         server.shutdown()

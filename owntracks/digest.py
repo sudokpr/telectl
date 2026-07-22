@@ -143,10 +143,20 @@ def generate_stop_index(start_text: str | None = None, end_text: str | None = No
     return summary, render_stop_index_html(summary)
 
 
-def generate_activity_dashboard(start_text: str | None = None, end_text: str | None = None) -> tuple[dict, str]:
+def generate_activity_dashboard(
+    start_text: str | None = None,
+    end_text: str | None = None,
+    home_radius_km: float | None = None,
+) -> tuple[dict, str]:
     env = load_env()
     local_tz = ZoneInfo(env.get("OWNTRACKS_TIMEZONE", "Asia/Kolkata"))
     home_filter = build_home_filter_config(env)
+    if home_radius_km is not None:
+        home_filter = type(home_filter)(
+            home_filter.enabled,
+            home_filter.region_names,
+            home_radius_km * 1000,
+        )
     stop_jitter_filter = build_stop_jitter_filter_config(env)
     log_path = project_path(env.get("OWNTRACKS_LOG_PATH"), "./data/owntracks/mqtt.log")
     tags_path = project_path(env.get("OWNTRACKS_USER_TAGS_PATH"), "./data/owntracks/user_tags.json")
@@ -165,6 +175,8 @@ def generate_activity_dashboard(start_text: str | None = None, end_text: str | N
         home_filter=home_filter,
         stop_jitter_filter=stop_jitter_filter,
     )
+    if not start_text and not end_text:
+        summary["range_preset"] = "month-to-date"
     return summary, render_activity_dashboard_html(summary)
 
 

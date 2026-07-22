@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -256,6 +257,11 @@ def test_manual_route_point_is_restored_as_stop(fixture_events) -> None:
     assert "/owntracks/stops" in html
     assert "Save visit changes" in html
     assert "saveStopReviews" in html
+    assert "Add missing stop" in html
+    assert "nearestTrajectoryProjection" in html
+    assert "Snap marker to trajectory" in html
+    assert "Adjust location" in html
+    assert "manual-stop-${line}-${timestamp}" in html
     assert "routeAnimationMaxZoom = 16" in html
     assert "map.fitBounds(routeBounds" in html
     assert "map.panInside(currentPosition" not in html
@@ -305,6 +311,77 @@ def test_day_map_renders_poi_locations_with_embedded_media() -> None:
     assert "data:image/jpeg;base64,/9j/test" in html
     assert "IMG_4081" in html
     assert "renderPois" in html
+
+
+def test_day_map_uses_structured_poi_capture_context_and_single_wrapped_label() -> None:
+    received_at = datetime.fromisoformat("2026-07-18T00:10:00+05:30")
+    inner = {
+        "time ": "2026-07-17T23:58:36+05:30",
+        "lat": 12.95900953072699,
+        "lon": 77.5007669503874,
+        "poi": "A very long captured POI description that should be wrapped and clamped on the map label",
+    }
+    events = [
+        Event(
+            1,
+            datetime.fromisoformat("2026-07-17T23:55:00+05:30"),
+            "owntracks/test/device",
+            {
+                "_type": "location",
+                "lat": 12.946154,
+                "lon": 77.528397,
+                "tst": int(datetime.fromisoformat("2026-07-17T23:55:00+05:30").timestamp()),
+                "acc": 40,
+            },
+            TZ,
+        ),
+        Event(
+            2,
+            received_at,
+            "owntracks/test/device",
+            {
+                "_type": "location",
+                "lat": 12.956949,
+                "lon": 77.518101,
+                "tst": int(datetime.fromisoformat("2026-07-18T00:05:00+05:30").timestamp()),
+                "poi": json.dumps(inner),
+            },
+            TZ,
+        )
+    ]
+
+    plan, _ = build_plan(events, date(2026, 7, 17))
+
+    assert len(plan["poi_events"]) == 1
+    poi = plan["poi_events"][0]
+    assert poi["name"] == inner["poi"]
+    assert poi["lat"] == inner["lat"]
+    assert poi["lon"] == inner["lon"]
+    assert poi["timestamp"] == int(datetime.fromisoformat(inner["time "]).timestamp())
+    assert poi["maps"] == "https://maps.google.com/?q=12.959010,77.500767"
+    assert poi["outer_lat"] == 12.956949
+    assert poi["outer_lon"] == 77.518101
+    assert poi["has_inner_context"] is True
+    assert poi["track_lat"] == 12.946154
+    assert poi["track_lon"] == 77.528397
+    assert poi["track_method"] == "nearest reliable sample"
+    assert poi["track_delta_seconds"] == -216
+
+    html = render_leaflet_map_html(plan)
+
+    assert 'class="poi-label-prefix"' in html
+    assert 'class="poi-label-text"' in html
+    assert 'if (zoom < 14) return "compact"' in html
+    assert 'if (zoom < 16) return "medium"' in html
+    assert "-webkit-line-clamp: 2" in html
+    assert "refreshPoiMarkers();" in html
+    assert 'id="poiPositionSource"' in html
+    assert "OwnTracks at capture time" in html
+    assert "iOS capture (inner payload)" in html
+    assert "OwnTracks envelope (outer payload)" in html
+    assert 'position_source: "OwnTracks envelope"' in html
+    assert 'position_source: "OwnTracks at capture time"' in html
+    assert ").bindTooltip(escapeHtml(item.name || item.poi" not in html
 
 
 def test_stop_index_groups_reviewed_places_and_renders_visit_details(fixture_events) -> None:
@@ -566,3 +643,50 @@ def test_activity_dashboard_summarizes_days_and_places(fixture_events) -> None:
     assert "Year to date" in html
     assert "/owntracks/dashboard" in html
     assert "/owntracks/map/" in html
+    assert 'name="home_radius_km"' in html
+    assert 'value="0.12"' in html
+    assert "syncRangePreset" in html
+
+
+def test_activity_dashboard_home_radius_changes_day_classification() -> None:
+    events = [
+        Event(
+            1,
+            datetime.fromisoformat("2026-06-01T08:00:00+05:30"),
+            "owntracks/test/device",
+            {"_type": "waypoint", "desc": "Home", "lat": 12.0, "lon": 77.0},
+            TZ,
+        ),
+        Event(
+            2,
+            datetime.fromisoformat("2026-06-01T09:00:00+05:30"),
+            "owntracks/test/device",
+            {"_type": "location", "lat": 12.0, "lon": 77.0},
+            TZ,
+        ),
+        Event(
+            3,
+            datetime.fromisoformat("2026-06-01T10:00:00+05:30"),
+            "owntracks/test/device",
+            {"_type": "location", "lat": 12.0, "lon": 77.005},
+            TZ,
+        ),
+    ]
+
+    narrow = build_activity_dashboard_summary(
+        events,
+        start=date(2026, 6, 1),
+        end=date(2026, 6, 1),
+        home_filter=HomeFilterConfig(True, ("Home",), 150),
+    )
+    wide = build_activity_dashboard_summary(
+        events,
+        start=date(2026, 6, 1),
+        end=date(2026, 6, 1),
+        home_filter=HomeFilterConfig(True, ("Home",), 1000),
+    )
+
+    assert narrow["daily"][0]["out_of_home"] is True
+    assert wide["daily"][0]["home_only"] is True
+    assert narrow["home_radius_km"] == 0.15
+    assert wide["home_radius_km"] == 1.0

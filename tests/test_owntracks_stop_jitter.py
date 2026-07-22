@@ -17,6 +17,7 @@ from owntracks.tagger import (
     filter_stop_jitter_points,
     location_override_for,
     point_dicts,
+    route_points_via_manual_stops,
     saved_stop_matches_stop,
     render_leaflet_map_html,
     render_trip_html,
@@ -283,6 +284,8 @@ def test_leaflet_map_payload_includes_possible_missed_stops() -> None:
     }
 
     html = render_leaflet_map_html(plan)
+    assert 'id="today"' in html
+    assert "navigateToday" in html
     match = re.search(r"const data = (\{.*?\});\n", html, re.S)
 
     assert match is not None
@@ -370,6 +373,66 @@ def test_proximity_override_does_not_rename_existing_named_stop() -> None:
 
     assert location_override_for(home_stop, user_tags, "2026-06-13") == {}
     assert location_override_for(unnamed_stop, user_tags, "2026-06-13")["name"] == "Hair salon"
+
+
+def test_single_use_detected_stop_is_exact_only_not_reused_by_proximity() -> None:
+    user_tags = {
+        "2026-06-12": {
+            "stops": {
+                "unnamed-stop-7-42": {
+                    "name": "One-time errand",
+                    "lat": 12.90005,
+                    "lon": 77.59005,
+                    "timestamp": 1_718_200_100,
+                    "place": False,
+                }
+            }
+        }
+    }
+
+    exact_stop = {
+        "name": "unnamed-stop-7",
+        "lat": 12.90005,
+        "lon": 77.59005,
+        "start_timestamp": 1_718_200_000,
+        "end_timestamp": 1_718_200_200,
+    }
+    future_stop = {"name": "unnamed-stop-8", "lat": 12.9000, "lon": 77.5900}
+
+    assert location_override_for(exact_stop, user_tags, "2026-06-12")["name"] == "One-time errand"
+    assert location_override_for(future_stop, user_tags, "2026-06-13") == {}
+
+
+def test_manual_stop_with_corrected_times_routes_through_saved_location() -> None:
+    points = [
+        {"lat": 12.8000, "lon": 77.3200, "timestamp": 100, "line": 1},
+        {"lat": 12.8100, "lon": 77.3300, "timestamp": 250, "line": 2},
+        {"lat": 12.8200, "lon": 77.3400, "timestamp": 400, "line": 3},
+    ]
+    stop = {
+        "id": "manual-stop-1-200",
+        "manual": True,
+        "reviewed_name": "Missed temple",
+        "lat": 12.8050,
+        "lon": 77.3500,
+        "start_line": 1,
+        "visit_start_timestamp": 200,
+        "visit_end_timestamp": 300,
+        "entry_display": "14:01",
+        "exit_display": "14:20",
+        "entry_corrected": True,
+        "exit_corrected": True,
+    }
+
+    routed = route_points_via_manual_stops(points, [stop])
+
+    assert [point["timestamp"] for point in routed] == [100, 200, 300, 400]
+    assert [(point["lat"], point["lon"]) for point in routed[1:3]] == [
+        (12.805, 77.35),
+        (12.805, 77.35),
+    ]
+    assert [point["manual_stop_phase"] for point in routed[1:3]] == ["arrival", "departure"]
+    assert points[1]["timestamp"] == 250
 
 
 def test_manual_route_point_does_not_rename_detected_home_stop() -> None:

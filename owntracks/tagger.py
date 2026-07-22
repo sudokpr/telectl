@@ -77,6 +77,9 @@ MOTION_COLORS = {
 
 DEFAULT_VISIT_RADIUS_M = 180
 VISIT_BOUNDARY_INTERPOLATION_MAX_GAP_SECONDS = 20 * 60
+POI_TRACK_MAX_ACCURACY_M = 200
+POI_TRACK_MAX_DELTA_SECONDS = 15 * 60
+POI_TRACK_INTERPOLATION_MAX_GAP_SECONDS = 20 * 60
 
 
 @dataclass(frozen=True)
@@ -486,7 +489,7 @@ def point_dict(event: Event) -> dict:
         "regions": event.payload.get("inregions") or [],
         "maps": maps_url(event.lat, event.lon) if event.lat is not None and event.lon is not None else None,
     }
-    poi = str(event.payload.get("poi") or "").strip()
+    poi = poi_context(event)["text"]
     if poi:
         point["poi"] = poi
     if event.payload.get("imagename"):
@@ -496,12 +499,166 @@ def point_dict(event: Event) -> dict:
     return point
 
 
-def poi_event_dict(event: Event) -> dict | None:
-    poi = str(event.payload.get("poi") or "").strip()
-    if not poi or not event.is_location:
+def parsed_poi_datetime(value: object, local_tz: ZoneInfo | timezone) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_tz)
+    return parsed.astimezone(local_tz)
+
+
+def valid_poi_coordinates(lat: object, lon: object) -> tuple[float, float] | None:
+    parsed_lat = as_float(lat)
+    parsed_lon = as_float(lon)
+    if parsed_lat is None or parsed_lon is None:
+        return None
+    if not math.isfinite(parsed_lat) or not math.isfinite(parsed_lon):
+        return None
+    if not (-90 <= parsed_lat <= 90 and -180 <= parsed_lon <= 180):
+        return None
+    return parsed_lat, parsed_lon
+
+
+def poi_context(event: Event) -> dict:
+    """Resolve structured iOS POI capture fields with OwnTracks fallback."""
+    raw_poi = str(event.payload.get("poi") or "").strip()
+    context = {
+        "text": raw_poi,
+        "lat": event.lat,
+        "lon": event.lon,
+        "recorded_at": event_time(event),
+        "structured": False,
+        "inner_coordinates": False,
+    }
+    if not raw_poi.startswith("{"):
+        return context
+    try:
+        decoded = json.loads(raw_poi)
+    except json.JSONDecodeError:
+        return context
+    if not isinstance(decoded, dict):
+        return context
+
+    fields = {str(key).strip(): value for key, value in decoded.items()}
+    inner_text = fields.get("poi", fields.get("text"))
+    if not isinstance(inner_text, str) or not inner_text.strip():
+        return context
+    context["text"] = inner_text.strip()
+    context["structured"] = True
+
+    captured_at = parsed_poi_datetime(fields.get("time", fields.get("captured_at")), event.local_tz)
+    if captured_at is not None:
+        context["recorded_at"] = captured_at
+
+    coordinates = valid_poi_coordinates(fields.get("lat"), fields.get("lon"))
+    if coordinates is not None:
+        context["lat"], context["lon"] = coordinates
+        context["inner_coordinates"] = True
+    return context
+
+
+def poi_track_position(event: Event, events: list[Event], captured_at: datetime) -> dict | None:
+    candidates: list[tuple[float, Event, float | None]] = []
+    for candidate in events:
+        if candidate.line_no == event.line_no or not candidate.is_location:
+            continue
+        delta = (event_time(candidate) - captured_at).total_seconds()
+        if abs(delta) > POI_TRACK_MAX_DELTA_SECONDS:
+            continue
+        accuracy = as_float(candidate.payload.get("acc"))
+        if accuracy is not None and accuracy > POI_TRACK_MAX_ACCURACY_M:
+            continue
+        candidates.append((delta, candidate, accuracy))
+    if not candidates:
+        return None
+
+    before = max((item for item in candidates if item[0] <= 0), default=None, key=lambda item: item[0])
+    after = min((item for item in candidates if item[0] >= 0), default=None, key=lambda item: item[0])
+    if before is not None and after is not None and before[1].line_no != after[1].line_no:
+        gap_seconds = after[0] - before[0]
+        if 0 < gap_seconds <= POI_TRACK_INTERPOLATION_MAX_GAP_SECONDS:
+            ratio = -before[0] / gap_seconds
+            lat = float(before[1].lat) + (float(after[1].lat) - float(before[1].lat)) * ratio
+            lon = float(before[1].lon) + (float(after[1].lon) - float(before[1].lon)) * ratio
+            accuracies = [value for value in (before[2], after[2]) if value is not None]
+            return {
+                "lat": lat,
+                "lon": lon,
+                "maps": maps_url(lat, lon),
+                "accuracy_m": max(accuracies) if accuracies else None,
+                "method": "interpolated",
+                "sample_time": fmt_dt(captured_at),
+                "delta_seconds": 0,
+                "lines": [before[1].line_no, after[1].line_no],
+            }
+
+    delta, candidate, accuracy = min(
+        candidates,
+        key=lambda item: (abs(item[0]), item[2] if item[2] is not None else POI_TRACK_MAX_ACCURACY_M),
+    )
+    return {
+        "lat": candidate.lat,
+        "lon": candidate.lon,
+        "maps": maps_url(float(candidate.lat), float(candidate.lon)),
+        "accuracy_m": accuracy,
+        "method": "nearest reliable sample",
+        "sample_time": fmt_dt(event_time(candidate)),
+        "delta_seconds": int(delta),
+        "lines": [candidate.line_no],
+    }
+
+
+def poi_event_dict(event: Event, events: list[Event] | None = None) -> dict | None:
+    context = poi_context(event)
+    poi = str(context["text"] or "").strip()
+    lat = context["lat"]
+    lon = context["lon"]
+    recorded_at = context["recorded_at"]
+    if not poi or lat is None or lon is None:
         return None
     point = point_dict(event)
+    point["outer_lat"] = point.get("lat")
+    point["outer_lon"] = point.get("lon")
+    point["outer_time"] = point.get("time")
+    point["outer_timestamp"] = point.get("timestamp")
+    point["outer_maps"] = point.get("maps")
+    point["outer_accuracy_m"] = point.get("accuracy_m")
+    point["has_inner_context"] = bool(context["structured"])
+    timestamp = int(recorded_at.timestamp()) if isinstance(recorded_at, datetime) else None
+    received_timestamp = point.get("received_timestamp")
+    point["lat"] = lat
+    point["lon"] = lon
+    point["time"] = fmt_dt(recorded_at)
+    point["timestamp"] = timestamp
+    point["maps"] = maps_url(lat, lon)
+    point["upload_delay_seconds"] = (
+        received_timestamp - timestamp
+        if isinstance(received_timestamp, int) and isinstance(timestamp, int)
+        else None
+    )
+    if context["inner_coordinates"]:
+        point["accuracy_m"] = None
     point["name"] = poi
+    point["poi"] = poi
+    track_position = (
+        poi_track_position(event, events, recorded_at)
+        if context["structured"] and events is not None and isinstance(recorded_at, datetime)
+        else None
+    )
+    if track_position is not None:
+        point["track_lat"] = track_position["lat"]
+        point["track_lon"] = track_position["lon"]
+        point["track_maps"] = track_position["maps"]
+        point["track_accuracy_m"] = track_position["accuracy_m"]
+        point["track_method"] = track_position["method"]
+        point["track_sample_time"] = track_position["sample_time"]
+        point["track_delta_seconds"] = track_position["delta_seconds"]
+        point["track_lines"] = track_position["lines"]
     image = str(event.payload.get("image") or "").strip()
     if image:
         point["has_image"] = True
@@ -511,8 +668,17 @@ def poi_event_dict(event: Event) -> dict | None:
     return point
 
 
-def poi_event_dicts(events: list[Event]) -> list[dict]:
-    return [item for event in events if (item := poi_event_dict(event)) is not None]
+def poi_event_dicts(events: list[Event], target_date: date | None = None) -> list[dict]:
+    items = []
+    for event in events:
+        context = poi_context(event)
+        recorded_at = context["recorded_at"]
+        if target_date is not None and (not isinstance(recorded_at, datetime) or recorded_at.date() != target_date):
+            continue
+        item = poi_event_dict(event, events)
+        if item is not None:
+            items.append(item)
+    return items
 
 
 def point_dicts(events: list[Event], all_events: list[Event]) -> list[dict]:
@@ -548,6 +714,86 @@ def apply_stop_labels_to_point_dicts(plan: dict) -> None:
                 if start_timestamp <= timestamp <= end_timestamp:
                     point["place_name"] = label
                     break
+
+
+def route_points_via_manual_stops(points: list[dict], stops: list[dict]) -> list[dict]:
+    """Splice reviewed manual visits into the visualization-only route."""
+    manual_visits = []
+    for stop in stops:
+        if not stop.get("manual"):
+            continue
+        lat = as_float(stop.get("lat"))
+        lon = as_float(stop.get("lon"))
+        entry = stop.get("visit_start_timestamp", stop.get("start_timestamp"))
+        exit_ = stop.get("visit_end_timestamp", stop.get("end_timestamp"))
+        if lat is None or lon is None or not isinstance(entry, int) or not isinstance(exit_, int) or exit_ < entry:
+            continue
+        manual_visits.append((stop, lat, lon, entry, exit_))
+    if not manual_visits:
+        return points
+
+    def inside_corrected_visit(timestamp: object) -> bool:
+        if not isinstance(timestamp, int):
+            return False
+        return any(
+            stop.get("entry_corrected")
+            and stop.get("exit_corrected")
+            and entry < timestamp < exit_
+            for stop, _lat, _lon, entry, exit_ in manual_visits
+        )
+
+    routed: list[tuple[int, int, int, dict]] = []
+    unscheduled: list[dict] = []
+    for index, point in enumerate(points):
+        timestamp = point.get("timestamp")
+        if not isinstance(timestamp, int):
+            unscheduled.append(point)
+            continue
+        if inside_corrected_visit(timestamp):
+            continue
+        routed.append((timestamp, 1, index, point))
+
+    sequence = len(points)
+    for stop, lat, lon, entry, exit_ in manual_visits:
+        label = str(stop.get("reviewed_name") or stop.get("name") or "manual stop")
+        anchors = [(entry, 2, "arrival")]
+        if exit_ > entry:
+            anchors.append((exit_, 0, "departure"))
+        for timestamp, tie_order, phase in anchors:
+            already_recorded = any(
+                point.get("timestamp") == timestamp
+                and as_float(point.get("lat")) is not None
+                and as_float(point.get("lon")) is not None
+                and haversine_km(lat, lon, float(point["lat"]), float(point["lon"])) * 1000 <= 10
+                for point in points
+            )
+            if already_recorded:
+                continue
+            routed.append(
+                (
+                    timestamp,
+                    tie_order,
+                    sequence,
+                    {
+                        "lat": round(lat, 6),
+                        "lon": round(lon, 6),
+                        "timestamp": timestamp,
+                        "time": stop.get("entry_display" if phase == "arrival" else "exit_display", ""),
+                        "line": stop.get("start_line"),
+                        "motion_mode": "stationary",
+                        "speed_kmh": 0.0,
+                        "place_name": label,
+                        "maps": maps_url(lat, lon),
+                        "manual_route_stop": True,
+                        "manual_stop_id": stop.get("id"),
+                        "manual_stop_phase": phase,
+                    },
+                )
+            )
+            sequence += 1
+
+    routed.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [point for _timestamp, _tie_order, _sequence, point in routed] + unscheduled
 
 
 def is_moving_ride_point(event: Event) -> bool:
@@ -2439,7 +2685,9 @@ def location_override_for(stop: dict, user_tags: dict, current_date: str, radius
         for saved_stop in day_tags.get("stops", {}).values():
             if not isinstance(saved_stop, dict) or not saved_stop.get("name"):
                 continue
-            if saved_stop.get("manual") and not saved_stop.get("place"):
+            if saved_stop.get("place") is False:
+                continue
+            if saved_stop.get("manual") and "place" not in saved_stop:
                 continue
             saved_lat = as_float(saved_stop.get("lat"))
             saved_lon = as_float(saved_stop.get("lon"))
@@ -2814,6 +3062,7 @@ def owntracks_nav_html(
         ("heat", "Heat map", heat_href),
         ("stops", "Stops", f"/owntracks/stops{range_suffix}"),
         ("dashboard", "Dashboard", f"/owntracks/dashboard{range_suffix}"),
+        ("usage", "Usage", "/usage"),
     ]
     items = []
     for key, label, href in links:
@@ -3963,6 +4212,10 @@ def build_heatmap_summary(
     bucket_minutes: Counter[tuple[float, float]] = Counter()
     bucket_visits: Counter[tuple[float, float]] = Counter()
     bucket_visit_minutes: Counter[tuple[float, float]] = Counter()
+    bucket_daily_counts: dict[tuple[float, float], Counter[str]] = {}
+    bucket_daily_minutes: dict[tuple[float, float], Counter[str]] = {}
+    bucket_daily_visits: dict[tuple[float, float], Counter[str]] = {}
+    bucket_daily_visit_minutes: dict[tuple[float, float], Counter[str]] = {}
     bucket_modes: dict[tuple[float, float], Counter[str]] = {}
     label_sources = heatmap_label_sources(events, scope, user_tags or {})
     mode_points: Counter[str] = Counter()
@@ -3986,17 +4239,23 @@ def build_heatmap_summary(
                 previous_mode = motion_mode(previous)
                 previous_bucket = (round(previous.lat, 4), round(previous.lon, 4))
                 if previous_mode == "stationary" or segment <= 0.2:
-                    bucket_minutes[previous_bucket] += min(elapsed_minutes, 60)
+                    elapsed_for_bucket = min(elapsed_minutes, 60)
+                    bucket_minutes[previous_bucket] += elapsed_for_bucket
+                    bucket_daily_minutes.setdefault(previous_bucket, Counter())[day.isoformat()] += elapsed_for_bucket
         previous = event
         bucket = (round(event.lat, 4), round(event.lon, 4))
         buckets[bucket] += 1
+        if day is not None:
+            bucket_daily_counts.setdefault(bucket, Counter())[day.isoformat()] += 1
         bucket_modes.setdefault(bucket, Counter())[mode] += 1
 
-    for points in day_points.values():
+    for day, points in day_points.items():
         for visit in heatmap_visit_clusters(points):
             bucket = (round(visit["lat"], 4), round(visit["lon"], 4))
             bucket_visits[bucket] += 1
             bucket_visit_minutes[bucket] += int(visit["duration_minutes"])
+            bucket_daily_visits.setdefault(bucket, Counter())[day.isoformat()] += 1
+            bucket_daily_visit_minutes.setdefault(bucket, Counter())[day.isoformat()] += int(visit["duration_minutes"])
             bucket_modes.setdefault(bucket, Counter())[str(visit.get("mode") or "stationary")] += 1
 
     heat_points: list[dict] = []
@@ -4011,6 +4270,11 @@ def build_heatmap_summary(
         display_label = label or f"{lat:.4f}, {lon:.4f}"
         tags = match.get("tags", []) if match else []
         dominant_mode = bucket_modes[(lat, lon)].most_common(1)[0][0] if bucket_modes.get((lat, lon)) else "moving"
+        timeline_dates = sorted(
+            set(bucket_daily_counts.get((lat, lon), {}))
+            | set(bucket_daily_minutes.get((lat, lon), {}))
+            | set(bucket_daily_visits.get((lat, lon), {}))
+        )
         heat_point = {
             "lat": round(lat, 6),
             "lon": round(lon, 6),
@@ -4020,6 +4284,19 @@ def build_heatmap_summary(
             "label": display_label,
             "tags": tags,
             "mode": dominant_mode,
+            "timeline": [
+                {
+                    "date": timeline_date,
+                    "weight": bucket_daily_counts.get((lat, lon), {}).get(timeline_date, 0),
+                    "duration_minutes": int(round(
+                        bucket_daily_minutes.get((lat, lon), {}).get(timeline_date, 0)
+                        if bucket_minutes[(lat, lon)]
+                        else bucket_daily_visit_minutes.get((lat, lon), {}).get(timeline_date, 0)
+                    )),
+                    "visit_count": bucket_daily_visits.get((lat, lon), {}).get(timeline_date, 0),
+                }
+                for timeline_date in timeline_dates
+            ],
         }
         heat_points.append(heat_point)
         hotspots.append(
@@ -4317,6 +4594,7 @@ def build_activity_dashboard_summary(
         return {
             "title": "OwnTracks activity dashboard",
             "scope": {"start": "", "end": "", "days": 0},
+            "home_radius_km": round(float(home_filter.radius_m) / 1000, 3) if home_filter else 0.15,
             "stats": {},
             "daily": [],
             "top_places": [],
@@ -4355,7 +4633,7 @@ def build_activity_dashboard_summary(
         day_visits = visits_by_date.get(date_text, [])
         top_visit_names = sorted({str(visit.get("place_name") or visit.get("name") or "") for visit in day_visits if str(visit.get("place_name") or visit.get("name") or "").strip()})
         has_outside = bool(outside_points)
-        travel_day = distance_km >= 20 or outside_distance_km >= 10 or outside_minutes >= 180
+        travel_day = has_outside and (distance_km >= 20 or outside_distance_km >= 10 or outside_minutes >= 180)
         daily.append(
             {
                 "date": date_text,
@@ -4394,6 +4672,7 @@ def build_activity_dashboard_summary(
     )[:15]
     return {
         "title": "OwnTracks activity dashboard",
+        "home_radius_km": round(float(dashboard_home_filter.radius_m) / 1000, 3) if dashboard_home_filter else 0.15,
         "scope": {
             "start": start_date.isoformat(),
             "end": end_date.isoformat(),
@@ -4496,6 +4775,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     title = escape(summary["title"])
     scope = summary.get("scope") or {}
     stats = summary.get("stats") or {}
+    home_radius_km = float(summary.get("home_radius_km") or 0.15)
     payload = json.dumps(summary, ensure_ascii=False).replace("</", "<\\/")
     nav = owntracks_nav_html("dashboard", start=scope.get("start"), end=scope.get("end"))
     return f"""<!doctype html>
@@ -4513,7 +4793,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     .subtle {{ color: #4b5563; font-size: 13px; line-height: 1.4; }}
 {OWNTRACKS_NAV_CSS}
     .mobile-filter-toggle {{ display: none; margin-top: 10px; width: 100%; }}
-    .filters {{ align-items: end; display: grid; gap: 10px; grid-template-columns: minmax(160px, 210px) repeat(2, minmax(140px, 180px)) auto minmax(180px, 1fr) auto; margin-top: 12px; }}
+    .filters {{ align-items: end; display: grid; gap: 10px; grid-template-columns: minmax(150px, 190px) repeat(3, minmax(120px, 160px)) auto minmax(160px, 1fr) auto; margin-top: 12px; }}
     label {{ color: #374151; display: grid; font-size: 12px; font-weight: 800; gap: 4px; }}
     input, select {{ border: 1px solid #d1d5db; border-radius: 6px; font: inherit; min-height: 36px; padding: 7px 9px; width: 100%; }}
     input[type="checkbox"] {{ min-height: 0; width: auto; }}
@@ -4585,7 +4865,8 @@ def render_activity_dashboard_html(summary: dict) -> str:
       </select></label>
       <label>Start <input id="startDate" name="start" type="date" value="{escape(scope.get("start") or "")}"></label>
       <label>End <input id="endDate" name="end" type="date" value="{escape(scope.get("end") or "")}"></label>
-      <button type="submit">Apply range</button>
+      <label>Home radius (km) <input id="homeRadius" name="home_radius_km" type="number" min="0.01" max="1000" step="0.01" value="{home_radius_km:g}" title="Locations within this distance of a configured home anchor count as home"></label>
+      <button type="submit">Apply</button>
       <label>Calendar value <select id="metric"><option value="outside">Outside time</option><option value="distance">Distance</option><option value="visits">Visits</option></select></label>
       <label class="toggle"><input id="travelSplit" type="checkbox"> Travel split</label>
     </form>
@@ -4630,6 +4911,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
     const daily = document.getElementById("daily");
     const metric = document.getElementById("metric");
     const rangePreset = document.getElementById("rangePreset");
+    const defaultRangePreset = data.range_preset || "";
     const travelSplit = document.getElementById("travelSplit");
     const travelLegend = document.getElementById("travelLegend");
     const filterToggle = document.getElementById("filterToggle");
@@ -4683,6 +4965,20 @@ def render_activity_dashboard_html(summary: dict) -> str:
       if (preset === "year-to-date") return {{ start: dateInputValue(new Date(endToday.getFullYear(), 0, 1)), end: dateInputValue(endToday) }};
       if (preset === "all") return {{ start: "", end: "" }};
       return null;
+    }};
+    const syncRangePreset = () => {{
+      if (defaultRangePreset) {{
+        rangePreset.value = defaultRangePreset;
+        return;
+      }}
+      const start = document.getElementById("startDate").value;
+      const end = document.getElementById("endDate").value;
+      const matchingPreset = ["last-week", "last-7-days", "last-month", "month-to-date", "year-to-date"]
+        .find((preset) => {{
+          const range = presetRange(preset);
+          return range && range.start === start && range.end === end;
+        }});
+      rangePreset.value = matchingPreset || "";
     }};
     const weekdayIndex = (dateText) => {{
       const parts = dateParts(dateText);
@@ -4759,8 +5055,10 @@ def render_activity_dashboard_html(summary: dict) -> str:
       const params = new URLSearchParams(window.location.search);
       const start = document.getElementById("startDate").value;
       const end = document.getElementById("endDate").value;
+      const homeRadius = document.getElementById("homeRadius").value;
       if (start) params.set("start", start); else params.delete("start");
       if (end) params.set("end", end); else params.delete("end");
+      if (homeRadius) params.set("home_radius_km", homeRadius); else params.delete("home_radius_km");
       window.location.href = `/owntracks/dashboard?${{params.toString()}}`;
     }};
     document.getElementById("rangeForm").addEventListener("submit", (event) => {{
@@ -4786,6 +5084,7 @@ def render_activity_dashboard_html(summary: dict) -> str:
       filterToggle.textContent = expanded ? "Hide filters" : "Show filters";
     }});
 {OWNTRACKS_NAV_SCRIPT}
+    syncRangePreset();
     renderCalendar();
     renderPlaces();
     renderDaily();
@@ -5117,6 +5416,31 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
       border-color: #0f172a;
       color: white;
     }}
+    .timeline-controls {{
+      align-items: center;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      display: grid;
+      gap: 7px;
+      grid-template-columns: auto minmax(120px, 1fr);
+      margin-bottom: 8px;
+      padding: 8px;
+    }}
+    .timeline-controls input[type="range"] {{
+      accent-color: #0f172a;
+      cursor: pointer;
+      min-width: 0;
+      width: 100%;
+    }}
+    .timeline-label {{
+      color: #334155;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      grid-column: 1 / -1;
+      text-align: center;
+    }}
     .mode-summary {{
       display: flex;
       flex-wrap: wrap;
@@ -5306,12 +5630,17 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
         <button type="button" class="panel-action" data-heat-metric="raw">Raw points</button>
         <button type="button" id="toggleHeatmapPoints" class="panel-action">Show points</button>
       </div>
+      <div class="timeline-controls">
+        <button type="button" id="toggleHeatmapPlayback" class="panel-action">Play</button>
+        <input type="range" id="heatmapTimeline" min="0" value="0" step="1" aria-label="Heatmap date">
+        <div class="timeline-label" id="heatmapTimelineLabel"></div>
+      </div>
       <div class="mode-summary" id="modeSummary"></div>
       <div class="mode-summary-text" id="modeSummaryText"></div>
       <div class="stat-grid">
-        <div class="stat"><span class="label">Days</span><span class="value">{stats["days_with_points"]}</span></div>
-        <div class="stat"><span class="label">Points</span><span class="value">{stats["location_points"]}</span></div>
-        <div class="stat"><span class="label">Locations</span><span class="value">{stats["unique_locations"]}</span></div>
+        <div class="stat"><span class="label">Days</span><span class="value" id="heatmapDays">{stats["days_with_points"]}</span></div>
+        <div class="stat"><span class="label">Points</span><span class="value" id="heatmapPoints">{stats["location_points"]}</span></div>
+        <div class="stat"><span class="label">Locations</span><span class="value" id="heatmapLocations">{stats["unique_locations"]}</span></div>
         <div class="stat"><span class="label">Max visits</span><span class="value">{stats["max_visits"]}</span></div>
         <div class="stat"><span class="label">Min visits</span><span class="value">{stats["min_visits"]}</span></div>
         <div class="stat"><span class="label">Distance</span><span class="value">{stats["sampled_distance_km"]} km</span></div>
@@ -5341,11 +5670,16 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
       label: item.label || `${{item.lat}}, ${{item.lon}}`,
       tags: item.tags || [],
       mode: item.mode || "moving",
+      timeline: Array.isArray(item.timeline) ? item.timeline : [],
     }}));
     const map = L.map("map", {{ preferCanvas: true, zoomControl: false }});
     const panel = document.getElementById("heatmapPanel");
     const togglePanelButton = document.getElementById("toggleHeatmapPanel");
     const togglePointsButton = document.getElementById("toggleHeatmapPoints");
+    const playbackButton = document.getElementById("toggleHeatmapPlayback");
+    const timelineSlider = document.getElementById("heatmapTimeline");
+    const timelineLabel = document.getElementById("heatmapTimelineLabel");
+    const timelineControls = document.querySelector(".timeline-controls");
     const modeSummary = document.getElementById("modeSummary");
     const modeSummaryText = document.getElementById("modeSummaryText");
     const pointLayer = L.layerGroup();
@@ -5353,6 +5687,19 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
     let filteredSpots = allSpots;
     let activeMode = "all";
     let activeMetric = "time";
+    let playbackTimer = null;
+    const calendarDates = (startText, endText) => {{
+      const start = new Date(`${{startText}}T00:00:00Z`);
+      const end = new Date(`${{endText}}T00:00:00Z`);
+      if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) return [];
+      const dates = [];
+      for (let cursor = start; cursor <= end; cursor = new Date(cursor.getTime() + 86400000)) {{
+        dates.push(cursor.toISOString().slice(0, 10));
+      }}
+      return dates;
+    }};
+    const timelineDates = calendarDates(data.scope.start, data.scope.end);
+    let timelineIndex = Math.max(0, timelineDates.length - 1);
     const heatMetrics = {{
       time: {{
         title: "Time spent",
@@ -5490,6 +5837,39 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
     }};
     const modeMatches = (spot) => activeMode === "all" || (spot.mode || "moving") === activeMode;
     const textMatches = (spot) => !requestedFilter || [spot.label, spot.mode, ...(spot.tags || [])].some((part) => normalizeFilterText(part).includes(requestedFilter));
+    const spotThroughDate = (spot) => {{
+      if (!timelineDates.length || timelineIndex >= timelineDates.length - 1 || !spot.timeline.length) return spot;
+      const throughDate = timelineDates[timelineIndex];
+      const totals = spot.timeline.reduce((result, item) => {{
+        if (item.date <= throughDate) {{
+          result.rawCount += Number(item.weight || 0);
+          result.durationMinutes += Number(item.duration_minutes || 0);
+          result.visitCount += Number(item.visit_count || 0);
+        }}
+        return result;
+      }}, {{ rawCount: 0, durationMinutes: 0, visitCount: 0 }});
+      return {{ ...spot, ...totals }};
+    }};
+    const stopPlayback = () => {{
+      if (playbackTimer !== null) window.clearInterval(playbackTimer);
+      playbackTimer = null;
+      playbackButton.textContent = "Play";
+      playbackButton.classList.remove("active");
+    }};
+    const syncTimeline = () => {{
+      if (!timelineDates.length) {{
+        timelineControls.hidden = true;
+        return;
+      }}
+      timelineSlider.max = String(timelineDates.length - 1);
+      timelineSlider.value = String(timelineIndex);
+      timelineLabel.textContent = `Through ${{timelineDates[timelineIndex]}} · day ${{timelineIndex + 1}} of ${{timelineDates.length}}`;
+    }};
+    const setTimelineIndex = (index) => {{
+      timelineIndex = Math.max(0, Math.min(timelineDates.length - 1, Number(index) || 0));
+      syncTimeline();
+      applyFilter(false);
+    }};
     const setPointsVisible = (visible) => {{
       pointsVisible = visible;
       if (pointsVisible) {{
@@ -5500,9 +5880,16 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
       syncPointsButton();
     }};
     const applyFilter = (fit = false) => {{
-      filteredSpots = allSpots.filter((spot) => modeMatches(spot) && textMatches(spot));
+      filteredSpots = allSpots
+        .map((spot) => spotThroughDate(spot))
+        .filter((spot) => spot.rawCount > 0 || spot.durationMinutes > 0 || spot.visitCount > 0)
+        .filter((spot) => modeMatches(spot) && textMatches(spot));
+      const finalMaxValue = Math.max(
+        1,
+        ...allSpots.filter((spot) => modeMatches(spot) && textMatches(spot)).map((spot) => metricValue(spot))
+      );
       const weightedSpots = filteredSpots
-        .map((spot) => [spot.lat, spot.lon, metricValue(spot)])
+        .map((spot) => [spot.lat, spot.lon, metricValue(spot) / finalMaxValue])
         .filter((spot) => spot[2] > 0);
       heat.setLatLngs(weightedSpots);
       if (heat.redraw) heat.redraw();
@@ -5511,8 +5898,38 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
       listFor(leastSpots(filteredSpots), "leastVisited");
       syncMetricButtons();
       renderModeSummary();
+      const pointsAtDate = filteredSpots.reduce((total, spot) => total + spot.rawCount, 0);
+      document.getElementById("heatmapPoints").textContent = String(Math.round(pointsAtDate));
+      document.getElementById("heatmapLocations").textContent = String(filteredSpots.length);
+      document.getElementById("heatmapDays").textContent = String(
+        timelineIndex >= timelineDates.length - 1
+          ? data.stats.days_with_points
+          : new Set(allSpots.flatMap((spot) => spot.timeline.filter((item) => item.date <= timelineDates[timelineIndex] && item.weight > 0).map((item) => item.date))).size
+      );
       if (fit) fitToSpots(filteredSpots);
     }};
+    playbackButton.addEventListener("click", () => {{
+      if (playbackTimer !== null) {{
+        stopPlayback();
+        return;
+      }}
+      if (!timelineDates.length) return;
+      if (timelineIndex >= timelineDates.length - 1) setTimelineIndex(0);
+      playbackButton.textContent = "Pause";
+      playbackButton.classList.add("active");
+      const frameMilliseconds = Math.max(45, Math.min(350, Math.round(6000 / timelineDates.length)));
+      playbackTimer = window.setInterval(() => {{
+        if (timelineIndex >= timelineDates.length - 1) {{
+          stopPlayback();
+          return;
+        }}
+        setTimelineIndex(timelineIndex + 1);
+      }}, frameMilliseconds);
+    }});
+    timelineSlider.addEventListener("input", () => {{
+      stopPlayback();
+      setTimelineIndex(timelineSlider.value);
+    }});
     togglePointsButton.addEventListener("click", () => setPointsVisible(!pointsVisible));
     document.querySelectorAll("[data-heat-metric]").forEach((button) => {{
       button.addEventListener("click", () => {{
@@ -5529,6 +5946,7 @@ def render_heatmap_html(summary: dict, *, initial_filter: str | None = None, sel
     }}
     setPointsVisible(false);
     syncPanelButton();
+    syncTimeline();
     renderModeSummary();
     const listFor = (items, target) => {{
       const root = document.getElementById(target);
@@ -6671,9 +7089,10 @@ def render_leaflet_map_html(plan: dict) -> str:
     .tools-body {{
       margin-top: 8px;
     }}
-    .tools textarea, .tools input {{
+    .tools textarea, .tools input, .tools select {{
       border: 1px solid #cbd5e1;
       border-radius: 6px;
+      box-sizing: border-box;
       font: inherit;
       padding: 7px;
       width: 100%;
@@ -7007,13 +7426,53 @@ def render_leaflet_map_html(plan: dict) -> str:
       padding: 3px 5px;
     }}
     .poi-label {{
+      align-items: flex-start;
       background: #0f766e;
       border: 1px solid #134e4a;
       border-radius: 4px;
+      box-shadow: 0 2px 8px rgb(0 0 0 / 0.22);
       color: white;
+      display: flex;
       font-size: 12px;
-      font-weight: 800;
-      padding: 3px 5px;
+      gap: 5px;
+      line-height: 1.25;
+      padding: 4px 6px;
+      white-space: normal;
+      width: max-content;
+    }}
+    .poi-marker {{
+      background: transparent;
+      border: 0;
+    }}
+    .poi-label-prefix {{
+      background: rgb(255 255 255 / 0.18);
+      border-radius: 3px;
+      flex: 0 0 auto;
+      font-size: 10px;
+      font-weight: 900;
+      padding: 1px 3px;
+    }}
+    .poi-label-text {{
+      display: -webkit-box;
+      font-weight: 700;
+      overflow: hidden;
+      overflow-wrap: anywhere;
+      -webkit-box-orient: vertical;
+    }}
+    .poi-label.compact {{
+      border-radius: 999px;
+      padding: 3px 4px;
+    }}
+    .poi-label.compact .poi-label-text {{
+      display: none;
+    }}
+    .poi-label.medium .poi-label-text {{
+      max-width: 105px;
+      -webkit-line-clamp: 1;
+    }}
+    .poi-label.detailed .poi-label-text {{
+      max-width: 165px;
+      -webkit-line-clamp: 2;
     }}
     .poi-image {{
       border-radius: 7px;
@@ -7205,6 +7664,21 @@ def render_leaflet_map_html(plan: dict) -> str:
     .segment-popup .checkbox-row input {{
       width: auto;
     }}
+    .manual-stop-status {{
+      background: #fff7ed;
+      border: 1px solid #fdba74;
+      border-radius: 8px;
+      color: #9a3412;
+      display: none;
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1.4;
+      margin-top: 8px;
+      padding: 8px;
+    }}
+    .manual-stop-status.active {{
+      display: block;
+    }}
     @media (max-width: 700px) {{
       .tools {{
         max-height: calc(100vh - 20px);
@@ -7238,6 +7712,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       </div>
       <div class="row" style="margin-top: 8px">
         <button id="prevDay" type="button" class="secondary">Previous day</button>
+        <button id="today" type="button" class="secondary">Today</button>
         <button id="nextDay" type="button" class="secondary">Next day</button>
       </div>
       <button id="centerSelected" type="button" class="secondary" style="margin-top: 8px; width: 100%">Center selected</button>
@@ -7253,8 +7728,16 @@ def render_leaflet_map_html(plan: dict) -> str:
       </div>
       <button id="toggleFilteredPoints" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show filtered points</button>
       <button id="togglePois" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show POIs</button>
+      <label for="poiPositionSource">POI position and time</label>
+      <select id="poiPositionSource">
+        <option value="track">OwnTracks at capture time</option>
+        <option value="inner">iOS capture (inner payload)</option>
+        <option value="outer">OwnTracks envelope (outer payload)</option>
+      </select>
       <button id="togglePossibleStops" type="button" class="secondary" style="margin-top: 8px; width: 100%">Show possible missed stops</button>
       <div id="possibleStopList" class="stop-list"></div>
+      <button id="addMissingStop" type="button" style="margin-top: 8px; width: 100%">Add missing stop</button>
+      <div id="manualStopStatus" class="manual-stop-status"></div>
       <div class="profile">
         <div class="profile-title">Route animation</div>
         <div class="row">
@@ -7362,6 +7845,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let fitCount = 0;
     const markers = new Map();
     const placeMarkers = [];
+    const poiMarkers = [];
     const routeRenderer = L.svg();
     routeRenderer.addTo(map);
     // SVG only captures pointer events on circle paths; a canvas renderer would
@@ -7377,6 +7861,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     const filteredPointLayer = L.layerGroup();
     const possibleStopLayer = L.layerGroup();
     const animationLayer = L.layerGroup().addTo(map);
+    const manualStopLayer = L.layerGroup().addTo(map);
     let activeMotionMode = "all";
     let edgesVisible = true;
     let arrowsVisible = true;
@@ -7384,6 +7869,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     let stopLabelsVisible = true;
     let placeLabelsVisible = false;
     let poisVisible = true;
+    let poiPositionSource = "track";
     let filteredPointsVisible = false;
     let possibleStopsVisible = false;
     let routeColorMode = "speed";
@@ -7393,6 +7879,11 @@ def render_leaflet_map_html(plan: dict) -> str:
     let routeAnimationStartMs = null;
     let routeAnimationElapsedMs = 0;
     let routeAnimationStaticVisibility = null;
+    let manualPlacementActive = false;
+    let manualPlacementMarker = null;
+    let manualPlacementProjection = null;
+    let manualPlacementSnapped = true;
+    let manualPlacementDraft = null;
     const routeAnimationMaxZoom = 16;
     const motionModes = ["all", "stationary", "walking", "cycling", "automotive", "moving"];
     const routeColorModes = ["motion", "speed", "bands", "slope"];
@@ -7445,6 +7936,15 @@ def render_leaflet_map_html(plan: dict) -> str:
     const navigateDay = (offsetDays) => {{
       const targetDate = dateForOffset(data.date, offsetDays);
       if (!targetDate) return;
+      window.location.href = `${{mapPathForDate(targetDate)}}${{window.location.search}}${{window.location.hash}}`;
+    }};
+    const navigateToday = () => {{
+      const today = new Date();
+      const targetDate = [
+        today.getFullYear(),
+        String(today.getMonth() + 1).padStart(2, "0"),
+        String(today.getDate()).padStart(2, "0"),
+      ].join("-");
       window.location.href = `${{mapPathForDate(targetDate)}}${{window.location.search}}${{window.location.hash}}`;
     }};
     const syncDayNavigationButtons = () => {{
@@ -7872,6 +8372,9 @@ def render_leaflet_map_html(plan: dict) -> str:
         time: point.time || "",
         maps: point.maps || "",
         timestamp,
+        manual_route_stop: Boolean(point.manual_route_stop),
+        manual_stop_id: point.manual_stop_id || "",
+        manual_stop_phase: point.manual_stop_phase || "",
         cumulativeDistanceKm: cumulativeTrackDistanceKm,
       }});
       previousTrackPoint = currentTrackPoint;
@@ -8067,7 +8570,7 @@ def render_leaflet_map_html(plan: dict) -> str:
           ${{point.maps ? `<div><a href="${{escapeHtml(point.maps)}}" target="_blank" rel="noreferrer">Google Maps</a></div>` : ""}}
         </div>
         ${{durationAnchorButtons(anchorForRoutePoint(point))}}
-        ${{canSaveManualStops() && point.line ? `
+        ${{canSaveManualStops() && point.line && !point.manual_route_stop ? `
           <label>Name</label>
           <input data-manual-stop-name value="${{escapeHtml(point.place_name || "")}}">
           <label>Tags</label>
@@ -8121,6 +8624,290 @@ def render_leaflet_map_html(plan: dict) -> str:
         if (result) result.textContent = `Could not save: ${{error.message || error}}`;
         if (button) button.disabled = false;
       }}
+    }};
+    const nearestTrajectoryProjection = (latlng) => {{
+      if (!latlng || trackPoints.length < 2) return null;
+      const target = map.latLngToLayerPoint(latlng);
+      let best = null;
+      for (let index = 1; index < trackPoints.length; index += 1) {{
+        const previous = trackPoints[index - 1];
+        const current = trackPoints[index];
+        const start = map.latLngToLayerPoint([previous.lat, previous.lon]);
+        const end = map.latLngToLayerPoint([current.lat, current.lon]);
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const lengthSquared = dx * dx + dy * dy;
+        const ratio = lengthSquared > 0
+          ? Math.max(0, Math.min(1, ((target.x - start.x) * dx + (target.y - start.y) * dy) / lengthSquared))
+          : 0;
+        const projectedPoint = L.point(start.x + dx * ratio, start.y + dy * ratio);
+        const pixelDistance = target.distanceTo(projectedPoint);
+        if (best && pixelDistance >= best.pixelDistance) continue;
+        const previousTimestamp = Number(previous.timestamp);
+        const currentTimestamp = Number(current.timestamp);
+        const timestamp = Number.isFinite(previousTimestamp) && Number.isFinite(currentTimestamp)
+          ? interpolateNumber(previousTimestamp, currentTimestamp, ratio)
+          : (Number.isFinite(previousTimestamp) ? previousTimestamp : currentTimestamp);
+        const nearestSample = ratio < 0.5 ? previous : current;
+        const lat = interpolateNumber(Number(previous.lat), Number(current.lat), ratio);
+        const lon = interpolateNumber(Number(previous.lon), Number(current.lon), ratio);
+        best = {{
+          lat,
+          lon,
+          ratio,
+          timestamp,
+          line: nearestSample.line || previous.line || current.line,
+          motion_mode: current.motion_mode || previous.motion_mode || "unknown",
+          previous,
+          current,
+          pixelDistance,
+          offset_m: distanceMeters({{ lat: Number(latlng.lat), lon: Number(latlng.lng) }}, {{ lat, lon }}),
+          gap_m: distanceMeters(previous, current),
+          gap_seconds: Number.isFinite(previousTimestamp) && Number.isFinite(currentTimestamp)
+            ? Math.max(0, currentTimestamp - previousTimestamp)
+            : null,
+        }};
+      }}
+      return best;
+    }};
+    const timeInputValue = (timestamp) => {{
+      if (!Number.isFinite(Number(timestamp))) return "";
+      const date = new Date(Number(timestamp) * 1000);
+      const pad = (value) => String(value).padStart(2, "0");
+      return `${{pad(date.getHours())}}:${{pad(date.getMinutes())}}`;
+    }};
+    const manualProjectionSummary = (projection, snapped) => {{
+      if (!projection) return "No trajectory segment is available; the marker will be saved at its free position.";
+      const gap = `${{formatMeters(projection.gap_m)}} / ${{formatDuration(projection.gap_seconds)}}`;
+      if (snapped) return `Snapped to trajectory · estimated ${{formatTime(projection.timestamp)}} · recorded gap ${{gap}}`;
+      return `Free placement · ${{formatMeters(projection.offset_m)}} from trajectory · estimated ${{formatTime(projection.timestamp)}} · recorded gap ${{gap}}`;
+    }};
+    const setManualStopStatus = (message, active = true) => {{
+      const statusEl = document.getElementById("manualStopStatus");
+      if (statusEl) {{
+        statusEl.textContent = message;
+        statusEl.classList.toggle("active", active);
+      }}
+      const button = document.getElementById("addMissingStop");
+      if (button) {{
+        button.textContent = manualPlacementActive ? "Cancel missing stop" : "Add missing stop";
+        button.classList.toggle("active", manualPlacementActive);
+      }}
+      map.getContainer().style.cursor = manualPlacementActive && !manualPlacementMarker ? "crosshair" : "";
+    }};
+    const manualStopEditorHtml = () => {{
+      const projection = manualPlacementProjection;
+      const inferredTime = projection ? timeInputValue(projection.timestamp) : "";
+      if (!manualPlacementDraft) {{
+        manualPlacementDraft = {{ name: "", tags: "", note: "", entry: inferredTime, exit: "", radius: String({DEFAULT_VISIT_RADIUS_M}), singleUse: false }};
+      }}
+      return `
+        <div class="segment-popup" data-manual-placement-editor>
+          <strong>Add missing stop</strong>
+          <div class="popup-meta" data-manual-projection-summary>${{escapeHtml(manualProjectionSummary(projection, manualPlacementSnapped))}}</div>
+          <label>Name</label>
+          <input data-manual-placement-name placeholder="Stop name" value="${{escapeHtml(manualPlacementDraft.name)}}">
+          <label>Tags</label>
+          <input data-manual-placement-tags placeholder="tags" value="${{escapeHtml(manualPlacementDraft.tags)}}">
+          <label>Note</label>
+          <textarea data-manual-placement-note placeholder="note">${{escapeHtml(manualPlacementDraft.note)}}</textarea>
+          <div class="row">
+            <div><label>Arrival</label><input data-manual-placement-entry type="time" value="${{escapeHtml(manualPlacementDraft.entry)}}"></div>
+            <div><label>Departure</label><input data-manual-placement-exit type="time" value="${{escapeHtml(manualPlacementDraft.exit)}}"></div>
+          </div>
+          <label>Grouping radius, meters</label>
+          <input data-manual-placement-radius type="number" min="10" max="5000" step="10" value="${{escapeHtml(manualPlacementDraft.radius)}}">
+          <label class="checkbox-row">
+            <input type="checkbox" data-manual-placement-snap ${{manualPlacementSnapped ? "checked" : ""}}>
+            <span>Snap marker to trajectory</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" data-manual-placement-single-use ${{manualPlacementDraft.singleUse ? "checked" : ""}}>
+            <span>Single-use visit only</span>
+          </label>
+          <div class="row" style="margin-top: 8px">
+            <button type="button" data-save-manual-placement>Save visit</button>
+            <button type="button" class="secondary" data-cancel-manual-placement>Cancel</button>
+          </div>
+          <div class="popup-meta" data-manual-placement-feedback>Drag the marker to refine its position.</div>
+        </div>
+      `;
+    }};
+    const endManualPlacement = () => {{
+      manualPlacementActive = false;
+      manualPlacementProjection = null;
+      manualPlacementDraft = null;
+      manualStopLayer.clearLayers();
+      manualPlacementMarker = null;
+      setManualStopStatus("", false);
+    }};
+    const saveTrajectoryManualStop = async () => {{
+      if (!manualPlacementMarker || !manualPlacementProjection) return;
+      const popup = manualPlacementMarker.getPopup();
+      const element = popup && popup.getElement ? popup.getElement() : null;
+      if (!element) return;
+      const feedback = element.querySelector("[data-manual-placement-feedback]");
+      const saveButton = element.querySelector("[data-save-manual-placement]");
+      const position = manualPlacementMarker.getLatLng();
+      const projection = manualPlacementProjection;
+      const line = Number(projection.line);
+      if (!Number.isInteger(line) || line < 1) {{
+        if (feedback) feedback.textContent = "The selected trajectory segment has no usable source line.";
+        return;
+      }}
+      const timestamp = Number.isFinite(Number(projection.timestamp)) ? Math.round(Number(projection.timestamp)) : Math.round(Date.now() / 1000);
+      const stopId = `manual-stop-${{line}}-${{timestamp}}`;
+      if (saveButton) saveButton.disabled = true;
+      if (feedback) feedback.textContent = "Saving...";
+      try {{
+        const response = await fetch(owntracksStopsEndpoint(), {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            date: data.date,
+            id: stopId,
+            manual: true,
+            lat: position.lat,
+            lon: position.lng,
+            line,
+            timestamp,
+            time: formatTime(timestamp),
+            motion_mode: projection.motion_mode || "unknown",
+            name: element.querySelector("[data-manual-placement-name]")?.value.trim() || "",
+            tags: parseTags(element.querySelector("[data-manual-placement-tags]")?.value || ""),
+            note: element.querySelector("[data-manual-placement-note]")?.value.trim() || "",
+            entry_time: element.querySelector("[data-manual-placement-entry]")?.value || "",
+            exit_time: element.querySelector("[data-manual-placement-exit]")?.value || "",
+            radius_m: Number(element.querySelector("[data-manual-placement-radius]")?.value) || {DEFAULT_VISIT_RADIUS_M},
+            place: !Boolean(element.querySelector("[data-manual-placement-single-use]")?.checked),
+          }}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        if (feedback) feedback.textContent = "Saved. Reloading map...";
+        window.location.reload();
+      }} catch (error) {{
+        if (feedback) feedback.textContent = `Could not save: ${{error.message || error}}`;
+        if (saveButton) saveButton.disabled = false;
+      }}
+    }};
+    const attachManualPlacementHandlers = () => {{
+      if (!manualPlacementMarker) return;
+      const popup = manualPlacementMarker.getPopup();
+      const element = popup && popup.getElement ? popup.getElement() : null;
+      if (!element) return;
+      L.DomEvent.disableClickPropagation(element);
+      const syncDraft = () => {{
+        manualPlacementDraft = {{
+          name: element.querySelector("[data-manual-placement-name]")?.value || "",
+          tags: element.querySelector("[data-manual-placement-tags]")?.value || "",
+          note: element.querySelector("[data-manual-placement-note]")?.value || "",
+          entry: element.querySelector("[data-manual-placement-entry]")?.value || "",
+          exit: element.querySelector("[data-manual-placement-exit]")?.value || "",
+          radius: element.querySelector("[data-manual-placement-radius]")?.value || String({DEFAULT_VISIT_RADIUS_M}),
+          singleUse: Boolean(element.querySelector("[data-manual-placement-single-use]")?.checked),
+        }};
+      }};
+      element.addEventListener("input", syncDraft);
+      element.addEventListener("change", syncDraft);
+      element.querySelector("[data-save-manual-placement]")?.addEventListener("click", saveTrajectoryManualStop, {{ once: true }});
+      element.querySelector("[data-cancel-manual-placement]")?.addEventListener("click", endManualPlacement, {{ once: true }});
+      element.querySelector("[data-manual-placement-snap]")?.addEventListener("change", (event) => {{
+        manualPlacementSnapped = Boolean(event.target.checked);
+        if (manualPlacementSnapped && manualPlacementProjection) {{
+          manualPlacementMarker.setLatLng([manualPlacementProjection.lat, manualPlacementProjection.lon]);
+        }}
+        const summary = element.querySelector("[data-manual-projection-summary]");
+        if (summary) summary.textContent = manualProjectionSummary(manualPlacementProjection, manualPlacementSnapped);
+      }});
+    }};
+    const positionManualPlacement = (latlng) => {{
+      const projection = nearestTrajectoryProjection(latlng);
+      if (!projection) {{
+        setManualStopStatus("This day needs at least two route points before a stop can snap to its trajectory.");
+        return;
+      }}
+      manualPlacementProjection = projection;
+      if (manualPlacementMarker) {{
+        const popup = manualPlacementMarker.getPopup();
+        const element = popup && popup.getElement ? popup.getElement() : null;
+        if (element) {{
+          manualPlacementDraft = {{
+            name: element.querySelector("[data-manual-placement-name]")?.value || "",
+            tags: element.querySelector("[data-manual-placement-tags]")?.value || "",
+            note: element.querySelector("[data-manual-placement-note]")?.value || "",
+            entry: element.querySelector("[data-manual-placement-entry]")?.value || "",
+            exit: element.querySelector("[data-manual-placement-exit]")?.value || "",
+            radius: element.querySelector("[data-manual-placement-radius]")?.value || String({DEFAULT_VISIT_RADIUS_M}),
+            singleUse: Boolean(element.querySelector("[data-manual-placement-single-use]")?.checked),
+          }};
+        }}
+      }}
+      const position = manualPlacementSnapped ? L.latLng(projection.lat, projection.lon) : latlng;
+      if (!manualPlacementMarker) {{
+        manualPlacementMarker = L.marker(position, {{ draggable: true, autoPan: true, title: "Drag missing stop" }}).addTo(manualStopLayer);
+        manualPlacementMarker.bindPopup(manualStopEditorHtml(), {{ className: "stop-popup-shell", maxWidth: 340, closeOnClick: false }});
+        manualPlacementMarker.on("popupopen", attachManualPlacementHandlers);
+        manualPlacementMarker.on("dragend", () => {{
+          const dragged = manualPlacementMarker.getLatLng();
+          const nearest = nearestTrajectoryProjection(dragged);
+          if (nearest) {{
+            manualPlacementProjection = nearest;
+            if (manualPlacementSnapped) manualPlacementMarker.setLatLng([nearest.lat, nearest.lon]);
+          }}
+          manualPlacementMarker.setPopupContent(manualStopEditorHtml());
+          manualPlacementMarker.openPopup();
+          setManualStopStatus(manualProjectionSummary(manualPlacementProjection, manualPlacementSnapped));
+        }});
+      }} else {{
+        manualPlacementMarker.setLatLng(position);
+        manualPlacementMarker.setPopupContent(manualStopEditorHtml());
+      }}
+      manualPlacementMarker.openPopup();
+      setManualStopStatus(manualProjectionSummary(projection, manualPlacementSnapped));
+    }};
+    const toggleManualPlacement = () => {{
+      if (manualPlacementActive) {{
+        endManualPlacement();
+        return;
+      }}
+      if (!canSaveManualStops()) {{
+        setManualStopStatus("Open the hosted map to add and save a missing stop.");
+        return;
+      }}
+      if (trackPoints.length < 2) {{
+        setManualStopStatus("This day needs at least two route points before a stop can snap to its trajectory.");
+        return;
+      }}
+      manualPlacementActive = true;
+      manualPlacementSnapped = true;
+      manualPlacementDraft = null;
+      setManualStopStatus("Tap near the trajectory to place a stop, then drag the marker to refine it.");
+    }};
+    const beginStopLocationAdjustment = (stop, snapToTrajectory) => {{
+      const marker = markers.get(stop.alias);
+      if (!marker || !marker.dragging) return;
+      marker.closePopup();
+      marker.dragging.enable();
+      setManualStopStatus(`Drag ${{stop.alias}} to its corrected location${{snapToTrajectory ? "; it will snap to the trajectory" : ""}}.`);
+      marker.once("dragend", () => {{
+        const dragged = marker.getLatLng();
+        const projection = nearestTrajectoryProjection(dragged);
+        const corrected = snapToTrajectory && projection ? L.latLng(projection.lat, projection.lon) : dragged;
+        marker.setLatLng(corrected);
+        marker.dragging.disable();
+        stop.lat = Number(corrected.lat);
+        stop.lon = Number(corrected.lng);
+        stop.maps = `https://www.google.com/maps?q=${{stop.lat}},${{stop.lon}}`;
+        refreshStop(stop);
+        marker.openPopup();
+        attachPopupHandlers(stop);
+        const popup = marker.getPopup();
+        const element = popup && popup.getElement ? popup.getElement() : null;
+        const feedback = element && element.querySelector("[data-save-stop-feedback]");
+        if (feedback) feedback.textContent = `Location adjusted${{projection && snapToTrajectory ? " and snapped to trajectory" : ""}}. Save changes to persist it.`;
+        setManualStopStatus("Location adjusted. Use Save changes in the stop popup to persist it.");
+      }});
     }};
     const segmentPointsFor = (segment) => trackPoints.filter((point) => {{
       const timestamp = Number(point.timestamp);
@@ -8651,6 +9438,45 @@ def render_leaflet_map_html(plan: dict) -> str:
       button.classList.toggle("active", poisVisible);
       button.disabled = poiEvents.length === 0;
     }};
+    const syncPoiPositionSource = () => {{
+      const select = document.getElementById("poiPositionSource");
+      if (!select) return;
+      select.value = poiPositionSource;
+      select.disabled = poiEvents.length === 0;
+    }};
+    const poiForPositionSource = (item) => {{
+      if (poiPositionSource === "outer") {{
+        return {{
+          ...item,
+          lat: item.outer_lat ?? item.lat,
+          lon: item.outer_lon ?? item.lon,
+          time: item.outer_time || item.time,
+          timestamp: item.outer_timestamp ?? item.timestamp,
+          maps: item.outer_maps || item.maps,
+          accuracy_m: item.outer_accuracy_m ?? item.accuracy_m,
+          position_source: "OwnTracks envelope",
+          position_detail: "Outer event time and coordinates",
+        }};
+      }}
+      if (poiPositionSource === "track" && Number.isFinite(Number(item.track_lat)) && Number.isFinite(Number(item.track_lon))) {{
+        const delta = Number(item.track_delta_seconds);
+        const deltaText = Number.isFinite(delta) && delta !== 0 ? ` · sample ${{Math.abs(delta)}}s ${{delta < 0 ? "before" : "after"}}` : "";
+        return {{
+          ...item,
+          lat: item.track_lat,
+          lon: item.track_lon,
+          maps: item.track_maps || item.maps,
+          accuracy_m: item.track_accuracy_m ?? item.accuracy_m,
+          position_source: "OwnTracks at capture time",
+          position_detail: `${{item.track_method || "track sample"}}${{deltaText}}${{item.track_sample_time ? ` · ${{item.track_sample_time}}` : ""}}`,
+        }};
+      }}
+      return {{
+        ...item,
+        position_source: poiPositionSource === "track" ? "iOS capture (track unavailable)" : "iOS capture",
+        position_detail: "Inner payload time and coordinates",
+      }};
+    }};
     const poiPoint = (item) => ({{
       line: item.line,
       lat: item.lat,
@@ -8668,6 +9494,8 @@ def render_leaflet_map_html(plan: dict) -> str:
       <div class="segment-popup">
         <strong>POI: ${{escapeHtml(item.name || item.poi || "untitled")}}</strong>
         <div class="popup-meta">
+          <div>Position: ${{escapeHtml(item.position_source || "iOS capture")}}</div>
+          ${{item.position_detail ? `<div>${{escapeHtml(item.position_detail)}}</div>` : ""}}
           <div>${{escapeHtml(item.time || formatTime(item.timestamp))}} · Line ${{escapeHtml(item.line || "")}}</div>
           <div>Motion: ${{escapeHtml(item.motion_mode || "unknown")}} · Accuracy: ${{Number.isFinite(Number(item.accuracy_m)) ? Math.round(Number(item.accuracy_m)) + " m" : "unknown"}}</div>
           ${{item.imagename ? `<div>Image: ${{escapeHtml(item.imagename)}}</div>` : ""}}
@@ -8677,40 +9505,55 @@ def render_leaflet_map_html(plan: dict) -> str:
         ${{routePointPopupHtml(poiPoint(item))}}
       </div>
     `;
+    const poiLabelMode = () => {{
+      const zoom = map.getZoom();
+      if (zoom < 14) return "compact";
+      if (zoom < 16) return "medium";
+      return "detailed";
+    }};
+    const poiIconFor = (item, index) => {{
+      const mode = poiLabelMode();
+      const label = item.name || item.poi || `POI ${{index + 1}}`;
+      const size = mode === "compact" ? [38, 22] : mode === "medium" ? [150, 30] : [210, 46];
+      return L.divIcon({{
+        className: "poi-marker",
+        html: `<div class="poi-label ${{mode}}"><span class="poi-label-prefix">POI${{item.image_data_url ? " + image" : ""}}</span><span class="poi-label-text">${{escapeHtml(label)}}</span></div>`,
+        iconSize: size,
+        iconAnchor: [8, size[1] / 2],
+      }});
+    }};
+    const refreshPoiMarkers = () => {{
+      poiMarkers.forEach((entry) => entry.marker.setIcon(poiIconFor(entry.item, entry.index)));
+    }};
     const renderPois = () => {{
       poiLayer.clearLayers();
+      poiMarkers.length = 0;
       if (!poisVisible || !poiEvents.length) {{
         poiLayer.remove();
         syncPoisButton();
         return;
       }}
       poiEvents.forEach((item, index) => {{
-        const lat = Number(item.lat);
-        const lon = Number(item.lon);
+        const positionedItem = poiForPositionSource(item);
+        const lat = Number(positionedItem.lat);
+        const lon = Number(positionedItem.lon);
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
         const marker = L.marker([lat, lon], {{
-          icon: L.divIcon({{
-            className: "poi-marker",
-            html: `<div class="poi-label">POI${{item.image_data_url ? " + image" : ""}}</div>`,
-            iconSize: [74, 24],
-            iconAnchor: [10, 20],
-          }}),
-        }}).bindTooltip(escapeHtml(item.name || item.poi || `POI ${{index + 1}}`), {{
-          permanent: true,
-          direction: "right",
-          className: "poi-label",
-        }}).bindPopup(poiPopupHtml(item), {{ maxWidth: 360 }});
+          icon: poiIconFor(positionedItem, index),
+        }}).bindPopup(poiPopupHtml(positionedItem), {{ maxWidth: 360 }});
         marker.on("popupopen", () => {{
           const element = marker.getPopup() && marker.getPopup().getElement();
           if (!element) return;
           L.DomEvent.disableClickPropagation(element);
           const button = element.querySelector("[data-mark-manual-stop]");
-          if (button) button.addEventListener("click", () => saveManualStop(poiPoint(item), element), {{ once: true }});
+          if (button) button.addEventListener("click", () => saveManualStop(poiPoint(positionedItem), element), {{ once: true }});
         }});
         marker.addTo(poiLayer);
+        poiMarkers.push({{ marker, item: positionedItem, index }});
       }});
       poiLayer.addTo(map);
       syncPoisButton();
+      syncPoiPositionSource();
     }};
     const setPoisVisible = (visible) => {{
       poisVisible = visible;
@@ -8865,6 +9708,7 @@ def render_leaflet_map_html(plan: dict) -> str:
       for (const marker of placeMarkers) {{
         if (marker.setRadius) marker.setRadius(radius);
       }}
+      refreshPoiMarkers();
       applyLabelVisibility();
     }};
     const syncRouteColorButtons = () => {{
@@ -9123,7 +9967,12 @@ def render_leaflet_map_html(plan: dict) -> str:
         ${{canSaveManualStops() ? `
           <div class="row" style="margin-top: 8px">
             <button type="button" class="secondary" data-resolve-stop="${{escapeHtml(stop.alias)}}">Resolve place</button>
+            <button type="button" class="secondary" data-adjust-stop-location="${{escapeHtml(stop.alias)}}">Adjust location</button>
           </div>
+          <label class="checkbox-row">
+            <input type="checkbox" data-adjust-stop-snap="${{escapeHtml(stop.alias)}}" checked>
+            <span>Snap moved marker to trajectory</span>
+          </label>
           <div class="popup-meta" data-place-resolve-results="${{escapeHtml(stop.alias)}}"></div>
           <div class="row" style="margin-top: 8px">
             <button type="button" data-save-stop="${{escapeHtml(stop.alias)}}">Save changes</button>
@@ -9185,6 +10034,11 @@ def render_leaflet_map_html(plan: dict) -> str:
       }});
       const dismissButton = element.querySelector("[data-dismiss-stop]");
       if (dismissButton) dismissButton.addEventListener("click", () => dismissStop(stop, element));
+      const adjustLocationButton = element.querySelector("[data-adjust-stop-location]");
+      if (adjustLocationButton) adjustLocationButton.addEventListener("click", () => {{
+        const snap = Boolean(element.querySelector("[data-adjust-stop-snap]")?.checked);
+        beginStopLocationAdjustment(stop, snap);
+      }});
       const resolveButton = element.querySelector("[data-resolve-stop]");
       if (resolveButton) resolveButton.addEventListener("click", () => {{
         const container = element.querySelector(`[data-place-resolve-results="${{CSS.escape(stop.alias)}}"]`);
@@ -9458,7 +10312,10 @@ def render_leaflet_map_html(plan: dict) -> str:
       renderRideSegments();
       data.track.forEach((point) => addFitPoint(point[0], point[1]));
     }}
-    poiEvents.forEach((item) => addFitPoint(item.lat, item.lon));
+    poiEvents.forEach((item) => {{
+      const positionedItem = poiForPositionSource(item);
+      addFitPoint(positionedItem.lat, positionedItem.lon);
+    }});
     data.namedPlaces.forEach((place, index) => {{
       const label = `${{place.action || ""}} ${{place.name}}`.trim();
       const placeAnchor = anchorForPlace(place, index);
@@ -9530,6 +10387,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("prevDay").addEventListener("click", () => {{
       navigateDay(-1);
     }});
+    document.getElementById("today").addEventListener("click", navigateToday);
     document.getElementById("nextDay").addEventListener("click", () => {{
       navigateDay(1);
     }});
@@ -9558,8 +10416,20 @@ def render_leaflet_map_html(plan: dict) -> str:
     document.getElementById("togglePois").addEventListener("click", () => {{
       setPoisVisible(!poisVisible);
     }});
+    document.getElementById("poiPositionSource").addEventListener("change", (event) => {{
+      poiPositionSource = ["track", "inner", "outer"].includes(event.target.value) ? event.target.value : "track";
+      renderPois();
+    }});
     document.getElementById("togglePossibleStops").addEventListener("click", () => {{
       setPossibleStopsVisible(!possibleStopsVisible);
+    }});
+    document.getElementById("addMissingStop").addEventListener("click", () => {{
+      toggleManualPlacement();
+    }});
+    map.on("click", (event) => {{
+      if (!manualPlacementActive) return;
+      map.closePopup();
+      positionManualPlacement(event.latlng);
     }});
     document.getElementById("routeAnimPlay").addEventListener("click", () => {{
       playRouteAnimation();
@@ -9611,6 +10481,7 @@ def render_leaflet_map_html(plan: dict) -> str:
     syncDayNavigationButtons();
     syncLabelButtons();
     syncPoisButton();
+    syncPoiPositionSource();
     syncFilteredPointsButton();
     syncPossibleStopsButton();
     applyLabelVisibility();
@@ -9766,7 +10637,7 @@ def build_plan(
         "named_places": places,
         "candidate_stops": stops,
         "possible_missed_stops": missed_stop_suggestions,
-        "poi_events": poi_event_dicts(window_events),
+        "poi_events": poi_event_dicts(events, target_date),
         "raw_sampled_track": point_dicts(track_points, events),
         "sampled_track": point_dicts(visual_track_points, events),
         "home_filter": {
@@ -9791,6 +10662,7 @@ def build_plan(
     for index, stop in enumerate(plan["candidate_stops"], start=1):
         stop["alias"] = f"s{index}"
     apply_stop_labels_to_point_dicts(plan)
+    plan["sampled_track"] = route_points_via_manual_stops(plan["sampled_track"], plan["candidate_stops"])
     plan["travel_segments"] = build_stop_travel_segments(track_points, plan["candidate_stops"], places)
     attach_stop_travel_context(plan["candidate_stops"], plan["travel_segments"])
     plan["ride_segments"] = build_ride_segments(track_points, plan["candidate_stops"], places)

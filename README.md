@@ -96,14 +96,72 @@ intake is enabled, metrics are served by the intake server at `/metrics`; if
 Metrics cover Telegram update volume, handler latency/errors, image summary
 jobs, Ollama latency, OCR output size, memory extraction/query outcomes, fuel
 approval flow, OwnTracks digest/map generation, hosted OwnTracks UI render
-latency, HTTP intake requests, and process/config gauges. Codex remote-control
-commands are intentionally not instrumented. Use
+latency, HTTP intake requests, and process/config gauges. Use
 `telegram_control_http_request_duration_seconds{route="/owntracks/stops"}` and
 `telegram_control_http_request_duration_seconds{route="/owntracks/dashboard"}`
 for full request latency, or
 `telegram_control_owntracks_ui_render_duration_seconds{view="stops"}` and
 `telegram_control_owntracks_ui_render_duration_seconds{view="dashboard"}` for
 server-side page generation latency.
+
+## Local Feature Usage Analytics
+
+Durable usage analytics are enabled by default and stored only in a local
+SQLite database:
+
+```text
+FEATURE_USAGE_ENABLED=true
+FEATURE_USAGE_DB_PATH=./data/usage/usage.sqlite
+FEATURE_USAGE_RETENTION_DAYS=365
+```
+
+When HTTP intake is enabled, open `/usage?token=...` or use the **Usage** link
+in any hosted OwnTracks view. `/usage.json?token=...&days=30` returns the same
+report as JSON. The report ranks Telegram commands, automatic message
+workflows, HTTP intake features, OwnTracks views, and detailed UI controls. It
+also lists registered features with no recorded use.
+
+The browser sends sanitized feature identifiers such as
+`owntracks.ui.day.toggle_edges`; it does not send search terms, form values,
+coordinates, Telegram message text, user IDs, or tokens into the analytics
+database. Command compatibility aliases are counted under their canonical
+shortcut. Tracking starts when this version first creates the database, so a
+zero count means "not observed since tracking began," not "never used in the
+past." Keep a representative window (at least 30 days) before treating an
+unused feature as a removal candidate. Analytics can be disabled with
+`FEATURE_USAGE_ENABLED=false`.
+
+The same durable database is exported through the existing Prometheus
+`/metrics` endpoint. Unlike ordinary in-process counters, these totals survive
+bot restarts. Registered features are exported with a value of zero before
+their first observed use:
+
+```text
+telegram_control_feature_usage_total{feature="telegram.command.otm",surface="telegram",category="OwnTracks commands"}
+telegram_control_feature_last_used_timestamp_seconds{feature="telegram.command.otm",surface="telegram",category="OwnTracks commands"}
+telegram_control_feature_usage_tracking_started_timestamp_seconds
+telegram_control_feature_usage_enabled
+```
+
+Useful PromQL queries:
+
+```promql
+# Most used features
+topk(15, telegram_control_feature_usage_total)
+
+# Registered features never observed
+telegram_control_feature_usage_total == 0
+
+# Least used features that have been observed at least once
+bottomk(15, telegram_control_feature_usage_total > 0)
+
+# Telegram slash commands only
+topk(15, telegram_control_feature_usage_total{feature=~"telegram\\.command\\..+"})
+
+# Used before, but not in the last 30 days
+telegram_control_feature_last_used_timestamp_seconds > 0
+and telegram_control_feature_last_used_timestamp_seconds < time() - 30 * 24 * 60 * 60
+```
 
 
 ### Backup Metrics
@@ -147,6 +205,14 @@ In hosted mode, `/otm` replies with a link like
 `/owntracks/map/YYYY-MM-DD?token=...` instead of attaching the HTML file. The
 hosted route renders the map dynamically from the OwnTracks log on each
 request, so there is no per-day HTML file to regenerate for map UI changes.
+The hosted daily map can also repair missed visits without changing the raw
+OwnTracks log. Use **Add missing stop**, tap near the day's trajectory, and
+drag the proposed marker; it snaps to the nearest route segment and estimates
+the visit time between the surrounding samples. Disable snapping for free
+placement. A saved manual stop is inserted into the displayed route using its
+arrival and departure times, while the raw OwnTracks samples remain unchanged.
+Existing visit markers expose **Adjust location** and can likewise
+be dragged with optional trajectory snapping before saving the review.
 The hosted stop index at `/owntracks/stops?token=...` is also rendered on
 request from the raw OwnTracks log plus saved stop reviews. It groups visits by
 reviewed stop/place name when available, falls back to coordinate buckets for
@@ -181,9 +247,6 @@ The bot registers these Telegram menu commands:
 - `/cxs` - show whether the tracked process is running
 - `/cxq` - stop the tracked process
 - `/memq` - ask saved memories
-- `/spq` - ask the OwnTracks POI spending/price index
-- `/spi` - index OwnTracks spending POIs for a date/month/year scope
-- `/sph` - show spending command help
 - `/otd` - show an OwnTracks daily activity digest
 - `/otm` - send an interactive labeled OwnTracks stop map
 - `/otme` - send an embedded OwnTracks stop map attachment
@@ -227,7 +290,11 @@ cities, and city areas for visual testing without OwnTracks logs.
 stop/place index with visit details and links back to each daily map.
 `/owntracks/dashboard` serves an activity dashboard for a date range with
 home-only days, out-of-home days, travel days, distance, outside-home time, a
-daily activity calendar, and most visited places. For
+daily activity calendar, and most visited places. Its **Home radius (km)**
+control temporarily overrides the configured home radius for that dashboard
+view, so nearby errands can be classified as home without changing stored data
+or `.env`. With no date parameters, the dashboard defaults to month to date.
+Hosted daily maps include Previous day, Today, and Next day navigation. For
 Telegram iOS, prefer `OWNTRACKS_MAP_DELIVERY=hosted`. In the map, you can
 review visits chronologically, click a visit for a popup editor, rename it,
 add tags/notes, adjust entry or exit time, keep it reusable for future nearby visits,
@@ -377,10 +444,96 @@ logging for all received updates is enabled by default and written to
 delivery behavior is confirmed.
 
 Plain text messages in the same topic are treated as already-extracted OCR
-text. The bot asks Ollama to extract a durable memory record, saves it as
-Markdown under `MEMORY_WORK_DIR`, and replies with what was saved. This is the
-first step toward later command/keyword-specific handling, such as fuel receipt
-field extraction.
+text. The bot asks the configured text LLM to extract a durable memory record,
+saves it as Markdown under `MEMORY_WORK_DIR`, and replies with what was saved.
+Codex is preferred when `CODEX_LLM_ENABLED=true`; Ollama is the optional
+fallback when `OLLAMA_ENABLED=true`.
+
+HTTP(S) links in text memories are enriched automatically by default. The bot
+performs a bounded GET, extracts the page title, description, and readable
+text, generates a compact gist for the normal memory-extraction prompt, and
+saves retrieval status, final URL, timestamp, content type, SHA-256, and gist
+under `Linked Content`. The user's original message remains unchanged under
+`Raw Text`. Linked page content is labelled as untrusted data in the LLM prompt
+and cannot supply instructions to the extraction workflow.
+
+Link fetching accepts HTML and plain text, follows at most five redirects,
+revalidates every redirect destination, and defaults to three URLs, 2 MiB per
+response, and a ten-second request timeout. URLs with credentials, private or
+non-public addresses, and nonstandard ports are blocked. Sensitive query values
+such as tokens and signatures are redacted from saved link metadata. Configure
+the behavior with:
+
+```env
+MEMORY_LINK_ENRICHMENT_ENABLED=true
+MEMORY_LINK_TIMEOUT_SECONDS=10
+MEMORY_LINK_MAX_BYTES=2097152
+MEMORY_LINK_MAX_URLS=3
+MEMORY_LINK_ALLOWED_HOSTS=
+```
+
+Use `MEMORY_LINK_ALLOWED_HOSTS=notes.internal,*.trusted.example` only for
+explicitly trusted exceptional destinations. An allowlisted hostname may
+resolve to a private address or use a nonstandard port, so this is the approval
+mechanism for internal URLs and should be kept narrow.
+
+PDF documents sent to the memory topic are downloaded and hashed before
+processing. The extractor first reads embedded PDF text with `pypdf`. If the
+document has no usable text layer, pages are rendered locally with PDFium and
+passed through Tesseract OCR. The resulting text then goes through the same
+configured memory LLM used for plain-text structuring; the LLM does not parse
+the PDF bytes or replace the deterministic/OCR extraction step. The saved
+source metadata records the SHA-256, extraction method, heuristic quality,
+page count, processed pages, and extracted character count.
+
+Uploading the same PDF again without a new caption creates no memory. Uploading
+the same PDF with a new caption updates the existing hash-linked memory. PDF
+limits are configurable:
+
+```env
+MEMORY_PDF_MAX_BYTES=20971520
+MEMORY_PDF_MAX_PAGES=10
+MEMORY_PDF_RENDER_SCALE=2.5
+```
+
+Successful image extraction is also saved automatically as Markdown under
+`MEMORY_WORK_DIR`. The memory records the source image filename and SHA-256 so
+the same saved image can be backfilled or retried without creating duplicates.
+Codex benchmark text is preferred, followed by raw Tesseract OCR and then a
+successful Ollama vision response. Set `OLLAMA_ENABLED=false` to skip all local
+Ollama image jobs and text fallbacks; when Codex is enabled it is then used for
+both image extraction and durable memory structuring. If every configured image
+job returns no usable text, memory saving makes one final raw Tesseract attempt.
+
+An image caption is passed to the vision model as trusted user context. Use a
+caption to correct ambiguous or misspelled receipt text, describe the image's
+purpose, or add facts that are not visually obvious. The saved memory preserves
+the caption as `user_comment` metadata and in the Raw Text section. If an image
+already has a hash-linked memory, uploading the same image with a new caption
+updates that memory instead of silently dropping the correction as a duplicate.
+
+To update an older image without sharing it again, reply directly to that image
+with plain text. The bot downloads the replied-to Telegram image by file ID,
+matches its SHA-256, replaces the active comment, preserves comment history,
+and rebuilds the existing memory from its previously extracted Raw Text without
+rerunning image OCR or vision.
+
+The same reply workflow supports PDFs. Reply to an older PDF with the new
+caption; the bot downloads the replied-to document by Telegram file ID, hashes
+it, extracts embedded text or uses the scanned-page OCR fallback, and updates
+the existing PDF memory. Legacy caption-only PDF memories are upgraded in place
+by their original Telegram message ID, so the first successful reply adds the
+missing PDF hash instead of creating another memory.
+
+The iOS/Telegram workflow that sends replacement text and then immediately
+shares the old image is also supported. A text message is held briefly; if the
+very next message ID is an image from the same user, chat, and topic, that text
+becomes the image's replacement caption and overrides the old forwarded caption.
+Otherwise it is saved normally as a text memory. Configure the short hold with:
+
+```env
+MEMORY_CAPTION_PAIR_GRACE_SECONDS=3
+```
 
 Ask saved memories from the same topic with:
 
@@ -402,12 +555,57 @@ keeping `MEMORY_LLM_MODEL` on a local model for recurring extraction/summarizati
 `MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
 for aggregate questions that need multiple memories.
 
+Memory queries retain the last `MEMORY_QUERY_HISTORY_TURNS` successful query
+turns, defaulting to `3`, for the same Telegram user, chat, and topic. Each turn
+keeps the question, answer, and selected source paths so follow-ups such as
+`what else did I buy on the same day?` can reuse the prior receipt context.
+There is no time expiry. History is held in process memory and resets when the
+bot service restarts. Both `/memq ...` and `? ...` participate in this history.
+
+Memory answers distinguish document-derived facts from correlated location
+evidence. A merchant address printed on a receipt is labelled as a printed
+address; a POI location is labelled as the capture/association location and is
+not treated as proof of where the purchase occurred. When multiple purchases
+match, the answer distinguishes them instead of silently collapsing them. The
+model returns exact supporting basenames through an internal footer that the
+bot validates and strips; Telegram renders the final `Sources` list itself, so
+the model cannot invent local paths or source links.
+
+Every OwnTracks record containing POI text is also saved automatically as a
+deterministic Markdown memory under `MEMORY_WORK_DIR`. This includes ordinary
+place notes, trail observations, viewpoints, POIs with images, and POIs that
+contain transaction evidence. POI memory ingestion is local and deterministic;
+it does not call an LLM or require the text to resemble a receipt. The memory
+preserves the capture timestamp, coordinates, map URL, nearby stop or route
+context, OwnTracks line, optional image metadata, and original POI text.
+
+Ask POI, receipt, price, and location questions through the same memory command:
+
+```text
+/memq What POIs did I capture yesterday?
+/memq Where was Rs.450 spent on 7th July 2026?
+/memq What did I note at Savandurga viewpoint?
+```
+
 ## OwnTracks Spending POI Index
 
 OwnTracks POIs can be used as spending evidence when iOS automation pushes bank
 SMS text or receipt text/images into the POI field. The bot keeps the raw
 OwnTracks MQTT log unchanged, then a background indexer scans new POIs into a
 local SQLite database:
+
+The preferred iOS automation value for the OwnTracks `poi` field is a JSON
+string containing the capture context. The capture time and coordinates are
+authoritative for spending indexing; the enclosing OwnTracks `tst`, `lat`, and
+`lon` remain unchanged in the raw log and act as fallback values:
+
+```json
+{"time ":"2026-07-17T11:48:36+05:30","lat":12.95900953072699,"lon":77.5007669503874,"poi":"Bank or receipt text"}
+```
+
+The parser trims whitespace from JSON keys, so both `time ` (the current iOS
+Shortcut output) and `time` are accepted. Plain-text legacy POIs remain
+supported.
 
 ```env
 SPENDING_INDEX_ENABLED=true
@@ -421,7 +619,39 @@ paths, OwnTracks line numbers, and nearest location context. Embedded POI images
 are decoded under `SPENDING_EVIDENCE_DIR`; OCR runs only when
 `IMAGE_SUMMARY_OCR_ENABLED=true`.
 
-Use `/spi` for manual backfills or retries:
+### Memory and POI correlation
+
+Each spending-index pass also refreshes deterministic links between Markdown
+memories and indexed POI events in the SQLite `memory_poi_links` table. Matching
+uses the first unambiguous method in this order:
+
+1. shared `capture_id` (`confidence=1.0`)
+2. exact image SHA-256 (`confidence=1.0`)
+3. merchant + amount + transaction date (`confidence=0.9`)
+4. a unique amount + transaction date match (`confidence=0.8`)
+
+Live `/memq` queries do not ask an LLM to match records. They retrieve memories,
+read already-saved links locally, and add the linked POI time, place, distance,
+map URL, transaction, OwnTracks line, match method, and confidence to the answer
+context. This supports questions such as `/memq Where did I buy broccoli?`.
+
+For new iOS Shortcuts, generate one UUID and include it in both the structured
+OwnTracks POI JSON and the Telegram image caption:
+
+```json
+{"capture_id":"b3adca44-2f72-4e42-8729-d262fc55df77","time":"2026-07-20T15:03:00+05:30","lat":12.95,"lon":77.50,"poi":"GO GREEN receipt ₹511.50"}
+```
+
+```text
+capture_id: b3adca44-2f72-4e42-8729-d262fc55df77
+Broccoli is misspelt as brookly.
+```
+
+Payload `time` remains authoritative; MQTT receive time is not used for the
+transaction time or correlation.
+
+The hidden compatibility command `/spi` can be used for manual POI-memory
+backfills and correlation retries:
 
 ```text
 /spi today
@@ -429,13 +659,8 @@ Use `/spi` for manual backfills or retries:
 /spi 2026-07
 ```
 
-Ask indexed spending and price questions with `/spq`:
-
-```text
-/spq Where was Rs.450 spent on 7th July 2026?
-/spq what is the last price of apples per kg?
-/spq what is the avg price of pizza I paid in 2026?
-```
+Telegram spending and price questions use `/memq`; there is no separate
+`/spq` command.
 
 When HTTP intake is enabled, the same feature is available locally:
 
