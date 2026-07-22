@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from image_summary import IST, ImageSummaryConfig, log, run_ocr, text_llm_chat
 from link_enrichment import LinkEnrichment, enrich_text_links
@@ -502,6 +502,7 @@ def memories_with_history(
 ) -> list[tuple[Path, str, int]]:
     memories: list[tuple[Path, str, int]] = []
     seen: set[Path] = set()
+    positions: dict[Path, int] = {}
 
     for turn in reversed(history):
         for path in turn.context_paths:
@@ -513,11 +514,16 @@ def memories_with_history(
                 continue
             memories.append((path, content, 0))
             seen.add(path)
+            positions[path] = len(memories) - 1
 
     for path, content, score in relevant_memories(question, cfg):
-        if path not in seen:
-            memories.append((path, content, score))
-            seen.add(path)
+        if path in seen:
+            index = positions[path]
+            memories[index] = (path, content, score)
+            continue
+        memories.append((path, content, score))
+        seen.add(path)
+        positions[path] = len(memories) - 1
     return memories
 
 
@@ -569,6 +575,7 @@ def answer_memory_question(
     history: tuple[MemoryQueryTurn, ...] = (),
     selected_memories: list[tuple[Path, str, int]] | None = None,
     correlated_poi_context: str = "",
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> MemoryAnswer:
     memories = selected_memories if selected_memories is not None else memories_with_history(question, cfg, history)
     if not memories:
@@ -615,7 +622,16 @@ MEMORY CONTEXT:
 CORRELATED POI CONTEXT:
 {correlated_poi_context or "No correlated POI records."}
 """.strip()
-    raw_answer = text_llm_chat(cfg, cfg.memory_query_model, prompt, "memory_query")
+    if on_text_delta is None:
+        raw_answer = text_llm_chat(cfg, cfg.memory_query_model, prompt, "memory_query")
+    else:
+        raw_answer = text_llm_chat(
+            cfg,
+            cfg.memory_query_model,
+            prompt,
+            "memory_query",
+            on_text_delta=on_text_delta,
+        )
     answer, used_paths = answer_and_used_paths(raw_answer, memories)
     return MemoryAnswer(
         answer=answer,

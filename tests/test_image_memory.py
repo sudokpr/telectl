@@ -76,6 +76,26 @@ def test_ollama_can_be_disabled_for_image_jobs(tmp_path: Path) -> None:
     assert processing_description(cfg) == "Codex vision"
 
 
+def test_memory_query_feedback_flags_are_opt_in(tmp_path: Path) -> None:
+    default_cfg = build_config({"IMAGE_SUMMARY_WORK_DIR": str(tmp_path)}, 0)
+    assert default_cfg.image_summary_stream is False
+    assert default_cfg.memory_query_show_retrieval is False
+    assert default_cfg.memory_query_stream is False
+
+    enabled_cfg = build_config(
+        {
+            "IMAGE_SUMMARY_WORK_DIR": str(tmp_path),
+            "IMAGE_SUMMARY_STREAM": "true",
+            "MEMORY_QUERY_SHOW_RETRIEVAL": "true",
+            "MEMORY_QUERY_STREAM": "true",
+        },
+        0,
+    )
+    assert enabled_cfg.image_summary_stream is True
+    assert enabled_cfg.memory_query_show_retrieval is True
+    assert enabled_cfg.memory_query_stream is True
+
+
 def test_image_caption_is_passed_to_codex_vision(tmp_path: Path, monkeypatch) -> None:
     cfg = build_config(
         {
@@ -87,9 +107,12 @@ def test_image_caption_is_passed_to_codex_vision(tmp_path: Path, monkeypatch) ->
         0,
     )
     captured = {}
+    streamed: list[str] = []
 
-    def fake_vision(_path, _cfg, user_comment=None):
+    def fake_vision(_path, _cfg, user_comment=None, on_text_delta=None):
         captured["comment"] = user_comment
+        if on_text_delta:
+            on_text_delta("BROOKLY ")
         return "BROOKLY means broccoli"
 
     monkeypatch.setattr("image_summary.summarize_codex_vision", fake_vision)
@@ -97,12 +120,14 @@ def test_image_caption_is_passed_to_codex_vision(tmp_path: Path, monkeypatch) ->
         tmp_path / "receipt.jpg",
         cfg,
         "Broccoli is misspelt as brookly in the receipt.",
+        on_text_delta=streamed.append,
     )[0]
 
     result = job()
 
     assert result["ok"] is True
     assert captured["comment"] == "Broccoli is misspelt as brookly in the receipt."
+    assert streamed == ["BROOKLY "]
 
 
 def test_new_caption_updates_existing_image_memory(tmp_path: Path, monkeypatch) -> None:

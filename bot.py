@@ -33,6 +33,7 @@ from memory_processor import (
     MemoryQueryTurn,
     answer_memory_question,
     memories_with_history,
+    query_terms,
     save_image_memory,
     save_memory,
     update_image_memory_comment,
@@ -746,6 +747,89 @@ async def reply_chunked(update: Update, text: str, max_chars: int) -> None:
         REPLIES_TOTAL.labels(kind="text").inc()
 
 
+def memory_retrieval_report(
+    question: str,
+    selected_memories: list[tuple[Path, str, int]],
+) -> str:
+    terms = sorted(query_terms(question))
+    ranked = [(path, score) for path, _content, score in selected_memories if score > 0]
+    reused = [path for path, _content, score in selected_memories if score == 0]
+    lines = ["Memory retrieval", f"Query terms: {', '.join(terms) if terms else '(none)'}"]
+    if ranked:
+        lines.append("Ranked keyword matches:")
+        lines.extend(f"{index}. {path.name} — score {score}" for index, (path, score) in enumerate(ranked, 1))
+    else:
+        lines.append("Ranked keyword matches: none")
+    if reused:
+        lines.append("Reused from recent query context:")
+        lines.extend(f"- {path.name}" for path in reused)
+    lines.append("Generating answer…")
+    return "\n".join(lines)
+
+
+def visible_answer_stream(raw_text: str, max_chars: int) -> str:
+    visible = re.split(r"(?im)^USED_MEMORY_FILES:", raw_text, maxsplit=1)[0].strip()
+    if not visible:
+        return ""
+    lines = visible.splitlines()
+    if lines and "USED_MEMORY_FILES:".startswith(lines[-1].strip().upper()):
+        lines.pop()
+        visible = "\n".join(lines).rstrip()
+    if len(visible) > max_chars:
+        visible = visible[: max(1, max_chars - 1)].rstrip() + "…"
+    return visible
+
+
+async def stream_answer_updates(
+    stream_message: Any,
+    queue: asyncio.Queue[str],
+    done: asyncio.Event,
+    summary_config: ImageSummaryConfig,
+) -> None:
+    raw_text = ""
+    rendered = "Answering…"
+    last_edit = 0.0
+    while not done.is_set() or not queue.empty():
+        try:
+            raw_text += await asyncio.wait_for(queue.get(), timeout=0.75)
+            while not queue.empty():
+                raw_text += queue.get_nowait()
+        except TimeoutError:
+            pass
+        preview = visible_answer_stream(raw_text, summary_config.max_reply_chars)
+        now = time.monotonic()
+        if preview and preview != rendered and (done.is_set() or now - last_edit >= 1.0):
+            try:
+                await stream_message.edit_text(preview)
+                rendered = preview
+                last_edit = now
+            except Exception as exc:
+                image_summary_log(summary_config, f"answer_stream_edit_failed error={exc}")
+
+
+async def finish_streamed_reply(
+    message: Any,
+    stream_message: Any,
+    text: str,
+    max_chars: int,
+) -> None:
+    chunks = split_message(text, max_chars)
+    if not chunks:
+        chunks = ["I could not produce an answer."]
+    total = len(chunks)
+    for index, chunk in enumerate(chunks):
+        rendered = f"({index + 1}/{total})\n{chunk}" if total > 1 else chunk
+        if index == 0:
+            try:
+                await stream_message.edit_text(rendered)
+            except Exception:
+                await message.reply_text(rendered)
+                REPLIES_TOTAL.labels(kind="text").inc()
+        else:
+            await message.reply_text(rendered)
+            REPLIES_TOTAL.labels(kind="text").inc()
+
+
 def pending_caption_key(message: Any, message_id: int) -> tuple[int, int | None, int, int] | None:
     user = getattr(message, "from_user", None)
     user_id = getattr(user, "id", None)
@@ -851,9 +935,38 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
     )
     try:
         results: list[dict[str, Any]] = []
-        for label, job in image_result_jobs(target, summary_config, user_comment):
+        loop = asyncio.get_running_loop()
+        stream_queue: asyncio.Queue[str] | None = None
+
+        def enqueue_image_delta(delta: str) -> None:
+            if stream_queue is not None:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, delta)
+
+        image_delta_callback = enqueue_image_delta if summary_config.image_summary_stream else None
+        for label, job in image_result_jobs(
+            target,
+            summary_config,
+            user_comment,
+            on_text_delta=image_delta_callback,
+        ):
             image_summary_log(summary_config, f"image_result_started message_id={message.message_id} label={label!r}")
-            result = await asyncio.to_thread(job)
+            stream_message = None
+            stream_task = None
+            stream_done = asyncio.Event()
+            if summary_config.image_summary_stream:
+                stream_queue = asyncio.Queue()
+                stream_message = await message.reply_text(f"{label}\nGenerating…")
+                REPLIES_TOTAL.labels(kind="text").inc()
+                stream_task = asyncio.create_task(
+                    stream_answer_updates(stream_message, stream_queue, stream_done, summary_config)
+                )
+            try:
+                result = await asyncio.to_thread(job)
+            finally:
+                stream_done.set()
+                if stream_task is not None:
+                    await stream_task
+                stream_queue = None
             results.append(result)
             job_result = "success" if result["ok"] else "error"
             IMAGE_JOBS_TOTAL.labels(mode=summary_config.summary_mode, label=label, result=job_result).inc()
@@ -868,10 +981,52 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             IMAGE_REPLY_CHUNKS_TOTAL.labels(mode=summary_config.summary_mode).inc(
                 len(split_message(build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars))
             )
-            await reply_chunked(update, build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars)
+            result_reply = build_result_reply(result, summary_config.summary_mode)
+            if stream_message is not None:
+                await finish_streamed_reply(
+                    message,
+                    stream_message,
+                    result_reply,
+                    summary_config.max_reply_chars,
+                )
+            else:
+                await reply_chunked(update, result_reply, summary_config.max_reply_chars)
 
         image_summary_log(summary_config, f"image_comparison_started message_id={message.message_id}")
-        comparison = await asyncio.to_thread(compare_ollama_to_codex, results, summary_config)
+        comparison_stream_message = None
+        comparison_stream_task = None
+        comparison_stream_done = asyncio.Event()
+        comparison_possible = any(
+            result.get("ok") and str(result.get("label", "")).startswith("Codex benchmark text")
+            for result in results
+        ) and any(
+            result.get("ok") and str(result.get("label", "")).startswith("Direct vision LLM")
+            for result in results
+        )
+        if summary_config.image_summary_stream and comparison_possible:
+            stream_queue = asyncio.Queue()
+            comparison_stream_message = await message.reply_text("Image comparison\nGenerating…")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            comparison_stream_task = asyncio.create_task(
+                stream_answer_updates(
+                    comparison_stream_message,
+                    stream_queue,
+                    comparison_stream_done,
+                    summary_config,
+                )
+            )
+        try:
+            comparison = await asyncio.to_thread(
+                compare_ollama_to_codex,
+                results,
+                summary_config,
+                image_delta_callback if comparison_possible else None,
+            )
+        finally:
+            comparison_stream_done.set()
+            if comparison_stream_task is not None:
+                await comparison_stream_task
+            stream_queue = None
         if comparison:
             comparison_result = "success" if comparison["ok"] else "error"
             IMAGE_JOBS_TOTAL.labels(mode="comparison", label=comparison["label"], result=comparison_result).inc()
@@ -884,7 +1039,16 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             IMAGE_REPLY_CHUNKS_TOTAL.labels(mode="comparison").inc(
                 len(split_message(build_result_reply(comparison, "comparison"), summary_config.max_reply_chars))
             )
-            await reply_chunked(update, build_result_reply(comparison, "comparison"), summary_config.max_reply_chars)
+            comparison_reply = build_result_reply(comparison, "comparison")
+            if comparison_stream_message is not None:
+                await finish_streamed_reply(
+                    message,
+                    comparison_stream_message,
+                    comparison_reply,
+                    summary_config.max_reply_chars,
+                )
+            else:
+                await reply_chunked(update, comparison_reply, summary_config.max_reply_chars)
         else:
             image_summary_log(summary_config, f"image_comparison_skipped message_id={message.message_id}")
 
@@ -1554,7 +1718,7 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     image_summary_log(summary_config, f"memory_query question={question!r}")
-    await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
+    progress_message = await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
     REPLIES_TOTAL.labels(kind="text").inc()
 
     user_id = update.effective_user.id if update.effective_user else 0
@@ -1569,10 +1733,32 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     typing_task = asyncio.create_task(
         typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
     )
+    stream_message = None
+    stream_task = None
+    stream_done = asyncio.Event()
+    stream_queue: asyncio.Queue[str] = asyncio.Queue()
     try:
         selected_memories = await asyncio.to_thread(memories_with_history, question, summary_config, tuple(history))
+        if summary_config.memory_query_show_retrieval:
+            try:
+                await progress_message.edit_text(memory_retrieval_report(question, selected_memories))
+            except Exception as exc:
+                image_summary_log(summary_config, f"memory_query_retrieval_edit_failed error={exc}")
         selected_paths = tuple(path for path, _content, _score in selected_memories)
         poi_context = await asyncio.to_thread(memory_poi_context, config.spending, selected_paths)
+        on_text_delta = None
+        if summary_config.memory_query_stream and selected_memories:
+            stream_message = await message.reply_text("Answering…")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            loop = asyncio.get_running_loop()
+
+            def enqueue_text_delta(delta: str) -> None:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, delta)
+
+            on_text_delta = enqueue_text_delta
+            stream_task = asyncio.create_task(
+                stream_answer_updates(stream_message, stream_queue, stream_done, summary_config)
+            )
         result = await asyncio.to_thread(
             answer_memory_question,
             question,
@@ -1580,11 +1766,15 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             tuple(history),
             selected_memories,
             poi_context,
+            on_text_delta,
         )
         MEMORY_QUERY_CONTEXT_CHARS.observe(sum(path.stat().st_size for path in result.context_paths if path.exists()))
         if not result.context_paths:
             query_result = "no_match"
     finally:
+        stream_done.set()
+        if stream_task is not None:
+            await stream_task
         stop_event.set()
         await typing_task
     MEMORY_QUERIES_TOTAL.labels(result=query_result).inc()
@@ -1596,7 +1786,10 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply = result.answer
     if sources:
         reply += f"\n\nSources:\n{sources}"
-    await reply_chunked(update, reply, summary_config.max_reply_chars)
+    if stream_message is not None:
+        await finish_streamed_reply(message, stream_message, reply, summary_config.max_reply_chars)
+    else:
+        await reply_chunked(update, reply, summary_config.max_reply_chars)
 
     if result.context_paths and summary_config.memory_query_history_turns > 0:
         history.append(

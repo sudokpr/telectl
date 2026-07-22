@@ -443,6 +443,11 @@ logging for all received updates is enabled by default and written to
 `data/image-summary/worker.log`; set `IMAGE_SUMMARY_DEBUG_UPDATES=false` after
 delivery behavior is confirmed.
 
+Set `IMAGE_SUMMARY_STREAM=true` to show model output as it arrives for Codex
+vision, OCR summarization, direct Ollama vision, and the optional comparison
+step. Telegram edits are throttled, and only user-facing answer text is
+relayed—not private model reasoning.
+
 Plain text messages in the same topic are treated as already-extracted OCR
 text. The bot asks the configured text LLM to extract a durable memory record,
 saves it as Markdown under `MEMORY_WORK_DIR`, and replies with what was saved.
@@ -554,6 +559,15 @@ a fast fallback model such as `gemma4:31b-cloud` for interactive Q&A, while
 keeping `MEMORY_LLM_MODEL` on a local model for recurring extraction/summarization work.
 `MEMORY_QUERY_TOP_K` defaults to `1` for precise receipt lookups; increase it
 for aggregate questions that need multiple memories.
+
+Set `MEMORY_QUERY_SHOW_RETRIEVAL=true` to replace the initial search
+acknowledgement with the normalized query terms, ranked keyword matches, their
+deterministic scores, and any source reused from recent query history. This is
+retrieval evidence, not private model chain-of-thought. Set
+`MEMORY_QUERY_STREAM=true` to stream the user-facing answer by periodically
+editing a Telegram message. Both the Codex SDK and the Ollama fallback support
+this stream; the internal `USED_MEMORY_FILES` source-validation footer is never
+shown and the final message is replaced with the validated answer and sources.
 
 Memory queries retain the last `MEMORY_QUERY_HISTORY_TURNS` successful query
 turns, defaulting to `3`, for the same Telegram user, chat, and topic. Each turn

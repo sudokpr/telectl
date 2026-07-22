@@ -1,7 +1,13 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from memory_processor import MemoryQueryTurn, answer_memory_question, query_terms, relevant_memories
+from memory_processor import (
+    MemoryQueryTurn,
+    answer_memory_question,
+    memories_with_history,
+    query_terms,
+    relevant_memories,
+)
 
 
 def test_multiword_coverage_beats_repetition_of_one_term(tmp_path: Path) -> None:
@@ -69,6 +75,20 @@ def test_followup_query_reuses_previous_turn_sources(tmp_path: Path, monkeypatch
     assert "What was the broccoli price?" in captured["prompt"]
     assert "Broccoli cost 66.60 on 20/07/2026." in captured["prompt"]
     assert "BROOKLY means broccoli" in captured["prompt"]
+
+
+def test_history_source_keeps_current_keyword_score(tmp_path: Path) -> None:
+    receipt = tmp_path / "broccoli-receipt.md"
+    receipt.write_text("Broccoli 66.60", encoding="utf-8")
+    cfg = SimpleNamespace(memory_dir=tmp_path, memory_query_top_k=1)
+    history = (
+        MemoryQueryTurn(question="Earlier?", answer="Earlier answer", context_paths=(receipt,)),
+    )
+
+    selected = memories_with_history("broccoli price", cfg, history)
+
+    assert selected[0][0] == receipt
+    assert selected[0][2] > 0
 
 
 def test_memory_answer_includes_correlated_poi_context(tmp_path: Path, monkeypatch) -> None:

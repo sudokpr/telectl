@@ -101,6 +101,7 @@ class ImageSummaryConfig:
     topic_id: int
     max_reply_chars: int
     summary_mode: str
+    image_summary_stream: bool
     work_dir: Path
     log_file: Path
     debug_updates: bool
@@ -123,6 +124,8 @@ class ImageSummaryConfig:
     memory_query_top_k: int
     memory_query_max_context_chars: int
     memory_query_history_turns: int
+    memory_query_show_retrieval: bool
+    memory_query_stream: bool
     memory_link_enrichment_enabled: bool
     memory_link_timeout_seconds: int
     memory_link_max_bytes: int
@@ -181,6 +184,7 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         topic_id=env_topic_id(env.get("IMAGE_SUMMARY_TOPIC_ID"), 145),
         max_reply_chars=env_int(env.get("IMAGE_SUMMARY_MAX_REPLY_CHARS"), 3600),
         summary_mode=mode,
+        image_summary_stream=env_bool(env.get("IMAGE_SUMMARY_STREAM"), False),
         work_dir=work_dir,
         log_file=Path(env.get("IMAGE_SUMMARY_LOG_FILE", str(work_dir / "worker.log"))).expanduser(),
         debug_updates=env_bool(env.get("IMAGE_SUMMARY_DEBUG_UPDATES"), True),
@@ -203,6 +207,8 @@ def build_config(env: dict[str, str], fallback_chat_id: int) -> ImageSummaryConf
         memory_query_top_k=env_int(env.get("MEMORY_QUERY_TOP_K"), 1),
         memory_query_max_context_chars=env_int(env.get("MEMORY_QUERY_MAX_CONTEXT_CHARS"), 14000),
         memory_query_history_turns=env_int(env.get("MEMORY_QUERY_HISTORY_TURNS"), 3),
+        memory_query_show_retrieval=env_bool(env.get("MEMORY_QUERY_SHOW_RETRIEVAL"), False),
+        memory_query_stream=env_bool(env.get("MEMORY_QUERY_STREAM"), False),
         memory_link_enrichment_enabled=env_bool(env.get("MEMORY_LINK_ENRICHMENT_ENABLED"), True),
         memory_link_timeout_seconds=env_int(env.get("MEMORY_LINK_TIMEOUT_SECONDS"), 10),
         memory_link_max_bytes=env_int(env.get("MEMORY_LINK_MAX_BYTES"), 2 * 1024 * 1024),
@@ -266,6 +272,7 @@ def ollama_chat(
     prompt: str,
     images: list[Path] | None = None,
     purpose: str = "general",
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> str:
     start = time.monotonic()
     message: dict[str, Any] = {"role": "user", "content": prompt}
@@ -274,12 +281,26 @@ def ollama_chat(
     try:
         resp = requests.post(
             f"{cfg.ollama_url}/api/chat",
-            json={"model": model, "messages": [message], "stream": False},
+            json={"model": model, "messages": [message], "stream": on_text_delta is not None},
             timeout=cfg.ollama_timeout_seconds,
+            stream=on_text_delta is not None,
         )
         if resp.status_code != 200:
             raise RuntimeError(f"Ollama {model} failed: HTTP {resp.status_code}: {resp.text[:500]}")
         OLLAMA_REQUESTS_TOTAL.labels(purpose=purpose, model=model, result="success").inc()
+        if on_text_delta is not None:
+            chunks: list[str] = []
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                payload = json.loads(line)
+                delta = str(payload.get("message", {}).get("content", ""))
+                if delta:
+                    chunks.append(delta)
+                    on_text_delta(delta)
+                if payload.get("done"):
+                    break
+            return "".join(chunks).strip()
         return resp.json().get("message", {}).get("content", "").strip()
     except Exception as exc:
         OLLAMA_REQUESTS_TOTAL.labels(purpose=purpose, model=model, result=error_type(exc)).inc()
@@ -288,29 +309,45 @@ def ollama_chat(
         OLLAMA_REQUEST_DURATION_SECONDS.labels(purpose=purpose, model=model).observe(time.monotonic() - start)
 
 
-def codex_text_chat(cfg: ImageSummaryConfig, prompt: str) -> str:
-    return ask_codex_text(prompt, cfg.codex_llm_config)
+def codex_text_chat(
+    cfg: ImageSummaryConfig,
+    prompt: str,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> str:
+    return ask_codex_text(prompt, cfg.codex_llm_config, on_text_delta=on_text_delta)
 
 
-def codex_image_chat(cfg: ImageSummaryConfig, prompt: str, image_path: Path) -> str:
-    return ask_codex_image(prompt, [image_path], cfg.codex_llm_config)
+def codex_image_chat(
+    cfg: ImageSummaryConfig,
+    prompt: str,
+    image_path: Path,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> str:
+    return ask_codex_image(prompt, [image_path], cfg.codex_llm_config, on_text_delta=on_text_delta)
 
 
-def text_llm_chat(cfg: ImageSummaryConfig, ollama_model: str, prompt: str, purpose: str) -> str:
+def text_llm_chat(
+    cfg: ImageSummaryConfig,
+    ollama_model: str,
+    prompt: str,
+    purpose: str,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> str:
     if cfg.codex_llm_enabled:
         try:
-            return codex_text_chat(cfg, prompt)
+            return codex_text_chat(cfg, prompt, on_text_delta=on_text_delta)
         except Exception as exc:
             log(cfg, f"codex_llm_failed purpose={purpose} model={cfg.codex_llm_model or 'default'} error={exc}")
     if not cfg.ollama_enabled:
         raise RuntimeError(f"No text LLM available for {purpose}: Codex failed or is disabled and Ollama is disabled")
-    return ollama_chat(cfg, ollama_model, prompt, purpose=purpose)
+    return ollama_chat(cfg, ollama_model, prompt, purpose=purpose, on_text_delta=on_text_delta)
 
 
 def summarize_ocr(
     image_path: Path,
     cfg: ImageSummaryConfig,
     user_comment: str | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
     text = run_ocr(image_path, cfg)
     if not text:
@@ -325,17 +362,29 @@ OCR TEXT:
 {text}
 """.strip()
     prompt = image_prompt(prompt, user_comment)
-    summary = text_llm_chat(cfg, cfg.ocr_llm_model, prompt, "ocr_summary")
+    summary = text_llm_chat(
+        cfg,
+        cfg.ocr_llm_model,
+        prompt,
+        "ocr_summary",
+        on_text_delta=on_text_delta,
+    )
     return text, summary
 
 
-def summarize_vision(image_path: Path, cfg: ImageSummaryConfig, user_comment: str | None = None) -> str:
+def summarize_vision(
+    image_path: Path,
+    cfg: ImageSummaryConfig,
+    user_comment: str | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> str:
     return ollama_chat(
         cfg,
         cfg.vision_llm_model,
         image_prompt(VISION_PROMPT, user_comment),
         images=[image_path],
         purpose="vision_summary",
+        on_text_delta=on_text_delta,
     )
 
 
@@ -343,11 +392,21 @@ def summarize_codex_vision(
     image_path: Path,
     cfg: ImageSummaryConfig,
     user_comment: str | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> str:
-    return codex_image_chat(cfg, image_prompt(CODEX_BENCHMARK_PROMPT, user_comment), image_path)
+    return codex_image_chat(
+        cfg,
+        image_prompt(CODEX_BENCHMARK_PROMPT, user_comment),
+        image_path,
+        on_text_delta=on_text_delta,
+    )
 
 
-def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConfig) -> dict[str, Any] | None:
+def compare_ollama_to_codex(
+    results: list[dict[str, Any]],
+    cfg: ImageSummaryConfig,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> dict[str, Any] | None:
     benchmark = next(
         (
             result
@@ -373,7 +432,7 @@ def compare_ollama_to_codex(results: list[dict[str, Any]], cfg: ImageSummaryConf
         candidates=candidate_text,
     )
     label = f"MiniCPM-vs-Codex benchmark ({cfg.codex_llm_model or 'default'})"
-    return timed_call(label, lambda: codex_text_chat(cfg, prompt))
+    return timed_call(label, lambda: codex_text_chat(cfg, prompt, on_text_delta=on_text_delta))
 
 
 def timed_call(label: str, fn: Any) -> dict[str, Any]:
@@ -428,6 +487,7 @@ def image_result_jobs(
     image_path: Path,
     cfg: ImageSummaryConfig,
     user_comment: str | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> list[tuple[str, Callable[[], dict[str, Any]]]]:
     jobs: list[tuple[str, Callable[[], dict[str, Any]]]] = []
     if cfg.summary_mode in {"compare", "ocr"} and cfg.ocr_enabled:
@@ -438,7 +498,7 @@ def image_result_jobs(
                 label,
                 lambda label=label: timed_call(
                     label,
-                    lambda: summarize_ocr(image_path, cfg, user_comment),
+                    lambda: summarize_ocr(image_path, cfg, user_comment, on_text_delta=on_text_delta),
                 ),
             )
         )
@@ -450,7 +510,12 @@ def image_result_jobs(
                     label,
                     lambda label=label: timed_call(
                         label,
-                        lambda: summarize_codex_vision(image_path, cfg, user_comment),
+                        lambda: summarize_codex_vision(
+                            image_path,
+                            cfg,
+                            user_comment,
+                            on_text_delta=on_text_delta,
+                        ),
                     ),
                 )
             )
@@ -468,6 +533,7 @@ def image_result_jobs(
                                 image_prompt(VISION_PROMPT, user_comment),
                                 images=[image_path],
                                 purpose="vision_summary",
+                                on_text_delta=on_text_delta,
                             ),
                         ),
                     )
