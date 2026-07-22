@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram Control backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Kolkata
+Persistent=true
+Unit=telegram-control-backup.service
+
+[Install]
+WantedBy=timers.target

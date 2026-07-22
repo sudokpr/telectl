@@ -2,14 +2,73 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest, start_http_server
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, Histogram, generate_latest, start_http_server
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 
 START_TIME = time.time()
+
+
+class FeatureUsageCollector:
+    """Expose durable usage totals from the local analytics database."""
+
+    def __init__(self) -> None:
+        self.analytics: Any = None
+
+    def collect(self):
+        enabled = GaugeMetricFamily(
+            "telegram_control_feature_usage_enabled",
+            "Whether durable local feature usage analytics are enabled.",
+        )
+        events = CounterMetricFamily(
+            "telegram_control_feature_usage",
+            "Durable lifetime feature interactions observed since tracking began.",
+            labels=["feature", "surface", "category"],
+        )
+        last_used = GaugeMetricFamily(
+            "telegram_control_feature_last_used_timestamp_seconds",
+            "Unix timestamp of the most recent observed interaction; zero means never observed.",
+            labels=["feature", "surface", "category"],
+        )
+        tracking_started = GaugeMetricFamily(
+            "telegram_control_feature_usage_tracking_started_timestamp_seconds",
+            "Unix timestamp when durable feature usage tracking began.",
+        )
+        if self.analytics is None:
+            enabled.add_metric([], 0)
+            tracking_started.add_metric([], 0)
+        else:
+            try:
+                snapshot = self.analytics.prometheus_snapshot()
+                enabled.add_metric([], 1 if snapshot.get("enabled") else 0)
+                started = snapshot.get("tracking_started_at")
+                tracking_started.add_metric([], datetime.fromisoformat(started).timestamp() if started else 0)
+                for item in snapshot.get("features") or []:
+                    labels = [str(item["feature"]), str(item["surface"]), str(item["category"])]
+                    events.add_metric(labels, int(item.get("count") or 0))
+                    last = item.get("last_used")
+                    last_used.add_metric(labels, datetime.fromisoformat(last).timestamp() if last else 0)
+            except Exception:
+                enabled.add_metric([], 0)
+                tracking_started.add_metric([], 0)
+        yield enabled
+        yield events
+        yield last_used
+        yield tracking_started
+
+
+FEATURE_USAGE_COLLECTOR = FeatureUsageCollector()
+REGISTRY.register(FEATURE_USAGE_COLLECTOR)
+
+
+def set_usage_analytics(analytics: Any) -> None:
+    FEATURE_USAGE_COLLECTOR.analytics = analytics
 
 
 @dataclass(frozen=True)
@@ -216,6 +275,16 @@ OWNTRACKS_RIDE_SEGMENTS = Histogram(
     "telegram_control_owntracks_ride_segments",
     "Ride segment count in OwnTracks plans.",
 )
+OWNTRACKS_UI_RENDER_TOTAL = Counter(
+    "telegram_control_owntracks_ui_render_total",
+    "OwnTracks hosted UI render attempts by view and result.",
+    ["view", "result"],
+)
+OWNTRACKS_UI_RENDER_DURATION_SECONDS = Histogram(
+    "telegram_control_owntracks_ui_render_duration_seconds",
+    "OwnTracks hosted UI server-side render duration in seconds.",
+    ["view", "result"],
+)
 
 HTTP_REQUESTS_TOTAL = Counter(
     "telegram_control_http_requests_total",
@@ -291,6 +360,11 @@ def observe_plan(plan: dict) -> None:
     OWNTRACKS_RIDE_SEGMENTS.observe(len(plan.get("ride_segments") or []))
 
 
+def observe_owntracks_ui_render(view: str, start: float, result: str) -> None:
+    OWNTRACKS_UI_RENDER_TOTAL.labels(view=view, result=result).inc()
+    OWNTRACKS_UI_RENDER_DURATION_SECONDS.labels(view=view, result=result).observe(time.monotonic() - start)
+
+
 def set_config_enabled(*, image_summary: bool, memory: bool, fuel: bool, http_intake: bool, owntracks: bool) -> None:
     INFO.labels(version="0.1.0").set(1)
     UPTIME_SECONDS.set_function(lambda: max(0.0, time.time() - START_TIME))
@@ -324,10 +398,26 @@ def http_route(path: str) -> str:
         return "/health"
     if clean == "/memory":
         return "/memory"
+    if clean in {"/usage", "/usage.html", "/usage.json"}:
+        return "/usage"
+    if clean == "/usage/events":
+        return "/usage/events"
     if clean == "/fuel.csv":
         return "/fuel.csv"
     if clean in {"/owntracks/sample", "/owntracks/sample.html"}:
         return "/owntracks/sample"
+    if clean in {"/owntracks/stops", "/owntracks/stops.html"}:
+        return "/owntracks/stops"
+    if clean in {"/owntracks/trips", "/owntracks/trips.html"}:
+        return "/owntracks/trips"
+    if clean in {"/owntracks/dashboard", "/owntracks/dashboard.html"}:
+        return "/owntracks/dashboard"
+    if clean == "/owntracks/search-aliases":
+        return "/owntracks/search-aliases"
+    if clean == "/owntracks/media":
+        return "/owntracks/media"
+    if clean.startswith("/owntracks/media/"):
+        return "/owntracks/media/:file"
     if clean.startswith("/owntracks/map/"):
         return "/owntracks/map/:scope"
     return "not_found"

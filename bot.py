@@ -29,7 +29,17 @@ from image_summary import log as image_summary_log
 from image_summary import processing_description
 from image_summary import split_message
 from http_intake import HttpIntakeConfig, build_http_config, start_http_intake
-from memory_processor import answer_memory_question, save_memory
+from memory_processor import (
+    MemoryQueryTurn,
+    answer_memory_question,
+    memories_with_history,
+    query_terms,
+    save_image_memory,
+    save_memory,
+    update_image_memory_comment,
+)
+from pdf_memory import save_pdf_memory
+from poi_memory import poi_memory_loop, sync_poi_memories
 from metrics import (
     FUEL_APPROVALS_TOTAL,
     FUEL_CORRECTIONS_TOTAL,
@@ -63,6 +73,7 @@ from metrics import (
     observe_update,
     set_config_enabled,
     set_memory_files_gauge,
+    set_usage_analytics as configure_usage_metrics,
     start_standalone_metrics_server,
 )
 from owntracks.env import load_env as load_owntracks_env
@@ -75,6 +86,14 @@ from owntracks.env import project_path as owntracks_project_path
 from owntracks.tagger import load_user_tags as load_owntracks_user_tags
 from owntracks.tagger import save_user_tags as save_owntracks_user_tags
 from owntracks.tagger import target_scope_from_text as owntracks_target_scope_from_text
+from spending_index import (
+    SpendingConfig,
+    build_spending_config,
+    index_scope,
+    memory_poi_context,
+    spending_index_loop,
+)
+from usage_analytics import UsageAnalytics, UsageConfig, build_usage_config, canonical_command
 
 RUN_DIR = BASE_DIR / "run"
 LOG_DIR = BASE_DIR / "logs"
@@ -127,6 +146,8 @@ class Config:
     owntracks_user_tags_path: Path
     owntracks_map_delivery: str
     owntracks_map_base_url: str
+    spending: SpendingConfig
+    usage: UsageConfig
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -218,6 +239,8 @@ def load_config() -> Config:
         ),
         owntracks_map_delivery=(first_value(["OWNTRACKS_MAP_DELIVERY"], local_env) or "file").strip().lower(),
         owntracks_map_base_url=(first_value(["OWNTRACKS_MAP_BASE_URL", "HTTP_PUBLIC_BASE_URL"], local_env) or "").strip(),
+        spending=build_spending_config(image_summary_env),
+        usage=build_usage_config(image_summary_env, BASE_DIR),
     )
 
 
@@ -539,9 +562,37 @@ def message_debug_line(update: Update) -> str:
     )
 
 
+def usage_analytics(context: ContextTypes.DEFAULT_TYPE) -> UsageAnalytics | None:
+    analytics = context.application.bot_data.get("usage_analytics")
+    return analytics if isinstance(analytics, UsageAnalytics) else None
+
+
+async def record_usage(context: ContextTypes.DEFAULT_TYPE, feature: str, surface: str = "telegram") -> None:
+    analytics = usage_analytics(context)
+    if analytics is not None:
+        await asyncio.to_thread(analytics.record, feature, surface)
+
+
+def command_usage_is_authorized(update: Update, config: Config, command: str) -> bool:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or chat.id != config.chat_id or not is_allowed_user(update, config):
+        return False
+    if command in {"cxr", "cxs", "cxq", "cmd"}:
+        return message.message_thread_id == config.topic_id
+    if command in {"memq", "spq", "spi", "sph"}:
+        return message.message_thread_id == config.image_summary.topic_id
+    return message.message_thread_id == config.owntracks_topic_id
+
+
 async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     observe_update(update)
     config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    raw_text = (message.text or message.caption or "") if message else ""
+    command = canonical_command(raw_text)
+    if command and command_usage_is_authorized(update, config, command):
+        await record_usage(context, f"telegram.command.{command}")
     if config.image_summary.debug_updates:
         await asyncio.to_thread(image_summary_log, config.image_summary, f"debug {message_debug_line(update)}")
 
@@ -612,6 +663,78 @@ async def download_image(update: Update, target: Path) -> None:
         raise
 
 
+async def download_pdf(update: Update, target: Path) -> None:
+    start = time.monotonic()
+    message = update.effective_message
+    try:
+        if not message or not message.document or message.document.mime_type != "application/pdf":
+            raise RuntimeError("Message does not contain a PDF document")
+        telegram_file = await message.document.get_file()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await telegram_file.download_to_drive(custom_path=target)
+        observe_download("document_pdf", start, "success")
+    except Exception as exc:
+        observe_download("document_pdf", start, "error", exc)
+        raise
+
+
+def message_has_image(message: Any) -> bool:
+    return bool(
+        message
+        and (
+            getattr(message, "photo", None)
+            or (
+                getattr(message, "document", None)
+                and getattr(message.document, "mime_type", "").startswith("image/")
+            )
+        )
+    )
+
+
+async def download_message_image(message: Any, target: Path) -> None:
+    start = time.monotonic()
+    try:
+        if getattr(message, "photo", None):
+            kind = "reply_photo"
+            telegram_file = await message.photo[-1].get_file()
+        elif (
+            getattr(message, "document", None)
+            and getattr(message.document, "mime_type", "").startswith("image/")
+        ):
+            kind = "reply_document_image"
+            telegram_file = await message.document.get_file()
+        else:
+            raise RuntimeError("Replied message does not contain an image")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await telegram_file.download_to_drive(custom_path=target)
+        observe_download(kind, start, "success")
+    except Exception as exc:
+        observe_download("reply_image", start, "error", exc)
+        raise
+
+
+def message_has_pdf(message: Any) -> bool:
+    return bool(
+        message
+        and getattr(message, "document", None)
+        and getattr(message.document, "mime_type", "") == "application/pdf"
+    )
+
+
+async def download_message_pdf(message: Any, target: Path) -> None:
+    start = time.monotonic()
+    try:
+        if not message_has_pdf(message):
+            raise RuntimeError("Replied message does not contain a PDF")
+        telegram_file = await message.document.get_file()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await telegram_file.download_to_drive(custom_path=target)
+        observe_download("reply_document_pdf", start, "success")
+    except Exception as exc:
+        observe_download("reply_document_pdf", start, "error", exc)
+        raise
+
+
 async def reply_chunked(update: Update, text: str, max_chars: int) -> None:
     message = update.effective_message
     if not message:
@@ -624,6 +747,148 @@ async def reply_chunked(update: Update, text: str, max_chars: int) -> None:
         REPLIES_TOTAL.labels(kind="text").inc()
 
 
+def memory_retrieval_report(
+    question: str,
+    selected_memories: list[tuple[Path, str, int]],
+) -> str:
+    terms = sorted(query_terms(question))
+    ranked = [(path, score) for path, _content, score in selected_memories if score > 0]
+    reused = [path for path, _content, score in selected_memories if score == 0]
+    lines = ["Memory retrieval", f"Query terms: {', '.join(terms) if terms else '(none)'}"]
+    if ranked:
+        lines.append("Ranked keyword matches:")
+        lines.extend(f"{index}. {path.name} — score {score}" for index, (path, score) in enumerate(ranked, 1))
+    else:
+        lines.append("Ranked keyword matches: none")
+    if reused:
+        lines.append("Reused from recent query context:")
+        lines.extend(f"- {path.name}" for path in reused)
+    lines.append("Generating answer…")
+    return "\n".join(lines)
+
+
+def visible_answer_stream(raw_text: str, max_chars: int) -> str:
+    visible = re.split(r"(?im)^USED_MEMORY_FILES:", raw_text, maxsplit=1)[0].strip()
+    if not visible:
+        return ""
+    lines = visible.splitlines()
+    if lines and "USED_MEMORY_FILES:".startswith(lines[-1].strip().upper()):
+        lines.pop()
+        visible = "\n".join(lines).rstrip()
+    if len(visible) > max_chars:
+        visible = visible[: max(1, max_chars - 1)].rstrip() + "…"
+    return visible
+
+
+async def stream_answer_updates(
+    stream_message: Any,
+    queue: asyncio.Queue[str],
+    done: asyncio.Event,
+    summary_config: ImageSummaryConfig,
+) -> None:
+    raw_text = ""
+    rendered = "Answering…"
+    last_edit = 0.0
+    while not done.is_set() or not queue.empty():
+        try:
+            raw_text += await asyncio.wait_for(queue.get(), timeout=0.75)
+            while not queue.empty():
+                raw_text += queue.get_nowait()
+        except TimeoutError:
+            pass
+        preview = visible_answer_stream(raw_text, summary_config.max_reply_chars)
+        now = time.monotonic()
+        if preview and preview != rendered and (done.is_set() or now - last_edit >= 1.0):
+            try:
+                await stream_message.edit_text(preview)
+                rendered = preview
+                last_edit = now
+            except Exception as exc:
+                image_summary_log(summary_config, f"answer_stream_edit_failed error={exc}")
+
+
+async def finish_streamed_reply(
+    message: Any,
+    stream_message: Any,
+    text: str,
+    max_chars: int,
+) -> None:
+    chunks = split_message(text, max_chars)
+    if not chunks:
+        chunks = ["I could not produce an answer."]
+    total = len(chunks)
+    for index, chunk in enumerate(chunks):
+        rendered = f"({index + 1}/{total})\n{chunk}" if total > 1 else chunk
+        if index == 0:
+            try:
+                await stream_message.edit_text(rendered)
+            except Exception:
+                await message.reply_text(rendered)
+                REPLIES_TOTAL.labels(kind="text").inc()
+        else:
+            await message.reply_text(rendered)
+            REPLIES_TOTAL.labels(kind="text").inc()
+
+
+def pending_caption_key(message: Any, message_id: int) -> tuple[int, int | None, int, int] | None:
+    user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None)
+    chat_id = getattr(message, "chat_id", None)
+    if user_id is None or chat_id is None:
+        return None
+    return (int(chat_id), getattr(message, "message_thread_id", None), int(user_id), int(message_id))
+
+
+async def wait_for_caption_pair(
+    application: Any,
+    message: Any,
+    text: str,
+    grace_seconds: int,
+) -> bool:
+    key = pending_caption_key(message, message.message_id)
+    if key is None or grace_seconds <= 0:
+        return False
+    pending: dict[tuple[int, int | None, int, int], dict[str, Any]] = application.bot_data.setdefault(
+        "pending_image_captions",
+        {},
+    )
+    entry = {"text": text, "event": asyncio.Event(), "claimed": False}
+    pending[key] = entry
+    try:
+        await asyncio.wait_for(entry["event"].wait(), timeout=grace_seconds)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        if pending.get(key) is entry:
+            pending.pop(key, None)
+    return bool(entry["claimed"])
+
+
+async def claim_preceding_caption(
+    application: Any,
+    message: Any,
+    wait_seconds: float = 0.75,
+) -> tuple[str, int] | None:
+    previous_id = int(message.message_id) - 1
+    key = pending_caption_key(message, previous_id)
+    if key is None:
+        return None
+    pending: dict[tuple[int, int | None, int, int], dict[str, Any]] = application.bot_data.setdefault(
+        "pending_image_captions",
+        {},
+    )
+    deadline = time.monotonic() + max(0, wait_seconds)
+    while True:
+        entry = pending.pop(key, None)
+        if entry is not None:
+            entry["claimed"] = True
+            entry["event"].set()
+            return str(entry["text"]), previous_id
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.05)
+
+
 async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     handler_start = time.monotonic()
     handler_result = "ignored"
@@ -632,7 +897,15 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
     message = update.effective_message
     if not message or not is_image_summary_target(update, config):
         return
+    paired_caption = await claim_preceding_caption(context.application, message)
+    user_comment = paired_caption[0] if paired_caption else message.caption
+    if paired_caption:
+        image_summary_log(
+            summary_config,
+            f"image_caption_paired image_message_id={message.message_id} text_message_id={paired_caption[1]}",
+        )
     handler_result = "success"
+    await record_usage(context, "telegram.workflow.image_summary")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     target = summary_config.work_dir / "images" / f"{stamp}-msg{message.message_id}{image_suffix(update)}"
@@ -662,9 +935,38 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
     )
     try:
         results: list[dict[str, Any]] = []
-        for label, job in image_result_jobs(target, summary_config):
+        loop = asyncio.get_running_loop()
+        stream_queue: asyncio.Queue[str] | None = None
+
+        def enqueue_image_delta(delta: str) -> None:
+            if stream_queue is not None:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, delta)
+
+        image_delta_callback = enqueue_image_delta if summary_config.image_summary_stream else None
+        for label, job in image_result_jobs(
+            target,
+            summary_config,
+            user_comment,
+            on_text_delta=image_delta_callback,
+        ):
             image_summary_log(summary_config, f"image_result_started message_id={message.message_id} label={label!r}")
-            result = await asyncio.to_thread(job)
+            stream_message = None
+            stream_task = None
+            stream_done = asyncio.Event()
+            if summary_config.image_summary_stream:
+                stream_queue = asyncio.Queue()
+                stream_message = await message.reply_text(f"{label}\nGenerating…")
+                REPLIES_TOTAL.labels(kind="text").inc()
+                stream_task = asyncio.create_task(
+                    stream_answer_updates(stream_message, stream_queue, stream_done, summary_config)
+                )
+            try:
+                result = await asyncio.to_thread(job)
+            finally:
+                stream_done.set()
+                if stream_task is not None:
+                    await stream_task
+                stream_queue = None
             results.append(result)
             job_result = "success" if result["ok"] else "error"
             IMAGE_JOBS_TOTAL.labels(mode=summary_config.summary_mode, label=label, result=job_result).inc()
@@ -679,10 +981,52 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             IMAGE_REPLY_CHUNKS_TOTAL.labels(mode=summary_config.summary_mode).inc(
                 len(split_message(build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars))
             )
-            await reply_chunked(update, build_result_reply(result, summary_config.summary_mode), summary_config.max_reply_chars)
+            result_reply = build_result_reply(result, summary_config.summary_mode)
+            if stream_message is not None:
+                await finish_streamed_reply(
+                    message,
+                    stream_message,
+                    result_reply,
+                    summary_config.max_reply_chars,
+                )
+            else:
+                await reply_chunked(update, result_reply, summary_config.max_reply_chars)
 
         image_summary_log(summary_config, f"image_comparison_started message_id={message.message_id}")
-        comparison = await asyncio.to_thread(compare_ollama_to_codex, results, summary_config)
+        comparison_stream_message = None
+        comparison_stream_task = None
+        comparison_stream_done = asyncio.Event()
+        comparison_possible = any(
+            result.get("ok") and str(result.get("label", "")).startswith("Codex benchmark text")
+            for result in results
+        ) and any(
+            result.get("ok") and str(result.get("label", "")).startswith("Direct vision LLM")
+            for result in results
+        )
+        if summary_config.image_summary_stream and comparison_possible:
+            stream_queue = asyncio.Queue()
+            comparison_stream_message = await message.reply_text("Image comparison\nGenerating…")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            comparison_stream_task = asyncio.create_task(
+                stream_answer_updates(
+                    comparison_stream_message,
+                    stream_queue,
+                    comparison_stream_done,
+                    summary_config,
+                )
+            )
+        try:
+            comparison = await asyncio.to_thread(
+                compare_ollama_to_codex,
+                results,
+                summary_config,
+                image_delta_callback if comparison_possible else None,
+            )
+        finally:
+            comparison_stream_done.set()
+            if comparison_stream_task is not None:
+                await comparison_stream_task
+            stream_queue = None
         if comparison:
             comparison_result = "success" if comparison["ok"] else "error"
             IMAGE_JOBS_TOTAL.labels(mode="comparison", label=comparison["label"], result=comparison_result).inc()
@@ -695,9 +1039,43 @@ async def image_summary_handler(update: Update, context: ContextTypes.DEFAULT_TY
             IMAGE_REPLY_CHUNKS_TOTAL.labels(mode="comparison").inc(
                 len(split_message(build_result_reply(comparison, "comparison"), summary_config.max_reply_chars))
             )
-            await reply_chunked(update, build_result_reply(comparison, "comparison"), summary_config.max_reply_chars)
+            comparison_reply = build_result_reply(comparison, "comparison")
+            if comparison_stream_message is not None:
+                await finish_streamed_reply(
+                    message,
+                    comparison_stream_message,
+                    comparison_reply,
+                    summary_config.max_reply_chars,
+                )
+            else:
+                await reply_chunked(update, comparison_reply, summary_config.max_reply_chars)
         else:
             image_summary_log(summary_config, f"image_comparison_skipped message_id={message.message_id}")
+
+        saved = await asyncio.to_thread(
+            save_image_memory,
+            target,
+            results,
+            summary_config,
+            {
+                "telegram_chat_id": message.chat_id,
+                "telegram_thread_id": message.message_thread_id,
+                "telegram_message_id": message.message_id,
+                "telegram_date": message.date.isoformat() if message.date else None,
+                "user_comment": user_comment,
+                "telegram_original_caption": message.caption,
+                "telegram_caption_text_message_id": paired_caption[1] if paired_caption else None,
+            },
+        )
+        if saved:
+            image_summary_log(
+                summary_config,
+                f"image_memory_saved message_id={message.message_id} path={saved.path}",
+            )
+            await message.reply_text(f"Saved extracted image memory: `{saved.path.name}`")
+            REPLIES_TOTAL.labels(kind="text").inc()
+        else:
+            image_summary_log(summary_config, f"image_memory_skipped message_id={message.message_id}")
     except Exception as exc:
         handler_result = "error"
         observe_handler_error("image_summary", exc)
@@ -832,6 +1210,7 @@ async def fuel_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await fuel_guarded(update, config):
         return
     handler_result = "success"
+    await record_usage(context, "telegram.workflow.fuel_image")
 
     key = fuel_group_key(message)
     pending_by_key: dict[str, FuelPending] = context.application.bot_data.setdefault("fuel_pending", {})
@@ -885,6 +1264,15 @@ async def fuel_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     action, approval_id = parts[1], parts[2]
     handler_result = "success"
+    feature_by_action = {
+        "approve": "fuel_approve_full",
+        "full": "fuel_approve_full",
+        "partial": "fuel_approve_partial",
+        "correction": "fuel_correction",
+        "reject": "fuel_reject",
+    }
+    if action in feature_by_action:
+        await record_usage(context, f"telegram.workflow.{feature_by_action[action]}")
     approvals: dict[str, FuelApproval] = context.application.bot_data.setdefault("fuel_approvals", {})
     approval = approvals.get(approval_id)
     if not approval:
@@ -1020,6 +1408,7 @@ async def fuel_correction_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     handler_result = "success"
+    await record_usage(context, "telegram.workflow.fuel_correction")
     updated_row = apply_corrections(approval.row, corrections, config.fuel)
     updated_approval = FuelApproval(
         approval_id=approval.approval_id,
@@ -1053,7 +1442,7 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_user and update.effective_user.id == context.bot.id:
         image_summary_log(summary_config, f"memory_skipped_own_message {message_debug_line(update)}")
         return
-    if message.photo or (message.document and message.document.mime_type.startswith("image/")):
+    if message.photo or message.document:
         return
 
     raw_text = (message.text or message.caption or "").strip()
@@ -1062,7 +1451,130 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not raw_text:
         return
 
+    replied_message = message.reply_to_message
+    if message_has_image(replied_message):
+        handler_result = "image_caption_reply"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        reply_suffix = ".jpg" if replied_message.photo else Path(replied_message.document.file_name or "image.img").suffix
+        target = summary_config.work_dir / "images" / f"{stamp}-reply{replied_message.message_id}{reply_suffix or '.img'}"
+        await message.reply_text("Updating the existing image memory with this reply as its new caption.")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        try:
+            await download_message_image(replied_message, target)
+            saved = await asyncio.to_thread(
+                update_image_memory_comment,
+                target,
+                summary_config,
+                raw_text,
+                {
+                    "telegram_chat_id": message.chat_id,
+                    "telegram_thread_id": message.message_thread_id,
+                    "telegram_message_id": message.message_id,
+                    "telegram_date": message.date.isoformat() if message.date else None,
+                    "caption_reply_to_message_id": replied_message.message_id,
+                },
+            )
+            if saved:
+                await message.reply_text(f"Updated image memory: `{saved.path.name}`")
+                image_summary_log(
+                    summary_config,
+                    f"image_caption_reply_updated text_message_id={message.message_id} "
+                    f"image_message_id={replied_message.message_id} path={saved.path}",
+                )
+            else:
+                await message.reply_text("I could not find a hash-linked memory for that image. Share it once to create one.")
+            REPLIES_TOTAL.labels(kind="text").inc()
+        except Exception as exc:
+            handler_result = "error"
+            observe_handler_error("image_caption_reply", exc)
+            await message.reply_text(f"Could not update the image memory: {exc}")
+            REPLIES_TOTAL.labels(kind="text").inc()
+        finally:
+            observe_handler("memory_extraction", handler_start, handler_result)
+        return
+
+    if message_has_pdf(replied_message):
+        handler_result = "pdf_caption_reply"
+        max_bytes = int(summary_config.memory_pdf_max_bytes)
+        if replied_message.document.file_size and replied_message.document.file_size > max_bytes:
+            await message.reply_text(f"The replied PDF exceeds the {max_bytes // (1024 * 1024)} MiB limit.")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            observe_handler("memory_extraction", handler_start, "too_large")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_name = Path(replied_message.document.file_name or "document.pdf").name
+        target = summary_config.work_dir / "pdfs" / f"{stamp}-reply{replied_message.message_id}-{safe_name}"
+        await message.reply_text("Downloading the replied PDF and upgrading its existing memory with this caption.")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(
+            typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
+        )
+        extraction_start = time.monotonic()
+        try:
+            await download_message_pdf(replied_message, target)
+            if target.stat().st_size > max_bytes:
+                raise ValueError(f"PDF exceeds {max_bytes // (1024 * 1024)} MiB")
+            saved, extraction = await asyncio.to_thread(
+                save_pdf_memory,
+                target,
+                summary_config,
+                {
+                    "telegram_chat_id": message.chat_id,
+                    "telegram_thread_id": message.message_thread_id,
+                    "telegram_message_id": message.message_id,
+                    "telegram_date": message.date.isoformat() if message.date else None,
+                    "telegram_document_file_name": replied_message.document.file_name,
+                    "caption_reply_to_message_id": replied_message.message_id,
+                    "user_comment": raw_text,
+                    "caption_update_source": "telegram_reply",
+                },
+            )
+            MEMORY_EXTRACTIONS_TOTAL.labels(result="success").inc()
+            MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="success").observe(time.monotonic() - extraction_start)
+            quality_note = (
+                f"Text extractor: {extraction.method}, heuristic quality={extraction.quality}, "
+                f"characters={extraction.character_count}, pages={extraction.pages_processed}/{extraction.page_count}."
+            )
+            if saved:
+                await message.reply_text(f"Updated PDF memory: `{saved.path.name}`\n{quality_note}")
+                image_summary_log(
+                    summary_config,
+                    f"pdf_caption_reply_updated text_message_id={message.message_id} "
+                    f"pdf_message_id={replied_message.message_id} path={saved.path} "
+                    f"method={extraction.method} quality={extraction.quality}",
+                )
+            else:
+                await message.reply_text(f"This PDF already has that caption; no duplicate was created.\n{quality_note}")
+            REPLIES_TOTAL.labels(kind="text").inc()
+        except Exception as exc:
+            handler_result = "error"
+            MEMORY_EXTRACTIONS_TOTAL.labels(result="error").inc()
+            MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="error").observe(time.monotonic() - extraction_start)
+            observe_handler_error("pdf_caption_reply", exc)
+            await message.reply_text(f"Could not update the PDF memory: {exc}")
+            REPLIES_TOTAL.labels(kind="text").inc()
+        finally:
+            stop_event.set()
+            await typing_task
+            observe_handler("memory_extraction", handler_start, handler_result)
+        return
+
+    if await wait_for_caption_pair(
+        context.application,
+        message,
+        raw_text,
+        summary_config.memory_caption_pair_grace_seconds,
+    ):
+        image_summary_log(
+            summary_config,
+            f"memory_text_claimed_as_image_caption message_id={message.message_id}",
+        )
+        observe_handler("memory_extraction", handler_start, "paired_caption")
+        return
+
     handler_result = "success"
+    await record_usage(context, "telegram.workflow.text_memory")
     image_summary_log(summary_config, f"memory_processing {message_debug_line(update)} chars={len(raw_text)}")
     await message.reply_text("Received text. Extracting key information and saving it as a memory.")
     REPLIES_TOTAL.labels(kind="text").inc()
@@ -1101,6 +1613,95 @@ async def text_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await reply_chunked(update, reply, summary_config.max_reply_chars)
 
 
+async def pdf_memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
+    config: Config = context.application.bot_data["config"]
+    summary_config = config.image_summary
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    if not await allowed_user_guard(update, config):
+        return
+    document = message.document
+    if not document or document.mime_type != "application/pdf":
+        return
+    max_bytes = int(summary_config.memory_pdf_max_bytes)
+    if document.file_size and document.file_size > max_bytes:
+        await message.reply_text(f"PDF is too large. Maximum supported size is {max_bytes // (1024 * 1024)} MiB.")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("pdf_memory", handler_start, "too_large")
+        return
+
+    handler_result = "success"
+    await record_usage(context, "telegram.workflow.pdf_memory")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = Path(document.file_name or "document.pdf").name
+    target = summary_config.work_dir / "pdfs" / f"{stamp}-msg{message.message_id}-{safe_name}"
+    await message.reply_text("Received PDF. Extracting embedded text, with local OCR fallback for scanned pages.")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    try:
+        await download_pdf(update, target)
+        if target.stat().st_size > max_bytes:
+            raise ValueError(f"PDF exceeds {max_bytes // (1024 * 1024)} MiB")
+    except Exception as exc:
+        handler_result = "download_error"
+        image_summary_log(summary_config, f"pdf_download_failed message_id={message.message_id} error={exc}")
+        await message.reply_text(f"Failed to download PDF: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+        observe_handler("pdf_memory", handler_start, handler_result)
+        return
+
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(
+        typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
+    )
+    extraction_start = time.monotonic()
+    try:
+        saved, extraction = await asyncio.to_thread(
+            save_pdf_memory,
+            target,
+            summary_config,
+            {
+                "telegram_chat_id": message.chat_id,
+                "telegram_thread_id": message.message_thread_id,
+                "telegram_message_id": message.message_id,
+                "telegram_date": message.date.isoformat() if message.date else None,
+                "telegram_document_file_name": document.file_name,
+                "user_comment": message.caption,
+            },
+        )
+        MEMORY_EXTRACTIONS_TOTAL.labels(result="success").inc()
+        MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="success").observe(time.monotonic() - extraction_start)
+        quality_note = (
+            f"Text extractor: {extraction.method}, heuristic quality={extraction.quality}, "
+            f"characters={extraction.character_count}, pages={extraction.pages_processed}/{extraction.page_count}."
+        )
+        if saved:
+            await message.reply_text(f"Saved PDF memory: `{saved.path.name}`\n{quality_note}")
+            image_summary_log(
+                summary_config,
+                f"pdf_memory_saved message_id={message.message_id} path={saved.path} "
+                f"method={extraction.method} quality={extraction.quality} chars={extraction.character_count}",
+            )
+        else:
+            await message.reply_text(f"This PDF is already saved; no duplicate memory was created.\n{quality_note}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+    except Exception as exc:
+        handler_result = "error"
+        MEMORY_EXTRACTIONS_TOTAL.labels(result="error").inc()
+        MEMORY_EXTRACTION_DURATION_SECONDS.labels(result="error").observe(time.monotonic() - extraction_start)
+        observe_handler_error("pdf_memory", exc)
+        await message.reply_text(f"PDF extraction failed: {exc}")
+        REPLIES_TOTAL.labels(kind="text").inc()
+    finally:
+        stop_event.set()
+        await typing_task
+        observe_handler("pdf_memory", handler_start, handler_result)
+
+
 async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> None:
     query_start = time.monotonic()
     query_result = "success"
@@ -1117,19 +1718,63 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     image_summary_log(summary_config, f"memory_query question={question!r}")
-    await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
+    progress_message = await message.reply_text(f"Searching memories with `{summary_config.memory_query_model}`.")
     REPLIES_TOTAL.labels(kind="text").inc()
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    history_key = (message.chat_id, message.message_thread_id, user_id)
+    histories: dict[tuple[int, int | None, int], list[MemoryQueryTurn]] = context.application.bot_data.setdefault(
+        "memory_query_histories",
+        {},
+    )
+    history = histories.get(history_key, [])
 
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(
         typing_loop(context, summary_config, summary_config.chat_id, summary_config.topic_id, stop_event)
     )
+    stream_message = None
+    stream_task = None
+    stream_done = asyncio.Event()
+    stream_queue: asyncio.Queue[str] = asyncio.Queue()
     try:
-        result = await asyncio.to_thread(answer_memory_question, question, summary_config)
+        selected_memories = await asyncio.to_thread(memories_with_history, question, summary_config, tuple(history))
+        if summary_config.memory_query_show_retrieval:
+            try:
+                await progress_message.edit_text(memory_retrieval_report(question, selected_memories))
+            except Exception as exc:
+                image_summary_log(summary_config, f"memory_query_retrieval_edit_failed error={exc}")
+        selected_paths = tuple(path for path, _content, _score in selected_memories)
+        poi_context = await asyncio.to_thread(memory_poi_context, config.spending, selected_paths)
+        on_text_delta = None
+        if summary_config.memory_query_stream and selected_memories:
+            stream_message = await message.reply_text("Answering…")
+            REPLIES_TOTAL.labels(kind="text").inc()
+            loop = asyncio.get_running_loop()
+
+            def enqueue_text_delta(delta: str) -> None:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, delta)
+
+            on_text_delta = enqueue_text_delta
+            stream_task = asyncio.create_task(
+                stream_answer_updates(stream_message, stream_queue, stream_done, summary_config)
+            )
+        result = await asyncio.to_thread(
+            answer_memory_question,
+            question,
+            summary_config,
+            tuple(history),
+            selected_memories,
+            poi_context,
+            on_text_delta,
+        )
         MEMORY_QUERY_CONTEXT_CHARS.observe(sum(path.stat().st_size for path in result.context_paths if path.exists()))
         if not result.context_paths:
             query_result = "no_match"
     finally:
+        stream_done.set()
+        if stream_task is not None:
+            await stream_task
         stop_event.set()
         await typing_task
     MEMORY_QUERIES_TOTAL.labels(result=query_result).inc()
@@ -1141,7 +1786,20 @@ async def answer_memory_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply = result.answer
     if sources:
         reply += f"\n\nSources:\n{sources}"
-    await reply_chunked(update, reply, summary_config.max_reply_chars)
+    if stream_message is not None:
+        await finish_streamed_reply(message, stream_message, reply, summary_config.max_reply_chars)
+    else:
+        await reply_chunked(update, reply, summary_config.max_reply_chars)
+
+    if result.context_paths and summary_config.memory_query_history_turns > 0:
+        history.append(
+            MemoryQueryTurn(
+                question=question,
+                answer=result.answer,
+                context_paths=result.context_paths,
+            )
+        )
+        histories[history_key] = history[-summary_config.memory_query_history_turns :]
 
 
 async def memory_query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1187,6 +1845,7 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
     if not match:
         return
     handler_result = "success"
+    await record_usage(context, "telegram.workflow.memory_query_text")
     try:
         await answer_memory_query(update, context, match.group(1))
     except Exception as exc:
@@ -1199,6 +1858,66 @@ async def memory_query_text_handler(update: Update, context: ContextTypes.DEFAUL
         raise
     finally:
         observe_handler("memory_query", handler_start, handler_result)
+
+
+async def spending_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handler_start = time.monotonic()
+    handler_result = "ignored"
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        return
+    if not await allowed_user_guard(update, config):
+        return
+
+    scope = " ".join(context.args or []).strip() or "today"
+    await message.reply_text(f"Syncing POI memories and refreshing correlations for `{scope}`.")
+    REPLIES_TOTAL.labels(kind="text").inc()
+    handler_result = "success"
+    try:
+        poi_result = await asyncio.to_thread(
+            sync_poi_memories,
+            config.spending.owntracks_log_path,
+            config.spending.user_tags_path,
+            config.image_summary.memory_dir,
+            scope,
+            config.spending.nearest_stop_radius_m,
+            config.spending.nearest_stop_time_window_minutes,
+        )
+        result = await asyncio.to_thread(index_scope, config.spending, config.image_summary, scope)
+        await message.reply_text(
+            "POI memory sync complete: "
+            f"scanned={poi_result.scanned}, created={poi_result.created}, updated={poi_result.updated}, "
+            f"unchanged={poi_result.unchanged}, errors={poi_result.errors}.\n"
+            "Correlation refresh complete: "
+            f"scanned={result.scanned}, indexed={result.indexed}, skipped={result.skipped}, "
+            f"errors={result.errors}, linked={result.linked}."
+        )
+        REPLIES_TOTAL.labels(kind="text").inc()
+    except Exception as exc:
+        handler_result = "error"
+        observe_handler_error("spending_index", exc)
+        raise
+    finally:
+        observe_handler("spending_index", handler_start, handler_result)
+
+
+async def spending_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    if not message or not is_image_summary_target(update, config):
+        return
+    if not await allowed_user_guard(update, config):
+        return
+    await message.reply_text(
+        "POIs are saved as memories and queried through /memq.\n"
+        "/memq What POIs did I capture yesterday?\n"
+        "/memq Where was Rs.450 spent on 7th July 2026?\n"
+        "/spi [today|yesterday|YYYY-MM-DD|YYYY-MM|YYYY] manually resyncs POI memories and correlations."
+    )
+    REPLIES_TOTAL.labels(kind="text").inc()
 
 
 async def command_shortcuts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1839,6 +2558,7 @@ async def owntracks_help_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
+    configure_usage_metrics(application.bot_data.get("usage_analytics"))
     set_config_enabled(
         image_summary=bool(config.image_summary.topic_id),
         memory=bool(config.image_summary.memory_dir),
@@ -1862,9 +2582,26 @@ async def post_init(application: Application) -> None:
         config.image_summary,
         config.http_intake,
         config.metrics,
+        config.spending,
         asyncio.get_running_loop(),
     )
     application.bot_data["http_intake_server"] = server
+    application.bot_data["poi_memory_task"] = asyncio.create_task(
+        poi_memory_loop(config.spending, config.image_summary)
+    )
+    image_summary_log(
+        config.image_summary,
+        f"poi_memory_sync_started memory_dir={config.image_summary.memory_dir} "
+        f"poll_seconds={config.spending.poll_seconds}",
+    )
+    if config.spending.enabled:
+        application.bot_data["spending_index_task"] = asyncio.create_task(
+            spending_index_loop(config.spending, config.image_summary)
+        )
+        image_summary_log(
+            config.image_summary,
+            f"spending_index_started db={config.spending.db_path} poll_seconds={config.spending.poll_seconds}",
+        )
     if config.metrics.enabled and not config.http_intake.enabled:
         start_standalone_metrics_server(config.metrics)
         image_summary_log(
@@ -1893,13 +2630,16 @@ def run_without_telegram(config: Config) -> None:
             "config": config,
             "fuel_pending": {},
             "fuel_approvals": {},
+            "usage_analytics": UsageAnalytics(config.usage),
         },
     )
+    configure_usage_metrics(application.bot_data.get("usage_analytics"))
     server = start_http_intake(
         application,
         config.image_summary,
         config.http_intake,
         config.metrics,
+        config.spending,
         loop,
     )
     if config.metrics.enabled and not config.http_intake.enabled:
@@ -1943,6 +2683,7 @@ def main() -> None:
     application.bot_data["config"] = config
     application.bot_data["fuel_pending"] = {}
     application.bot_data["fuel_approvals"] = {}
+    application.bot_data["usage_analytics"] = UsageAnalytics(config.usage)
     application.add_handler(MessageHandler(filters.ALL, debug_update), group=-1)
     application.add_handler(CallbackQueryHandler(fuel_callback_handler, pattern=r"^fuel:"))
     application.add_handler(CommandHandler(["cmd", "commands", "help"], command_shortcuts_command))
@@ -1950,6 +2691,8 @@ def main() -> None:
     application.add_handler(CommandHandler(["cxs", "codex_status"], codex_status))
     application.add_handler(CommandHandler(["cxq", "codex_stop"], codex_stop))
     application.add_handler(CommandHandler(["memq", "memory_query"], memory_query_command))
+    application.add_handler(CommandHandler(["spi", "spending_index"], spending_index_command))
+    application.add_handler(CommandHandler(["sph", "spending_help"], spending_help_command))
     application.add_handler(CommandHandler(["oth", "owntracks", "owntracks_help", "ot_help"], owntracks_help_command))
     application.add_handler(CommandHandler(["otd", "ot", "owntracks_digest", "ot_digest"], owntracks_digest_command))
     application.add_handler(CommandHandler(["otm", "ot_map", "owntracks_map"], owntracks_map_command))
@@ -1960,6 +2703,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["oto", "note", "owntracks_note", "ot_note"], owntracks_note_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, fuel_image_handler), group=0)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_summary_handler), group=1)
+    application.add_handler(MessageHandler(filters.Document.PDF, pdf_memory_handler))
     application.add_handler(
         MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, fuel_correction_handler),
         group=1,

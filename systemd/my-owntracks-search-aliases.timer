@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram Control OwnTracks search alias generation weekly
+
+[Timer]
+OnCalendar=Sun 03:30
+Persistent=true
+Unit=my-owntracks-search-aliases.service
+
+[Install]
+WantedBy=timers.target

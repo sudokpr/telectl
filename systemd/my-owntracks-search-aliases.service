@@ -1,0 +1,7 @@
+[Unit]
+Description=Telegram Control OwnTracks search alias generation
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/workspace/projects/telegram_control
+ExecStart=%h/.local/bin/uv --cache-dir .uv-cache run python -m owntracks.digest --generate-search-aliases

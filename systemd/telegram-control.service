@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram Control bot and HTTP intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/kp/workspace/projects/telegram_control
+ExecStart=/home/kp/.local/bin/uv --cache-dir .uv-cache run python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
